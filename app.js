@@ -186,6 +186,8 @@
     events: [],
     runSeenAt: new Map(),
     watchingRuns: new Set(),
+    inFlightActionSubmissions: new Set(),
+    ambiguousActionSubmissions: new Set(),
     drawer: null,
     editingConnectionId: null,
     actionSearch: "",
@@ -1420,6 +1422,322 @@
     return true;
   }
 
+  function classRefKey(ref) {
+    return `${qualifiedKey(ref?.class)}@${ref?.hash || ""}`;
+  }
+
+  function groupedClassRefs(refs) {
+    const grouped = new Map();
+    for (const ref of refs || []) {
+      const key = classRefKey(ref);
+      const current = grouped.get(key) || { ref, count: 0 };
+      current.count += 1;
+      grouped.set(key, current);
+    }
+    return grouped;
+  }
+
+  function predicateCalls(source, name) {
+    const text = String(source || "");
+    const callName = String(name);
+    const calls = [];
+    let outerQuote = "";
+    let outerEscaped = false;
+    let lineComment = false;
+    let blockComment = false;
+    for (let cursor = 0; cursor < text.length; cursor += 1) {
+      const character = text[cursor];
+      const next = text[cursor + 1] || "";
+      if (lineComment) {
+        if (character === "\n") lineComment = false;
+        continue;
+      }
+      if (blockComment) {
+        if (character === "*" && next === "/") {
+          blockComment = false;
+          cursor += 1;
+        }
+        continue;
+      }
+      if (outerQuote) {
+        if (outerEscaped) outerEscaped = false;
+        else if (character === "\\") outerEscaped = true;
+        else if (character === outerQuote) outerQuote = "";
+        continue;
+      }
+      if (character === "/" && next === "/") {
+        lineComment = true;
+        cursor += 1;
+        continue;
+      }
+      if (character === "/" && next === "*") {
+        blockComment = true;
+        cursor += 1;
+        continue;
+      }
+      if (character === '"' || character === "'" || character === "`") {
+        outerQuote = character;
+        continue;
+      }
+      if (!text.startsWith(callName, cursor) || /[A-Za-z0-9_]/.test(text[cursor - 1] || "")) continue;
+      let openIndex = cursor + callName.length;
+      while (/\s/.test(text[openIndex] || "")) openIndex += 1;
+      if (text[openIndex] !== "(") continue;
+      let depth = 0;
+      let quote = "";
+      let escaped = false;
+      let innerLineComment = false;
+      let innerBlockComment = false;
+      for (let index = openIndex; index < text.length; index += 1) {
+        const innerCharacter = text[index];
+        const innerNext = text[index + 1] || "";
+        if (innerLineComment) {
+          if (innerCharacter === "\n") innerLineComment = false;
+          continue;
+        }
+        if (innerBlockComment) {
+          if (innerCharacter === "*" && innerNext === "/") {
+            innerBlockComment = false;
+            index += 1;
+          }
+          continue;
+        }
+        if (quote) {
+          if (escaped) escaped = false;
+          else if (innerCharacter === "\\") escaped = true;
+          else if (innerCharacter === quote) quote = "";
+          continue;
+        }
+        if (innerCharacter === "/" && innerNext === "/") {
+          innerLineComment = true;
+          index += 1;
+          continue;
+        }
+        if (innerCharacter === "/" && innerNext === "*") {
+          innerBlockComment = true;
+          index += 1;
+          continue;
+        }
+        if (innerCharacter === '"' || innerCharacter === "'" || innerCharacter === "`") {
+          quote = innerCharacter;
+          continue;
+        }
+        if (innerCharacter === "(") depth += 1;
+        if (innerCharacter !== ")") continue;
+        depth -= 1;
+        if (depth !== 0) continue;
+        calls.push({
+          source: text.slice(cursor, index + 1),
+          argumentsSource: text.slice(openIndex + 1, index),
+        });
+        break;
+      }
+    }
+    return calls;
+  }
+
+  function splitPredicateArguments(source) {
+    const text = String(source || "");
+    const parts = [];
+    let start = 0;
+    let depth = 0;
+    let quote = "";
+    let escaped = false;
+    for (let index = 0; index < text.length; index += 1) {
+      const character = text[index];
+      if (quote) {
+        if (escaped) escaped = false;
+        else if (character === "\\") escaped = true;
+        else if (character === quote) quote = "";
+        continue;
+      }
+      if (character === '"' || character === "'" || character === "`") {
+        quote = character;
+        continue;
+      }
+      if ("([{".includes(character)) depth += 1;
+      else if (")]}".includes(character)) depth = Math.max(0, depth - 1);
+      else if (character === "," && depth === 0) {
+        parts.push(text.slice(start, index).trim());
+        start = index + 1;
+      }
+    }
+    parts.push(text.slice(start).trim());
+    return parts;
+  }
+
+  function predicateOperationClassCounts(source, operation) {
+    const counts = new Map();
+    for (const call of predicateCalls(source, `tx::Tx${operation}`)) {
+      const match = call.source.match(/@self_predicate\(\s*Is([-A-Za-z0-9_]+)\s*\)/);
+      if (!match) continue;
+      counts.set(match[1], (counts.get(match[1]) || 0) + 1);
+    }
+    return counts;
+  }
+
+  function actionDependencyFlow(action) {
+    const totalInputs = action.totalInputs || [];
+    const totalOutputs = action.totalOutputs || [];
+    const deletedByClass = predicateOperationClassCounts(action.predicateSource, "Delete");
+    const insertedByClass = predicateOperationClassCounts(action.predicateSource, "Insert");
+    const mutatedByClass = predicateOperationClassCounts(action.predicateSource, "Mutate");
+    const source = String(action.predicateSource || "");
+    const sourceAvailable = Boolean(source.trim()) && !/AND\(\.\.\.\)/.test(source);
+    const countRefsByClass = (refs) => {
+      const counts = new Map();
+      for (const ref of refs) {
+        const className = ref.class?.name || "";
+        counts.set(className, (counts.get(className) || 0) + 1);
+      }
+      return counts;
+    };
+    const combineCounts = (left, right) => {
+      const combined = new Map(left);
+      for (const [key, count] of right) combined.set(key, (combined.get(key) || 0) + count);
+      return combined;
+    };
+    const requiredInputs = combineCounts(deletedByClass, mutatedByClass);
+    const requiredOutputs = combineCounts(insertedByClass, mutatedByClass);
+    const availableInputs = countRefsByClass(totalInputs);
+    const availableOutputs = countRefsByClass(totalOutputs);
+    const refVariantsByClass = (refs) => {
+      const variants = new Map();
+      for (const ref of refs) {
+        const className = ref.class?.name || "";
+        if (!variants.has(className)) variants.set(className, new Set());
+        variants.get(className).add(classRefKey(ref));
+      }
+      return variants;
+    };
+    const inputVariants = refVariantsByClass(totalInputs);
+    const outputVariants = refVariantsByClass(totalOutputs);
+    const inconsistent =
+      [...requiredInputs].some(([key, count]) => count > (availableInputs.get(key) || 0)) ||
+      [...requiredOutputs].some(([key, count]) => count > (availableOutputs.get(key) || 0)) ||
+      [...requiredInputs.keys()].some((key) => (inputVariants.get(key)?.size || 0) > 1) ||
+      [...requiredOutputs.keys()].some((key) => (outputVariants.get(key)?.size || 0) > 1) ||
+      [...mutatedByClass.keys()].some((key) => {
+        const inputKey = [...(inputVariants.get(key) || [])][0];
+        const outputKey = [...(outputVariants.get(key) || [])][0];
+        return inputKey !== outputKey;
+      });
+    if (!sourceAvailable || inconsistent) {
+      return {
+        inputs: [],
+        outputs: [],
+        mutations: [],
+        opaqueInputs: totalInputs,
+        opaqueOutputs: totalOutputs,
+        classified: false,
+      };
+    }
+
+    const assignRoles = (refs, firstCounts, secondCounts, firstRole, secondRole) => {
+      const firstRemaining = new Map(firstCounts);
+      const secondRemaining = new Map(secondCounts);
+      return refs.map((ref) => {
+        const className = ref.class?.name || "";
+        if ((firstRemaining.get(className) || 0) > 0) {
+          firstRemaining.set(className, firstRemaining.get(className) - 1);
+          return firstRole;
+        }
+        if ((secondRemaining.get(className) || 0) > 0) {
+          secondRemaining.set(className, secondRemaining.get(className) - 1);
+          return secondRole;
+        }
+        return "opaque";
+      });
+    };
+    const inputRoles = assignRoles(totalInputs, deletedByClass, mutatedByClass, "input", "mutation");
+    const outputRoles = assignRoles(totalOutputs, insertedByClass, mutatedByClass, "output", "mutation");
+    return {
+      inputs: totalInputs.filter((_, index) => inputRoles[index] === "input"),
+      outputs: totalOutputs.filter((_, index) => outputRoles[index] === "output"),
+      mutations: totalInputs.filter((_, index) => inputRoles[index] === "mutation"),
+      opaqueInputs: totalInputs.filter((_, index) => inputRoles[index] === "opaque"),
+      opaqueOutputs: totalOutputs.filter((_, index) => outputRoles[index] === "opaque"),
+      classified: true,
+    };
+  }
+
+  function actionProofWorkload(action) {
+    const source = String(action.predicateSource || "");
+    const sourceAvailable = Boolean(source.trim()) && !/AND\(\.\.\.\)/.test(source);
+    if (!sourceAvailable) {
+      return {
+        pow: { level: "Unknown", detail: "Predicate unavailable" },
+        vdf: { level: "Unknown", detail: "Predicate unavailable" },
+      };
+    }
+
+    const vdfCalls = predicateCalls(source, "Vdf");
+    const vdfIterations = vdfCalls.map((call) => splitPredicateArguments(call.argumentsSource)[0]);
+    const literalVdfIterations = vdfIterations.filter((value) => /^-?\d+$/.test(value || "")).map((value) => BigInt(value));
+    const vdfTotal = literalVdfIterations.reduce((sum, value) => sum + value, 0n);
+    const invalidVdfCount = literalVdfIterations.filter((value) => value < 2n || value >= (1n << 32n)).length;
+    const vdfLevel = !vdfCalls.length
+      ? "None"
+      : invalidVdfCount
+        ? "Invalid"
+        : literalVdfIterations.length !== vdfCalls.length
+        ? "Unknown"
+        : vdfTotal <= 5n
+          ? "Short"
+          : vdfTotal <= 20n
+            ? "Medium"
+            : "Long";
+
+    const powCalls = predicateCalls(source, "LtEqU256");
+    const powTargets = powCalls.map((call) => {
+      const targetSource = splitPredicateArguments(call.argumentsSource)[1] || "";
+      const target = predicateCalls(targetSource, "Raw")[0]?.argumentsSource.match(/^\s*0x([0-9a-fA-F]+)\s*$/)?.[1] || "";
+      return target.length <= 64 ? target : "";
+    });
+    const readablePowTargets = powTargets.filter(Boolean);
+    let expectedAttempts = 0n;
+    for (const target of readablePowTargets) {
+      const targetValue = BigInt(`0x${target.padStart(64, "0")}`);
+      const denominator = targetValue + 1n;
+      expectedAttempts += ((1n << 256n) + denominator - 1n) / denominator;
+    }
+    const powLevel = !powCalls.length
+      ? "None"
+      : readablePowTargets.length !== powCalls.length
+        ? "Unknown"
+        : expectedAttempts <= 256n
+          ? "Easy"
+          : expectedAttempts <= 2048n
+            ? "Medium"
+            : expectedAttempts <= 4096n
+              ? "Hard"
+              : "Extreme";
+    const expectedAttemptDetail = expectedAttempts <= BigInt(Number.MAX_SAFE_INTEGER)
+      ? Math.max(1, Number(expectedAttempts)).toLocaleString()
+      : `>${Number.MAX_SAFE_INTEGER.toLocaleString()}`;
+
+    return {
+      pow: {
+        level: powLevel,
+        detail: !powCalls.length
+          ? "No direct LtEq threshold"
+          : readablePowTargets.length !== powCalls.length
+            ? `${readablePowTargets.length} of ${powCalls.length} thresholds readable`
+            : `~${expectedAttemptDetail} assumed search trials / ${powCalls.length} target${powCalls.length === 1 ? "" : "s"}`,
+      },
+      vdf: {
+        level: vdfLevel,
+        detail: !vdfCalls.length
+          ? "No direct VDF call"
+          : invalidVdfCount
+            ? `${invalidVdfCount} invalid literal count${invalidVdfCount === 1 ? "" : "s"} outside 2..2^32-1${literalVdfIterations.length !== vdfCalls.length ? " / additional unreadable count" : ""}`
+            : literalVdfIterations.length !== vdfCalls.length
+              ? `${literalVdfIterations.length} of ${vdfCalls.length} counts readable`
+              : `${vdfCalls.length} call${vdfCalls.length === 1 ? "" : "s"} / ${vdfTotal.toLocaleString()} total recursive iterations`,
+      },
+    };
+  }
+
   function techTreeClassId(value, explicitHash = "") {
     const qualified = value?.class?.pluginName ? value.class : value;
     const hash = explicitHash || value?.hash || value?.classHash || "unhashed";
@@ -1519,6 +1837,7 @@
 
     for (const action of cartridge.actions) {
       const id = techTreeActionId(action);
+      const flow = actionDependencyFlow(action);
       const transition = {
         id,
         kind: "transition",
@@ -1528,18 +1847,27 @@
         description: action.description || "",
         hash: action.hash || "",
         action,
+        flow,
         ready: actionReady(action),
         source: !(action.totalInputs || []).length,
         sink: !(action.totalOutputs || []).length,
       };
       transitions.set(id, transition);
-      (action.totalInputs || []).forEach((required, index) => {
+      flow.inputs.forEach((required, index) => {
         const place = ensurePlace(required.class, required.hash);
         addEdge(place.id, id, "input", index);
       });
-      (action.totalOutputs || []).forEach((produced, index) => {
+      flow.outputs.forEach((produced, index) => {
         const place = ensurePlace(produced.class, produced.hash);
         addEdge(id, place.id, "output", index);
+      });
+      flow.opaqueInputs.forEach((required, index) => {
+        const place = ensurePlace(required.class, required.hash);
+        addEdge(place.id, id, "opaque-input", index);
+      });
+      flow.opaqueOutputs.forEach((produced, index) => {
+        const place = ensurePlace(produced.class, produced.hash);
+        addEdge(id, place.id, "opaque-output", index);
       });
     }
 
@@ -1570,6 +1898,11 @@
       for (const edge of allEdges) {
         if (edge.source === focusPlaceId && transitions.has(edge.target)) branchTransitions.add(edge.target);
         if (edge.target === focusPlaceId && transitions.has(edge.source)) branchTransitions.add(edge.source);
+      }
+      for (const transition of transitions.values()) {
+        if (transition.flow.mutations.some((ref) => techTreeClassId(ref.class, ref.hash) === focusPlaceId)) {
+          branchTransitions.add(transition.id);
+        }
       }
       for (const transitionId of branchTransitions) {
         included.add(transitionId);
@@ -1928,6 +2261,8 @@
       <defs>
         <marker id="tree-arrow-input" class="tech-tree-marker tech-tree-marker-input" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z"></path></marker>
         <marker id="tree-arrow-output" class="tech-tree-marker tech-tree-marker-output" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z"></path></marker>
+        <marker id="tree-arrow-opaque-input" class="tech-tree-marker tech-tree-marker-opaque" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z"></path></marker>
+        <marker id="tree-arrow-opaque-output" class="tech-tree-marker tech-tree-marker-opaque" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z"></path></marker>
       </defs>`];
 
     for (const box of layout.componentBoxes) {
@@ -2005,10 +2340,17 @@
   }
 
   function techTreeBranchLabel(model, transition) {
-    const outputs = techTreeGroupedRefs(transition.action?.totalOutputs || [])
+    const outputs = techTreeGroupedRefs([
+      ...(transition.flow?.outputs || []),
+      ...(transition.flow?.opaqueOutputs || []),
+    ])
       .map(({ ref, count }) => `${ref.class?.name || "?"}${count > 1 ? ` x${count}` : ""}`)
       .join(" + ");
-    return `${transition.label} \u2192 ${outputs || "terminal"}`;
+    const updates = techTreeGroupedRefs(transition.flow?.mutations || [])
+      .map(({ ref, count }) => `${ref.class?.name || "?"}${count > 1 ? ` x${count}` : ""}`)
+      .join(" + ");
+    if (!outputs && updates) return `${transition.label} \u21bb update ${updates}`;
+    return `${transition.label} \u2192 ${outputs || "terminal"}${updates ? ` / updates ${updates}` : ""}`;
   }
 
   function techTreeDetailsMarkup(model) {
@@ -2023,10 +2365,14 @@
     if (!selected) {
       if (focusObject) {
         const place = allNodeById.get(model.focusPlaceId);
-        const branches = model.allEdges
+        const edgeBranches = model.allEdges
           .filter((edge) => edge.source === model.focusPlaceId)
           .map((edge) => allNodeById.get(edge.target))
           .filter((node) => node?.kind === "transition");
+        const mutationBranches = model.allNodes.filter(
+          (node) => node.kind === "transition" && node.flow?.mutations.some((ref) => techTreeClassId(ref.class, ref.hash) === model.focusPlaceId),
+        );
+        const branches = [...new Map([...edgeBranches, ...mutationBranches].map((node) => [node.id, node])).values()];
         return `
           <div class="tech-tree-detail-heading">
             <div><span class="tech-tree-detail-kind">Selected object</span><h2>${escapeHtml(`${focusObject.emoji || ""} ${focusObject.class?.name || "Object"}`)}</h2></div>
@@ -2047,8 +2393,11 @@
         </div>
         <p class="tech-tree-detail-copy">${escapeHtml(selected.description || "No description")}</p>
         <div class="tech-tree-detail-io">
-          <div><span>Required states</span><div class="chip-list">${techTreeRefsMarkup(selected.action.totalInputs, "No inputs / source")}</div></div>
-          <div><span>Produced states</span><div class="chip-list">${techTreeRefsMarkup(selected.action.totalOutputs, "No outputs / sink")}</div></div>
+          <div><span>Consumed states</span><div class="chip-list">${techTreeRefsMarkup(selected.flow?.inputs, "No direct consumes")}</div></div>
+          <div><span>Created states</span><div class="chip-list">${techTreeRefsMarkup(selected.flow?.outputs, "No direct creates")}</div></div>
+          ${selected.flow?.mutations.length ? `<div><span>Explicit updates / not mapped</span><div class="chip-list">${techTreeRefsMarkup(selected.flow.mutations, "")}</div></div>` : ""}
+          ${selected.flow?.opaqueInputs.length ? `<div><span>Unresolved inputs / dashed</span><div class="chip-list">${techTreeRefsMarkup(selected.flow.opaqueInputs, "")}</div></div>` : ""}
+          ${selected.flow?.opaqueOutputs.length ? `<div><span>Unresolved outputs / dashed</span><div class="chip-list">${techTreeRefsMarkup(selected.flow.opaqueOutputs, "")}</div></div>` : ""}
         </div>`;
     }
 
@@ -2056,10 +2405,14 @@
       .filter((edge) => edge.target === selected.id)
       .map((edge) => allNodeById.get(edge.source))
       .filter((node) => node?.kind === "transition");
-    const outgoing = model.allEdges
+    const edgeOutgoing = model.allEdges
       .filter((edge) => edge.source === selected.id)
       .map((edge) => allNodeById.get(edge.target))
       .filter((node) => node?.kind === "transition");
+    const mutationOutgoing = model.allNodes.filter(
+      (node) => node.kind === "transition" && node.flow?.mutations.some((ref) => techTreeClassId(ref.class, ref.hash) === selected.id),
+    );
+    const outgoing = [...new Map([...edgeOutgoing, ...mutationOutgoing].map((node) => [node.id, node])).values()];
     const objects = [...(selected.objects || [])].sort((left, right) =>
       (left.fileName === focusObject?.fileName ? -1 : 0) - (right.fileName === focusObject?.fileName ? -1 : 0) ||
       (left.status === "live" ? -1 : 1) - (right.status === "live" ? -1 : 1) ||
@@ -2133,6 +2486,9 @@
             <span><i class="legend-place" aria-hidden="true"></i>Class state</span>
             <span><i class="legend-transition" aria-hidden="true"></i>Action transition</span>
             <span><i class="legend-ready" aria-hidden="true"></i>Locally ready</span>
+            <span><i class="legend-edge legend-input" aria-hidden="true"></i>Consume</span>
+            <span><i class="legend-edge legend-output" aria-hidden="true"></i>Create</span>
+            <span><i class="legend-edge legend-opaque" aria-hidden="true"></i>Unresolved I/O</span>
             <span class="tech-tree-counts"><b data-tree-place-count>0</b> states / <b data-tree-action-count>0</b> transitions / <b data-tree-network-count>0</b> networks</span>
           </div>
           <div id="tech-tree-canvas" class="tech-tree-canvas">
@@ -2141,12 +2497,12 @@
             </button>
             <svg id="tech-tree-svg" role="group" aria-labelledby="tech-tree-svg-title tech-tree-svg-description" preserveAspectRatio="xMidYMid meet">
               <title id="tech-tree-svg-title">${escapeHtml(cartridge.name)} action dependency graph</title>
-              <desc id="tech-tree-svg-description">Class states connect to action transitions through required input and produced output arcs.</desc>
+              <desc id="tech-tree-svg-description">Class states connect to action transitions through consume, create, and dashed unresolved input or output arcs. Explicit mutations are excluded.</desc>
             </svg>
             <span class="tech-tree-map-help" aria-hidden="true">Click: trace prerequisites / again: clear / drag: pan / wheel: zoom</span>
           </div>
           <div id="tech-tree-details" class="tech-tree-details" aria-live="polite"></div>
-          <div class="terminal-note tech-tree-truth-note">This map uses the Driver's public, flattened action signatures. Object branches are possible transitions, not disclosed private provenance or hidden sub-action internals.</div>
+          <div class="terminal-note tech-tree-truth-note">Solid arcs are direct TxDelete consumes and TxInsert creates. Dashed neutral arcs are flattened I/O that the public predicate could not classify; hidden subactions are one possible cause. Explicit TxMutate updates are listed in the inspector but intentionally excluded from this dependency map.</div>
         </div>
       </section>`;
   }
@@ -2575,10 +2931,43 @@
     return state.workspace.actions.find((action) => qualifiedKey(action.action) === key) || null;
   }
 
+  function actionSubmissionKey(connection, action, selections) {
+    if (!connection || !action) return "";
+    return JSON.stringify([
+      connection.id,
+      qualifiedKey(action.action),
+      action.hash || "",
+      [...(selections || [])].map(String),
+    ]);
+  }
+
+  function visibleActionSubmissionKey() {
+    if (state.drawer?.type !== "action") return "";
+    return actionSubmissionKey(activeConnection(), actionByKey(state.drawer.key), state.drawer.selections);
+  }
+
+  function visibleActionMatches(connection, action) {
+    return Boolean(
+      state.drawer?.type === "action" &&
+      activeConnection()?.id === connection?.id &&
+      state.drawer.key === qualifiedKey(action?.action),
+    );
+  }
+
   async function openActionSetup(key) {
     const action = actionByKey(key);
     if (!action) return toast("Action unavailable", "Refresh the Driver catalog and try again.", "error");
-    state.drawer = { type: "action", key, report: null, error: null, loading: true, selections: [] };
+    state.drawer = {
+      type: "action",
+      key,
+      report: null,
+      error: null,
+      submitError: null,
+      loading: true,
+      selections: [],
+      submitting: false,
+      outcomeUnknown: false,
+    };
     openDrawer();
     renderDrawer();
     const connection = activeConnection();
@@ -2616,23 +3005,35 @@
   }
 
   function renderActionTechTreePortal(action, runState = {}) {
+    const dependencyFlow = actionDependencyFlow(action);
     const placeMap = new Map();
     const addPlaces = (refs, role) => {
       for (const { ref, count } of techTreeGroupedRefs(refs)) {
         const key = `${qualifiedKey(ref.class)}@${ref.hash || ""}`;
-        const place = placeMap.get(key) || { key, ref, inputCount: 0, outputCount: 0 };
+        const place = placeMap.get(key) || {
+          key,
+          ref,
+          inputCount: 0,
+          outputCount: 0,
+          opaqueInputCount: 0,
+          opaqueOutputCount: 0,
+        };
         place[`${role}Count`] += count;
         placeMap.set(key, place);
       }
     };
-    addPlaces(action.totalInputs || [], "input");
-    addPlaces(action.totalOutputs || [], "output");
+    addPlaces(dependencyFlow.inputs, "input");
+    addPlaces(dependencyFlow.outputs, "output");
+    addPlaces(dependencyFlow.opaqueInputs, "opaqueInput");
+    addPlaces(dependencyFlow.opaqueOutputs, "opaqueOutput");
     const comparePlaces = (left, right) =>
       (left.ref.class?.name || "").localeCompare(right.ref.class?.name || "") || left.key.localeCompare(right.key);
     const places = [...placeMap.values()].sort(comparePlaces);
-    const inputs = places.filter((place) => place.inputCount && !place.outputCount);
-    const outputs = places.filter((place) => place.outputCount && !place.inputCount);
-    const shared = places.filter((place) => place.inputCount && place.outputCount);
+    const inputTotal = (place) => place.inputCount + place.opaqueInputCount;
+    const outputTotal = (place) => place.outputCount + place.opaqueOutputCount;
+    const inputs = places.filter((place) => inputTotal(place) && !outputTotal(place));
+    const outputs = places.filter((place) => outputTotal(place) && !inputTotal(place));
+    const shared = places.filter((place) => inputTotal(place) && outputTotal(place));
     const placeWidth = 126;
     const placeHeight = 46;
     const transitionWidth = 130;
@@ -2670,14 +3071,12 @@
       const lines = techTreeNodeLabelLines(place.ref.class?.name || "Unknown", 14);
       const labelX = 35;
       const lineStart = lines.length > 1 ? 17 : 23;
-      let status = "";
-      if (place.inputCount && place.outputCount) {
-        status = `I${place.inputCount} / O${place.outputCount}${live ? ` / ${live} LIVE` : ""}`;
-      } else if (place.inputCount) {
-        status = `INPUT x${place.inputCount}${live ? ` / ${live} LIVE` : ""}`;
-      } else {
-        status = `OUTPUT x${place.outputCount}${live ? ` / ${live} LIVE` : ""}`;
-      }
+      const roles = [];
+      if (place.inputCount) roles.push(`I${place.inputCount}`);
+      if (place.opaqueInputCount) roles.push(`HI${place.opaqueInputCount}`);
+      if (place.outputCount) roles.push(`O${place.outputCount}`);
+      if (place.opaqueOutputCount) roles.push(`HO${place.opaqueOutputCount}`);
+      const status = `${roles.join(" / ")}${live ? ` / ${live} LIVE` : ""}`;
       return `
         <g class="tech-tree-node-place${live ? " has-live" : ""}" transform="translate(${x} ${y})" aria-hidden="true">
           <rect class="tech-tree-node-frame" width="${placeWidth}" height="${placeHeight}"></rect>
@@ -2688,8 +3087,14 @@
         </g>`;
     };
     const edgeMarkup = (sourceX, sourceY, targetX, targetY, role, count) => {
+      if (!count) return "";
+      const isInput = role.endsWith("input");
+      const isOpaque = role.startsWith("opaque");
+      const offset = isOpaque ? (isInput ? -4 : 4) : 0;
+      sourceY += offset;
+      targetY += offset;
       const control = Math.max(28, Math.abs(targetX - sourceX) * 0.45);
-      const markerId = role === "input" ? inputMarkerId : outputMarkerId;
+      const markerId = isOpaque ? `${markerScope}-opaque` : isInput ? inputMarkerId : outputMarkerId;
       const labelX = (sourceX + targetX) / 2;
       const labelY = (sourceY + targetY) / 2;
       return `
@@ -2699,20 +3104,29 @@
         </g>`;
     };
     const sharedEdgeMarkup = (place, x, y, role) => {
-      const markerId = role === "input" ? inputMarkerId : outputMarkerId;
-      const count = role === "input" ? place.inputCount : place.outputCount;
+      const isInput = role.endsWith("input");
+      const isOpaque = role.startsWith("opaque");
+      const markerId = isOpaque ? `${markerScope}-opaque` : isInput ? inputMarkerId : outputMarkerId;
+      const count = role === "input"
+        ? place.inputCount
+        : role === "output"
+          ? place.outputCount
+          : role === "opaque-input"
+            ? place.opaqueInputCount
+            : place.opaqueOutputCount;
+      if (!count) return "";
       const transitionCenterX = transitionX + transitionWidth / 2;
       const transitionBottomY = transitionY + transitionHeight;
       const placeCenterX = x + placeWidth / 2;
       const placeTopY = y;
-      const sourceX = role === "input" ? placeCenterX : transitionCenterX;
-      const sourceY = role === "input" ? placeTopY : transitionBottomY;
-      const targetX = role === "input" ? transitionCenterX : placeCenterX;
-      const targetY = role === "input" ? transitionBottomY : placeTopY;
+      const sourceX = isInput ? placeCenterX : transitionCenterX;
+      const sourceY = isInput ? placeTopY : transitionBottomY;
+      const targetX = isInput ? transitionCenterX : placeCenterX;
+      const targetY = isInput ? transitionBottomY : placeTopY;
       const busY = sideHeight + 8;
-      const lane = role === "input" ? -8 : 8;
+      const lane = (isInput ? -8 : 8) + (isOpaque ? (isInput ? -5 : 5) : 0);
       const labelX = (sourceX + targetX) / 2 + lane;
-      const labelY = busY + (role === "input" ? -7 : 9);
+      const labelY = busY + (isInput ? -7 : 9) + (isOpaque ? (isInput ? -4 : 4) : 0);
       return `
         <g class="tech-tree-edge tech-tree-edge-${role}" aria-hidden="true">
           <path d="M ${sourceX} ${sourceY} C ${sourceX + lane} ${busY}, ${targetX + lane} ${busY}, ${targetX} ${targetY}" marker-end="url(#${markerId})"></path>
@@ -2723,24 +3137,29 @@
     const parts = [`
       <svg class="action-tech-tree-portal" viewBox="0 0 ${width} ${height}" width="${width}" height="${height}" role="img" aria-labelledby="${titleId} ${descriptionId}" preserveAspectRatio="xMidYMid meet">
         <title id="${titleId}">${escapeHtml(action.action?.name || "Action")} direct action relationships</title>
-        <desc id="${descriptionId}">Only this action transition and its directly adjacent required and produced class states are shown. Inputs are on the left, outputs are on the right, and states used on both sides appear once beneath the transition with two arcs.</desc>
+        <desc id="${descriptionId}">Only this action transition and its adjacent input and output class states are shown. Inputs are on the left, outputs are on the right, unresolved slots use dashed neutral arcs, and explicit mutations are excluded.</desc>
         <defs>
           <marker id="${inputMarkerId}" class="tech-tree-marker tech-tree-marker-input" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z"></path></marker>
           <marker id="${outputMarkerId}" class="tech-tree-marker tech-tree-marker-output" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z"></path></marker>
+          <marker id="${markerScope}-opaque" class="tech-tree-marker tech-tree-marker-opaque" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z"></path></marker>
         </defs>`];
 
     inputs.forEach((place, index) => {
       const y = rowY(index, inputs.length);
       parts.push(edgeMarkup(inputX + placeWidth, y + placeHeight / 2, transitionX, transitionY + transitionHeight / 2, "input", place.inputCount));
+      parts.push(edgeMarkup(inputX + placeWidth, y + placeHeight / 2, transitionX, transitionY + transitionHeight / 2, "opaque-input", place.opaqueInputCount));
     });
     outputs.forEach((place, index) => {
       const y = rowY(index, outputs.length);
       parts.push(edgeMarkup(transitionX + transitionWidth, transitionY + transitionHeight / 2, outputX, y + placeHeight / 2, "output", place.outputCount));
+      parts.push(edgeMarkup(transitionX + transitionWidth, transitionY + transitionHeight / 2, outputX, y + placeHeight / 2, "opaque-output", place.opaqueOutputCount));
     });
     shared.forEach((place, index) => {
       const position = sharedPosition(index);
       parts.push(sharedEdgeMarkup(place, position.x, position.y, "input"));
+      parts.push(sharedEdgeMarkup(place, position.x, position.y, "opaque-input"));
       parts.push(sharedEdgeMarkup(place, position.x, position.y, "output"));
+      parts.push(sharedEdgeMarkup(place, position.x, position.y, "opaque-output"));
     });
 
     inputs.forEach((place, index) => parts.push(placeMarkup(place, inputX, rowY(index, inputs.length))));
@@ -2749,8 +3168,8 @@
       const position = sharedPosition(index);
       parts.push(placeMarkup(place, position.x, position.y));
     });
-    if (!(action.totalInputs || []).length) parts.push(`<text class="tech-tree-empty" x="${inputX + placeWidth / 2}" y="${sideHeight / 2}" text-anchor="middle">NO INPUTS</text>`);
-    if (!(action.totalOutputs || []).length) parts.push(`<text class="tech-tree-empty" x="${outputX + placeWidth / 2}" y="${sideHeight / 2}" text-anchor="middle">NO OUTPUTS</text>`);
+    if (!dependencyFlow.inputs.length && !dependencyFlow.opaqueInputs.length) parts.push(`<text class="tech-tree-empty" x="${inputX + placeWidth / 2}" y="${sideHeight / 2}" text-anchor="middle">NO CONSUMES</text>`);
+    if (!dependencyFlow.outputs.length && !dependencyFlow.opaqueOutputs.length) parts.push(`<text class="tech-tree-empty" x="${outputX + placeWidth / 2}" y="${sideHeight / 2}" text-anchor="middle">NO CREATES</text>`);
 
     const transitionLines = techTreeNodeLabelLines(action.action?.name || "Action", 16);
     const transitionLineStart = transitionLines.length > 1 ? 19 : 25;
@@ -2774,14 +3193,46 @@
       </g>
       </svg>`);
 
+    const unresolvedRelationships = dependencyFlow.opaqueInputs.length + dependencyFlow.opaqueOutputs.length;
+    const notes = [];
+    if (dependencyFlow.mutations.length) notes.push(`${dependencyFlow.mutations.length} explicit object update${dependencyFlow.mutations.length === 1 ? " is" : "s are"} excluded; mutations need a separate identity-preserving view.`);
+    if (unresolvedRelationships) notes.push(`${unresolvedRelationships} unresolved flattened I/O slot${unresolvedRelationships === 1 ? " is" : "s are"} shown with dashed neutral arcs; the public predicate does not expose enough detail to classify the operation.`);
+    const omittedNote = notes.length ? `<div class="terminal-note action-tech-tree-note">${escapeHtml(notes.join(" "))}</div>` : "";
     return `
       <div class="game-panel action-tech-tree-panel">
-        <div class="game-panel-header"><h3>Action tech-tree portal</h3><span>Direct relationships only</span></div>
-        <div class="game-panel-body"><div class="action-tech-tree-viewport" tabindex="0" role="region" aria-label="Scrollable direct action relationship graph">${parts.join("")}</div></div>
+        <div class="game-panel-header"><h3>Action tech-tree portal</h3><span>I/O only</span></div>
+        <div class="game-panel-body"><div class="action-tech-tree-viewport" tabindex="0" role="region" aria-label="Scrollable action input and output relationship graph">${parts.join("")}</div></div>
+        ${omittedNote}
       </div>`;
   }
 
+  function actionProofRequirementsMarkup(action) {
+    const workload = actionProofWorkload(action);
+    const rating = (kind, value) => `
+      <div class="proof-rating proof-rating-${value.level.toLowerCase()}">
+        <span>${kind}</span>
+        <strong>${escapeHtml(value.level)}</strong>
+        <small>${escapeHtml(value.detail)}</small>
+      </div>`;
+    return `
+      <section class="game-panel action-proof-panel" aria-labelledby="action-proof-title">
+        <div class="game-panel-header"><h3 id="action-proof-title">Direct work gates</h3><span>Partial predicate hints</span></div>
+        <div class="game-panel-body">
+          <div class="proof-rating-grid">
+            ${rating("PoW / inferred", workload.pow)}
+            ${rating("VDF / iteration band", workload.vdf)}
+          </div>
+          <p class="action-proof-note">Easy–Extreme groups assumed search-trial counts; Short–Long groups literal VDF iteration totals. Neither is a duration, and the two scales are independent. This is a partial, UI-inferred reading of direct gates only: custom or nested calls may add undisclosed work, while the object, selected Driver, and current load determine realized time.</p>
+        </div>
+      </section>`;
+  }
+
   function renderActionDrawer(action, model) {
+    const dependencyFlow = actionDependencyFlow(action);
+    const submissionKey = actionSubmissionKey(activeConnection(), action, model.selections);
+    const submissionInFlight = state.inFlightActionSubmissions.has(submissionKey);
+    const outcomeUnknown = model.outcomeUnknown || state.ambiguousActionSubmissions.has(submissionKey);
+    const submissionLocked = submissionInFlight || outcomeUnknown;
     const used = new Set(model.selections.filter(Boolean));
     const slots = (action.totalInputs || []).map((required, index) => {
       const usedElsewhere = new Set([...used].filter((fileName) => fileName !== model.selections[index]));
@@ -2789,17 +3240,27 @@
       return `
         <div class="game-field">
           <label for="action-input-${index}">Input ${index + 1} / ${escapeHtml(required.class?.name || "Object")}</label>
-          <select id="action-input-${index}" class="game-select" data-action-input="${index}">
+          <select id="action-input-${index}" class="game-select" data-action-input="${index}"${model.submitting ? " disabled" : ""}>
             <option value="">Choose an object</option>
             ${candidates.map((object) => `<option value="${escapeHtml(object.fileName)}"${model.selections[index] === object.fileName ? " selected" : ""}>${escapeHtml(`${object.emoji || ""} ${object.class?.name || "Object"} / ${shortText(object.contentHash)}`)}</option>`).join("")}
           </select>
           ${candidates.length ? "" : "<small>No compatible live object is available.</small>"}
         </div>`;
     }).join("");
-    const outputs = (action.totalOutputs || []).map((item) => `<span class="chip">${escapeHtml(item.class?.name || "?")}</span>`).join("") || '<span class="chip">No declared output</span>';
+    const outputs = techTreeRefsMarkup(dependencyFlow.outputs, "No direct creates");
+    const unresolvedOutputs = dependencyFlow.opaqueOutputs.length
+      ? `<div class="game-panel proof-update-panel"><div class="game-panel-header"><h3>Unresolved outputs</h3><span>Dashed in graph</span></div><div class="game-panel-body"><div class="chip-list">${techTreeRefsMarkup(dependencyFlow.opaqueOutputs, "")}</div><p class="action-proof-note">The flattened signature exposes these outputs, but the public predicate does not identify their exact operation.</p></div></div>`
+      : "";
+    const updates = dependencyFlow.mutations.length
+      ? `<div class="game-panel proof-update-panel"><div class="game-panel-header"><h3>Updated objects</h3><span>Not dependency outputs</span></div><div class="game-panel-body"><div class="chip-list">${techTreeRefsMarkup(dependencyFlow.mutations, "")}</div></div></div>`
+      : "";
+    const opaque = dependencyFlow.opaqueInputs.length
+      ? `<div class="terminal-note">${techTreeRefsMarkup(dependencyFlow.opaqueInputs, "")} remains required by the flattened signature, but its exact operation is unresolved. Hidden subactions or unavailable predicate detail can cause this.</div>`
+      : "";
     const unique = new Set(model.selections.filter(Boolean)).size === (action.totalInputs || []).length;
     const complete = model.selections.filter(Boolean).length === (action.totalInputs || []).length;
-    const canRun = !model.loading && !model.error && model.report?.feasible === true && complete && unique;
+    const canRun = !model.loading && !model.error && !model.submitting && !submissionLocked && model.report?.feasible === true && complete && unique;
+    const showProofRequirements = !(action.totalInputs || []).length || model.selections.some(Boolean);
     return `
       <div class="drawer-header">
         <div><p class="screen-kicker">Action setup</p><h2 class="drawer-title" id="drawer-title">${escapeHtml(action.action?.name || "Action")}</h2></div>
@@ -2809,15 +3270,21 @@
         <p class="screen-copy">${escapeHtml(action.description || "")}</p>
         ${model.loading ? '<div class="terminal-note">Checking feasibility with the Driver...</div>' : ""}
         ${model.error ? `<div class="terminal-note error">${escapeHtml(model.error)}</div>` : ""}
+        <div data-action-submit-error aria-live="polite" aria-atomic="true">${model.submitError ? `<div class="terminal-note ${outcomeUnknown ? "warning" : "error"}" tabindex="-1">${escapeHtml(model.submitError)}</div>` : outcomeUnknown ? '<div class="terminal-note warning" tabindex="-1">A matching submission had an unknown outcome in this browser session. Review Activity before retrying; choose different input objects or reload only after you have reconciled the prior request.</div>' : submissionInFlight ? '<div class="terminal-note" tabindex="-1">A matching request is already in flight in this browser session. You can close this drawer safely; duplicate submission remains locked.</div>' : ""}</div>
         <form id="action-run-form" class="game-form">
           ${(action.totalInputs || []).length ? slots : '<div class="terminal-note">This action requires no input objects.</div>'}
+          ${showProofRequirements ? actionProofRequirementsMarkup(action) : ""}
           <div class="game-panel">
             <div class="game-panel-header"><h3>Expected outputs</h3></div>
             <div class="game-panel-body"><div class="chip-list">${outputs}</div></div>
           </div>
-          <div class="terminal-note warning">Submitting starts a mutation directly on the selected Driver. If the browser loses the response, check Activity before retrying.</div>
+          ${unresolvedOutputs}
+          ${updates}
+          ${opaque}
+          <div class="terminal-note warning">Submitting starts a state-changing action directly on the selected Driver. If the browser loses the response, check Activity before retrying.</div>
+          <div data-action-submit-meter aria-live="polite" aria-atomic="true">${model.submitting ? runSubmissionProgressMarkup() : ""}</div>
           <div class="game-form-actions">
-            <button class="game-button game-button-primary" type="submit"${canRun ? "" : " disabled"}>Run action</button>
+            <button id="action-run-submit" class="game-button game-button-primary" type="submit"${canRun ? "" : " disabled"}>${model.submitting ? "Starting..." : outcomeUnknown ? "Session safety lock" : submissionInFlight ? "Request in flight" : "Run action"}</button>
           </div>
         </form>
         ${renderActionTechTreePortal(action, { canRun, loading: model.loading, error: Boolean(model.error), feasible: model.report?.feasible })}
@@ -2826,18 +3293,36 @@
 
   async function submitActionRun() {
     const model = state.drawer;
-    if (model?.type !== "action") return;
+    if (model?.type !== "action" || model.submitting) return;
     const action = actionByKey(model.key);
     const connection = activeConnection();
     const generation = state.workspaceGeneration;
     if (!action || !connection) return;
     const selections = model.selections || [];
-    if (selections.filter(Boolean).length !== (action.totalInputs || []).length) return;
+    const complete = selections.filter(Boolean).length === (action.totalInputs || []).length;
+    const unique = new Set(selections.filter(Boolean)).size === (action.totalInputs || []).length;
+    const submissionKey = actionSubmissionKey(connection, action, selections);
+    if (state.inFlightActionSubmissions.has(submissionKey) || state.ambiguousActionSubmissions.has(submissionKey)) {
+      const inFlight = state.inFlightActionSubmissions.has(submissionKey);
+      toast("Submission locked", inFlight ? "A matching request is already in flight." : "Review the earlier unknown outcome in Activity before retrying these inputs.", "warning");
+      return;
+    }
+    if (model.loading || model.error || model.report?.feasible !== true || !complete || !unique) return;
+    state.inFlightActionSubmissions.add(submissionKey);
+    model.submitting = true;
+    model.submitError = null;
+    const previousError = drawerContent.querySelector("[data-action-submit-error]");
+    if (previousError) previousError.innerHTML = "";
+    drawerContent.querySelectorAll("[data-action-input]").forEach((select) => {
+      select.disabled = true;
+    });
     const submit = drawerContent.querySelector('#action-run-form button[type="submit"]');
     if (submit) {
       submit.disabled = true;
       submit.textContent = "Starting...";
     }
+    const submitMeter = drawerContent.querySelector("[data-action-submit-meter]");
+    if (submitMeter) submitMeter.innerHTML = runSubmissionProgressMarkup();
     try {
       const accepted = await driverRequest(
         connection,
@@ -2845,31 +3330,72 @@
         jsonOptions("POST", { input: { action: action.action, inputObjectPaths: selections } }, 30000),
       );
       if (!accepted?.runId) throw new DriverError("Driver accepted the request without returning a run id.");
+      state.inFlightActionSubmissions.delete(submissionKey);
       rememberRun(connection.id, accepted.runId);
       if (!isCurrentWorkspace(connection, generation)) {
+        const currentConnection = activeConnection();
+        if (currentConnection?.id === connection.id) {
+          const currentGeneration = state.workspaceGeneration;
+          mergeRun({ ...accepted, action: action.action, result: null, error: null, progress: [] });
+          void watchRun(accepted.runId, currentConnection, currentGeneration);
+          if (visibleActionMatches(currentConnection, action)) {
+            state.drawer = { type: "run", runId: accepted.runId };
+            renderDrawer(false);
+            requestAnimationFrame(() => {
+              drawerContent.scrollTop = 0;
+              drawerContent.querySelector("[data-run-focus]")?.focus({ preventScroll: true });
+            });
+          }
+        } else if (state.drawer === model) {
+          closeDrawer();
+        }
         toast("Action started", `${action.action.name} started on ${connection.name}. Switch back to follow ${shortText(accepted.runId)}.`, "success");
         return;
       }
       mergeRun({ ...accepted, action: action.action, result: null, error: null, progress: [] });
       void watchRun(accepted.runId, connection, generation);
-      if (state.drawer === model) {
-        closeDrawer();
-        navigate("activity");
-        openRunDrawer(accepted.runId);
+      if (visibleActionMatches(connection, action)) {
+        state.drawer = { type: "run", runId: accepted.runId };
+        renderDrawer(false);
+        requestAnimationFrame(() => {
+          drawerContent.scrollTop = 0;
+          drawerContent.querySelector("[data-run-focus]")?.focus({ preventScroll: true });
+        });
       }
       toast("Action started", `${action.action.name} / ${shortText(accepted.runId)}`, "success");
     } catch (error) {
       const ambiguous = error.status === 0;
+      state.inFlightActionSubmissions.delete(submissionKey);
+      if (ambiguous) state.ambiguousActionSubmissions.add(submissionKey);
+      if (visibleActionSubmissionKey() === submissionKey) {
+        const visibleModel = state.drawer;
+        visibleModel.submitting = false;
+        visibleModel.outcomeUnknown = ambiguous;
+        visibleModel.submitError = ambiguous
+          ? `${error.message} The request may have reached the Driver; this action stays locked to prevent a duplicate submission.`
+          : error.message;
+        drawerContent.querySelectorAll("[data-action-input]").forEach((select) => {
+          select.disabled = false;
+        });
+        const errorRegion = drawerContent.querySelector("[data-action-submit-error]");
+        if (errorRegion) {
+          errorRegion.innerHTML = `<div class="terminal-note ${ambiguous ? "warning" : "error"}" tabindex="-1">${escapeHtml(visibleModel.submitError)}</div>`;
+          requestAnimationFrame(() => errorRegion.firstElementChild?.focus());
+        }
+        const meter = drawerContent.querySelector("[data-action-submit-meter]");
+        if (meter) meter.innerHTML = "";
+        const retry = drawerContent.querySelector("#action-run-submit");
+        if (retry) {
+          retry.disabled = ambiguous;
+          retry.textContent = ambiguous ? "Session safety lock" : "Run action";
+        }
+      }
       toast(
         ambiguous ? "Outcome unknown" : "Action was not started",
-        ambiguous ? `${error.message} Check Activity before retrying; the Driver may have accepted the mutation.` : error.message,
+        ambiguous ? `${error.message} Check Activity before retrying; the Driver may have accepted the action.` : error.message,
         "error",
         9000,
       );
-      if (submit && state.drawer === model) {
-        submit.disabled = false;
-        submit.textContent = "Run action";
-      }
       if (ambiguous && isCurrentWorkspace(connection, generation)) {
         void loadRetainedRuns(connection, generation).then(() => {
           if (isCurrentWorkspace(connection, generation)) scheduleLivePatch({ activity: true });
@@ -3144,6 +3670,93 @@
     });
   }
 
+  const RUN_STAGE_LABELS = ["Queue", "Prepare", "Commit", "Complete"];
+
+  function runStageView(run) {
+    if (!run) {
+      return { activeIndex: -1, value: 0, label: "Loading run", message: "Reading retained Driver state.", failed: false, succeeded: false };
+    }
+    const status = String(run.status || "queued").toLowerCase();
+    const latest = Array.isArray(run.progress) && run.progress.length ? run.progress[run.progress.length - 1] : null;
+    const latestPhase = String(latest?.phase || "").toLowerCase();
+    const message = latest?.message || run.error || (status === "succeeded" ? "The Driver reported a successful action run." : "Waiting for the Driver to report its next stage.");
+    if (status === "succeeded") {
+      return { activeIndex: -1, value: 4, label: "Action complete", message, failed: false, succeeded: true };
+    }
+    if (status === "failed") {
+      const activeIndex = latestPhase.includes("commit") ? 2 : latestPhase.includes("proof") ? 1 : 0;
+      return { activeIndex, value: activeIndex + 1, label: `${RUN_STAGE_LABELS[activeIndex]} failed`, message, failed: true, succeeded: false };
+    }
+    if (status === "committing") {
+      return { activeIndex: 2, value: 3, label: "Finalize & commit", message, failed: false, succeeded: false };
+    }
+    if (status === "generateproof" || status === "running") {
+      return { activeIndex: 1, value: 2, label: "Prepare & prove", message, failed: false, succeeded: false };
+    }
+    return { activeIndex: 0, value: 1, label: "Queued by Driver", message, failed: false, succeeded: false };
+  }
+
+  function runStageClasses(view, index) {
+    const complete = view.succeeded || index < view.activeIndex;
+    const active = index === view.activeIndex;
+    return [
+      "run-meter-segment",
+      complete ? "is-complete" : "",
+      active ? "is-active" : "",
+      active && view.failed ? "is-failed" : "",
+    ].filter(Boolean).join(" ");
+  }
+
+  function runProgressMeterMarkup(run) {
+    const view = runStageView(run);
+    const segments = RUN_STAGE_LABELS.map((label, index) => {
+      return `<li class="${runStageClasses(view, index)}" data-run-stage-index="${index}"><span aria-hidden="true">${index + 1}</span><b>${label}</b></li>`;
+    }).join("");
+    return `
+      <div class="run-meter${view.failed ? " is-failed" : view.succeeded ? " is-succeeded" : ""}" data-run-meter-shell>
+        <div class="run-meter-copy">
+          <span>Driver pipeline</span>
+          <strong data-run-meter-label>${escapeHtml(view.label)}</strong>
+          <small data-run-meter-unit>Stage ${view.value} of 4 / not elapsed time</small>
+        </div>
+        <ol class="run-meter-track" data-run-meter-track role="progressbar" aria-label="Action pipeline stage" aria-valuemin="0" aria-valuemax="4" aria-valuenow="${view.value}" aria-valuetext="${escapeHtml(view.label)}">${segments}</ol>
+        <p data-run-meter-message>${escapeHtml(view.message)}</p>
+        <span class="sr-only" data-run-meter-announcement aria-live="polite" aria-atomic="true">${escapeHtml(`${view.label}. ${view.message}`)}</span>
+      </div>`;
+  }
+
+  function patchRunMeter(run) {
+    const shell = drawerContent.querySelector("[data-run-meter-shell]");
+    if (!shell) return;
+    const view = runStageView(run);
+    shell.className = `run-meter${view.failed ? " is-failed" : view.succeeded ? " is-succeeded" : ""}`;
+    const label = shell.querySelector("[data-run-meter-label]");
+    const unit = shell.querySelector("[data-run-meter-unit]");
+    const track = shell.querySelector("[data-run-meter-track]");
+    const message = shell.querySelector("[data-run-meter-message]");
+    const announcement = shell.querySelector("[data-run-meter-announcement]");
+    if (label) label.textContent = view.label;
+    if (unit) unit.textContent = `Stage ${view.value} of 4 / not elapsed time`;
+    if (track) {
+      track.setAttribute("aria-valuenow", String(view.value));
+      track.setAttribute("aria-valuetext", view.label);
+    }
+    shell.querySelectorAll("[data-run-stage-index]").forEach((segment) => {
+      segment.className = runStageClasses(view, Number(segment.dataset.runStageIndex));
+    });
+    if (message && message.textContent !== view.message) message.textContent = view.message;
+    const announcementText = `${view.label}. ${view.message}`;
+    if (announcement && announcement.textContent !== announcementText) announcement.textContent = announcementText;
+  }
+
+  function runSubmissionProgressMarkup() {
+    return `
+      <div class="run-meter is-requesting">
+        <div class="run-meter-copy"><span>Action request</span><strong>Contacting Driver</strong><small>Awaiting a run id / not yet queued</small></div>
+        <div class="run-request-track" role="progressbar" aria-label="Submitting action" aria-valuetext="Contacting Driver"><span></span></div>
+      </div>`;
+  }
+
   function runProgressMarkup(run) {
     const progress = (run?.progress || []).map((item) => `
       <li class="game-list-row">
@@ -3166,7 +3779,7 @@
     const run = state.workspace.runs.get(model.runId);
     return `
       <div class="drawer-header">
-        <div><p class="screen-kicker">Action run</p><h2 class="drawer-title" id="drawer-title" data-run-title>${escapeHtml(run?.action?.name || shortText(model.runId))}</h2></div>
+        <div><p class="screen-kicker">Action run</p><h2 class="drawer-title" id="drawer-title" data-run-title data-run-focus tabindex="-1">${escapeHtml(run?.action?.name || shortText(model.runId))}</h2></div>
         <button class="game-button" type="button" data-command="close-drawer">Close</button>
       </div>
       <div class="drawer-body">
@@ -3178,7 +3791,7 @@
           <div class="summary-stat"><span>Consumed</span><strong data-run-consumed>${run?.result?.nullifiedFiles?.length || 0}</strong></div>
         </div>
         <div data-run-error>${run?.error ? `<div class="terminal-note error">${escapeHtml(run.error)}</div>` : ""}</div>
-        <div class="game-panel"><div class="game-panel-header"><h3>Progress</h3><span data-run-badge>${badge(run?.status || "loading")}</span></div><div class="game-panel-body flush" data-run-progress>${runProgressMarkup(run)}</div></div>
+        <div class="game-panel"><div class="game-panel-header"><h3>Progress</h3><span data-run-badge>${badge(run?.status || "loading")}</span></div><div class="game-panel-body run-progress-body"><div data-run-meter>${runProgressMeterMarkup(run)}</div><div class="run-progress-log" data-run-progress>${runProgressMarkup(run)}</div></div></div>
         <div data-run-result>${runResultMarkup(run)}</div>
       </div>`;
   }
@@ -3202,6 +3815,7 @@
     setHtml("[data-run-request-error]", state.drawer.error ? `<div class="terminal-note error">${escapeHtml(state.drawer.error)}</div>` : "");
     setHtml("[data-run-error]", run?.error ? `<div class="terminal-note error">${escapeHtml(run.error)}</div>` : "");
     setHtml("[data-run-badge]", badge(run?.status || "loading"));
+    patchRunMeter(run);
     setHtml("[data-run-progress]", runProgressMarkup(run));
     setHtml("[data-run-result]", runResultMarkup(run));
   }
@@ -3381,6 +3995,9 @@
     const last = focusable[focusable.length - 1];
     const current = document.activeElement;
     if (!drawer.contains(current)) {
+      event.preventDefault();
+      (event.shiftKey ? last : first).focus({ preventScroll: true });
+    } else if (!focusable.includes(current)) {
       event.preventDefault();
       (event.shiftKey ? last : first).focus({ preventScroll: true });
     } else if (event.shiftKey && current === first) {
@@ -3824,6 +4441,8 @@
     if (event.target.matches("[data-action-input]") && state.drawer?.type === "action") {
       const index = Number(event.target.dataset.actionInput);
       state.drawer.selections[index] = event.target.value;
+      state.drawer.outcomeUnknown = false;
+      state.drawer.submitError = null;
       renderDrawer(false);
       requestAnimationFrame(() => drawerContent.querySelector(`[data-action-input="${index}"]`)?.focus());
     }
