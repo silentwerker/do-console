@@ -398,6 +398,14 @@
       goalSemantics: "additional",
       goalQuantity: 1,
       result: null,
+      viewBox: null,
+      viewKey: "",
+      layout: null,
+      drag: null,
+      viewMode: "fit",
+      fullscreenFallback: false,
+      fullscreenRequestPending: false,
+      deferredReplan: null,
     },
     linkedConfigHandle: null,
     linkedConfigName: null,
@@ -1141,6 +1149,7 @@
 
   function resetWorkspace() {
     cleanupTechTreeFullscreen();
+    cleanupPlannerTreeFullscreen();
     state.workspaceGeneration += 1;
     state.workspace = emptyWorkspace();
     state.events = [];
@@ -1160,6 +1169,12 @@
     state.planner.goalSemantics = "additional";
     state.planner.goalQuantity = 1;
     state.planner.result = null;
+    state.planner.viewBox = null;
+    state.planner.viewKey = "";
+    state.planner.layout = null;
+    state.planner.drag = null;
+    state.planner.viewMode = "fit";
+    state.planner.deferredReplan = null;
   }
 
   async function refreshEverything() {
@@ -1419,7 +1434,9 @@
   }
 
   function render() {
+    if (state.planner.drag) cancelPlannerTreePan();
     if (state.screen !== "tree") cleanupTechTreeFullscreen();
+    if (state.screen !== "planner") cleanupPlannerTreeFullscreen();
     updateHeader();
     const focusToken = captureFocus(main);
     const shouldAutofocus = Boolean(focusToken) || !document.activeElement || document.activeElement === document.body || document.activeElement === main;
@@ -1452,10 +1469,11 @@
     };
     main.innerHTML = renderers[state.screen]();
     if (state.screen !== "tree" || !byId("tech-tree-canvas")) cleanupTechTreeFullscreen();
+    if (state.screen !== "planner" || !byId("planner-tree-canvas")) cleanupPlannerTreeFullscreen();
     main.dataset.screen = state.screen;
     requestAnimationFrame(() => {
       if (state.screen === "tree") mountTechTree();
-      if (state.screen === "planner") centerPlannerTarget(main.querySelector(".planner-tree-viewport"));
+      if (state.screen === "planner") mountPlannerTree();
       const captured = findCapturedFocus(main, focusToken);
       if (captured) {
         captured.focus({ preventScroll: true });
@@ -5102,14 +5120,52 @@
       }
     });
     const height = Math.max(190, TOP + maximumDepth * (64 + LEVEL_GAP) + 64 + 30);
-    return { root, nodes, edges, width, height, maximumDepth };
+    const left = Math.min(...nodes.map((node) => node.x));
+    const top = Math.min(...nodes.map((node) => node.y));
+    const right = Math.max(...nodes.map((node) => node.x + node.size.width));
+    const bottom = Math.max(...nodes.map((node) => node.y + node.size.height));
+    const bounds = {
+      x: left,
+      y: top,
+      width: Math.max(1, right - left),
+      height: Math.max(1, bottom - top),
+    };
+    return { root, nodes, edges, width, height, bounds, maximumDepth };
+  }
+
+  function plannerTreeViewKey(layout) {
+    return JSON.stringify([
+      state.planner.goalClassId,
+      state.planner.goalSemantics,
+      state.planner.goalQuantity,
+      layout.nodes.map((node) => [node.id, node.kind, node.state, node.depth, node.x, node.y]),
+      layout.edges.map((edge) => [edge.source.id, edge.target.id, edge.role]),
+    ]);
+  }
+
+  function fittedPlannerTreeView(layout = state.planner.layout) {
+    if (!layout?.bounds) return null;
+    const padding = 28;
+    return {
+      x: layout.bounds.x - padding,
+      y: layout.bounds.y - padding,
+      width: layout.bounds.width + padding * 2,
+      height: layout.bounds.height + padding * 2,
+    };
+  }
+
+  function plannerTreeViewBoxValue(view = state.planner.viewBox) {
+    if (!view) return "";
+    return [view.x, view.y, view.width, view.height]
+      .map((value) => Number(value.toFixed(3)))
+      .join(" ");
   }
 
   function plannerNodeStatus(node, timingByStep) {
     if (node.kind === "action") {
       return `STEP ${node.step.index + 1} / ${plannerDirectTimingLabel(timingByStep.get(node.step.id))}`;
     }
-    if (node.state === "inventory") return node.isRoot ? "TARGET / ON HAND" : "ON HAND / 0 WORK";
+    if (node.state === "inventory") return node.isRoot ? "TARGET / LIVE INVENTORY" : "LIVE INVENTORY / NO ACTION";
     if (node.state === "shared") return `FROM STEP ${(node.aliasStep?.index ?? 0) + 1} / SHARED`;
     if (node.state === "cycle") return "CYCLE REFERENCE";
     if (node.state === "search-limit") return "SEARCH LIMIT";
@@ -5122,6 +5178,16 @@
   function plannerTreeSvg(root, timingByStep, cartridgeName) {
     const layout = layoutPlannerDisplayTree(root);
     if (!layout) return "";
+    const viewKey = plannerTreeViewKey(layout);
+    state.planner.layout = layout;
+    if (state.planner.viewKey !== viewKey || !state.planner.viewBox) {
+      state.planner.viewKey = viewKey;
+      state.planner.viewBox = fittedPlannerTreeView(layout);
+      state.planner.viewMode = "fit";
+      state.planner.drag = null;
+    }
+    const aspect = layout.bounds.width / layout.bounds.height;
+    const canvasShape = aspect >= 4 ? "is-wide" : aspect <= 1.35 ? "is-deep" : "is-balanced";
     const denseGraph = layout.nodes.length > 120;
     const edgeMarkup = layout.edges.map((edge) => {
       const sourceX = edge.source.x + edge.source.size.width / 2;
@@ -5160,6 +5226,9 @@
       if (node.isRoot) classes.push("is-target");
       const lines = techTreeNodeLabelLines(node.label, node.kind === "object" ? 20 : 18);
       const status = plannerNodeStatus(node, timingByStep);
+      const inventorySource = node.state === "inventory" && node.token
+        ? ` Driver object: ${node.token.fileName || node.token.contentHash || node.token.tokenId}.`
+        : "";
       const shape = node.kind === "action"
         ? `<path class="planner-node-frame" d="M ${node.x + 12} ${node.y} H ${node.x + node.size.width - 12} L ${node.x + node.size.width} ${node.y + 12} V ${node.y + node.size.height - 12} L ${node.x + node.size.width - 12} ${node.y + node.size.height} H ${node.x + 12} L ${node.x} ${node.y + node.size.height - 12} V ${node.y + 12} Z"></path>`
         : `<rect class="planner-node-frame" x="${node.x}" y="${node.y}" width="${node.size.width}" height="${node.size.height}"></rect><rect class="planner-object-tab" x="${node.x + 12}" y="${node.y - 4}" width="34" height="7"></rect>`;
@@ -5167,26 +5236,41 @@
       const firstY = node.y + (lines.length > 1 ? 20 : 25);
       return `
         <g class="${classes.join(" ")}" aria-hidden="true">
-          <title>${escapeHtml(`${node.label}: ${status}`)}</title>
+          <title>${escapeHtml(`${node.label}: ${status}.${inventorySource}`)}</title>
           ${shape}
           ${lines.map((line, index) => `<text class="planner-node-label" x="${textX}" y="${firstY + index * 12}">${escapeHtml(line)}</text>`).join("")}
           <text class="planner-node-status" x="${textX}" y="${node.y + node.size.height - 9}">${escapeHtml(status)}</text>
         </g>`;
     }).join("");
     return `
-      <div id="planner-tree-viewport" class="planner-tree-viewport" role="region" aria-label="Scrollable goal dependency tree" tabindex="0" data-target-center-x="${layout.root.x + layout.root.size.width / 2}">
-        <svg class="planner-tree-svg" width="${layout.width}" height="${layout.height}" viewBox="0 0 ${layout.width} ${layout.height}" role="img" aria-labelledby="planner-tree-title planner-tree-description">
-          <title id="planner-tree-title">${escapeHtml(cartridgeName)} goal plan</title>
-          <desc id="planner-tree-description">The target object is at the top. Created objects flow upward from actions; required objects flow upward into the actions that use them. Dashed update arcs mark paired same-class input and output turnover whose post-state is not simulated. Dotted missing lines summarize unresolved prerequisite diagnostics rather than direct Petri arcs.</desc>
-          <defs>
-            <marker id="planner-arrow-input" class="planner-marker-input" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M 0 0 L 10 5 L 0 10 Z"></path></marker>
-            <marker id="planner-arrow-output" class="planner-marker-output" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M 1 5 L 5 1 L 9 5 L 5 9 Z"></path></marker>
-            <marker id="planner-arrow-update" class="planner-marker-update" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M 1 1 H 9 V 9 H 1 Z"></path></marker>
-            <marker id="planner-arrow-missing" class="planner-marker-missing" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><circle cx="5" cy="5" r="3.5"></circle></marker>
-          </defs>
-          ${edgeMarkup}
-          ${nodeMarkup}
-        </svg>
+      <div id="planner-tree-canvas" class="planner-tree-canvas ${canvasShape}" data-plan-node-count="${layout.nodes.length}">
+        <div class="planner-tree-control-bar">
+          <div class="planner-tree-control-copy" aria-hidden="true"><strong>Plan map</strong><span>Drag to pan / wheel to zoom</span></div>
+          <div class="game-toolbar-group planner-tree-view-controls" role="group" aria-label="Plan map view controls">
+            ${gameButton("-", "planner-tree-zoom-out", { extra: ' aria-label="Zoom out plan map" title="Zoom out" aria-keyshortcuts="-"' })}
+            ${gameButton("Fit", "planner-tree-fit", { extra: ' aria-label="Fit complete plan path" title="Fit complete plan path" aria-keyshortcuts="0 Home"' })}
+            ${gameButton("+", "planner-tree-zoom-in", { extra: ' aria-label="Zoom in plan map" title="Zoom in" aria-keyshortcuts="+"' })}
+            <output class="planner-tree-zoom-label" data-planner-tree-zoom aria-live="polite">100%</output>
+            <button class="game-button planner-tree-fullscreen-button" type="button" data-command="planner-tree-fullscreen" aria-label="Enter plan map fullscreen" title="Enter plan map fullscreen" aria-pressed="false">
+              <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true" focusable="false"><path d="M14 4h6v6 M20 4l-7 7 M10 20H4v-6 M4 20l7-7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square" stroke-linejoin="miter"></path></svg>
+              <span data-planner-fullscreen-label>Full</span>
+            </button>
+          </div>
+        </div>
+        <div id="planner-tree-viewport" class="planner-tree-viewport" role="region" aria-label="Goal dependency map. Drag to pan, use the mouse wheel or plus and minus keys to zoom, and press zero to fit the complete plan.">
+          <svg id="planner-tree-svg" class="planner-tree-svg" viewBox="${plannerTreeViewBoxValue()}" preserveAspectRatio="xMidYMid meet" role="img" tabindex="0" aria-labelledby="planner-tree-title planner-tree-description">
+            <title id="planner-tree-title">${escapeHtml(cartridgeName)} goal plan</title>
+            <desc id="planner-tree-description">The target object is at the top. Created objects flow upward from actions; required objects flow upward into the actions that use them. Dashed update arcs mark paired same-class input and output turnover whose post-state is not simulated. Dotted missing lines summarize unresolved prerequisite diagnostics rather than direct Petri arcs. The complete path is fitted automatically; drag to pan and zoom for detail.</desc>
+            <defs>
+              <marker id="planner-arrow-input" class="planner-marker-input" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M 0 0 L 10 5 L 0 10 Z"></path></marker>
+              <marker id="planner-arrow-output" class="planner-marker-output" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M 1 5 L 5 1 L 9 5 L 5 9 Z"></path></marker>
+              <marker id="planner-arrow-update" class="planner-marker-update" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M 1 1 H 9 V 9 H 1 Z"></path></marker>
+              <marker id="planner-arrow-missing" class="planner-marker-missing" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><circle cx="5" cy="5" r="3.5"></circle></marker>
+            </defs>
+            ${edgeMarkup}
+            ${nodeMarkup}
+          </svg>
+        </div>
       </div>`;
   }
 
@@ -5279,9 +5363,26 @@
         ? "No actions required"
         : `${result.totals.expandedStates.toLocaleString()} states checked`;
     const hasMissingBranches = tree?.children?.some((child) => child.inputRole === "missing");
+    const startingInventory = result.tokens.filter(
+      (token) => token.kind === "inventory" && (token.consumedByStepId || result.goalTokenIds.includes(token.tokenId)),
+    );
+    const startingCounts = new Map();
+    for (const token of startingInventory) {
+      startingCounts.set(token.classLabel, (startingCounts.get(token.classLabel) || 0) + 1);
+    }
+    const startingItems = [...startingCounts]
+      .sort(([left], [right]) => plannerCompareText(left, right))
+      .map(([label, count]) => `${count} ${label}`);
+    const visibleStartingItems = startingItems.slice(0, 5);
+    if (startingItems.length > visibleStartingItems.length) {
+      visibleStartingItems.push(`+${startingItems.length - visibleStartingItems.length} more types`);
+    }
+    const inventoryKey = startingItems.length
+      ? `<span title="${escapeHtml(`Current live Driver objects used by this plan: ${startingItems.join(", ")}`)}"><i class="planner-key-inventory" aria-hidden="true"></i>LIVE DRIVER / ${escapeHtml(visibleStartingItems.join(", "))}</span>`
+      : "";
     const treeGuide = result.steps.length > 40
-      ? "Target and direct components stay centered; scroll lower levels for the complete plan. UPDATE tools remain compact references."
-      : "Read down for requirements; arrows flow up toward the target.";
+      ? "The complete path is fitted; zoom for detail and drag to pan. UPDATE tools remain compact references."
+      : "The complete path is fitted. Read down for requirements; arrows flow up toward the target.";
     const goalRule = result.goal.semantics === "additional"
       ? `make +${result.goal.quantity} / ${result.goal.initialCount} on hand / finish with ${result.goal.targetCount}`
       : `have ${result.goal.targetCount}+ / ${result.goal.initialCount} on hand`;
@@ -5316,7 +5417,7 @@
         <div class="planner-summary-item"><span>Grounding</span><strong>${cwi ? `CWI-1 ${cwi.score.toLocaleString()}` : "No CWI"}</strong><small>${escapeHtml(groundingNote)}</small>${cwiControl}</div>
       </div>
       ${inventorySatisfiedNote}
-      <div class="planner-flow-key" aria-label="Plan relationship legend"><span><i class="planner-key-input" aria-hidden="true"></i>USE / consumed input</span><span><i class="planner-key-output" aria-hidden="true"></i>MAKE / created output</span><span><i class="planner-key-update" aria-hidden="true"></i>UPDATE / paired turnover</span>${hasMissingBranches ? '<span><i class="planner-key-missing" aria-hidden="true"></i>MISSING / unresolved prerequisite</span>' : ""}<span>${escapeHtml(treeGuide)}</span></div>
+      <div class="planner-flow-key" aria-label="Plan relationship legend"><span><i class="planner-key-input" aria-hidden="true"></i>USE / consumed input</span><span><i class="planner-key-output" aria-hidden="true"></i>MAKE / created output</span><span><i class="planner-key-update" aria-hidden="true"></i>UPDATE / paired turnover</span>${inventoryKey}${hasMissingBranches ? '<span><i class="planner-key-missing" aria-hidden="true"></i>MISSING / unresolved prerequisite</span>' : ""}<span>${escapeHtml(treeGuide)}</span></div>
       ${plannerTreeSvg(tree, timingByStep, context.cartridge.name)}
       ${plannerStepListMarkup(context, timingByStep)}
       ${diagnosticMarkup.length || warningMarkup.length ? `<div class="terminal-note warning planner-diagnostics"><strong>Plan limits</strong><ul>${[...diagnosticMarkup, ...warningMarkup].slice(0, 8).join("")}</ul></div>` : ""}
@@ -5360,18 +5461,333 @@
       </section>`;
   }
 
-  function centerPlannerTarget(viewport) {
-    if (!viewport) return;
-    const targetCenter = Number(viewport.dataset.targetCenterX);
-    if (!Number.isFinite(targetCenter)) return;
-    viewport.scrollLeft = Math.max(0, targetCenter - viewport.clientWidth / 2);
+  function syncPlannerTreeFullscreenUi() {
+    const canvas = byId("planner-tree-canvas");
+    const nativeActive = Boolean(canvas && techTreeFullscreenElement() === canvas);
+    if (nativeActive) state.planner.fullscreenFallback = false;
+    const fallbackActive = Boolean(canvas && state.planner.fullscreenFallback && !nativeActive);
+    const active = nativeActive || fallbackActive;
+    canvas?.classList.toggle("is-pseudo-fullscreen", fallbackActive);
+    document.documentElement.classList.toggle("has-planner-tree-fullscreen", active);
+    const button = canvas?.querySelector("[data-command='planner-tree-fullscreen']");
+    if (button) {
+      const label = active ? "Exit plan map fullscreen" : "Enter plan map fullscreen";
+      button.setAttribute("aria-label", label);
+      button.setAttribute("title", label);
+      button.setAttribute("aria-pressed", String(active));
+      const visibleLabel = button.querySelector("[data-planner-fullscreen-label]");
+      if (visibleLabel) visibleLabel.textContent = active ? "Exit" : "Full";
+    }
+  }
+
+  function enablePlannerTreeFullscreenFallback() {
+    if (state.screen !== "planner" || !byId("planner-tree-canvas")) return;
+    state.planner.fullscreenRequestPending = false;
+    state.planner.fullscreenFallback = true;
+    syncPlannerTreeFullscreenUi();
+  }
+
+  async function togglePlannerTreeFullscreen() {
+    const canvas = byId("planner-tree-canvas");
+    if (!canvas) return;
+    const nativeElement = techTreeFullscreenElement();
+    if (nativeElement === canvas) {
+      state.planner.fullscreenRequestPending = false;
+      const exit = document.exitFullscreen || document.webkitExitFullscreen;
+      try {
+        const result = exit?.call(document);
+        if (result?.then) await result;
+      } catch {
+        // The fullscreenchange event remains authoritative if exit rejects.
+      }
+      syncPlannerTreeFullscreenUi();
+      return;
+    }
+    if (state.planner.fullscreenFallback) {
+      state.planner.fullscreenFallback = false;
+      syncPlannerTreeFullscreenUi();
+      return;
+    }
+
+    const request = canvas.requestFullscreen || canvas.webkitRequestFullscreen;
+    if (!request) {
+      enablePlannerTreeFullscreenFallback();
+      return;
+    }
+    state.planner.fullscreenRequestPending = true;
+    try {
+      const result = request.call(canvas);
+      if (result?.then) {
+        await result;
+        state.planner.fullscreenRequestPending = false;
+        if (techTreeFullscreenElement() !== canvas) enablePlannerTreeFullscreenFallback();
+        else syncPlannerTreeFullscreenUi();
+      } else {
+        window.setTimeout(() => {
+          if (!state.planner.fullscreenRequestPending) return;
+          if (techTreeFullscreenElement() === byId("planner-tree-canvas")) {
+            state.planner.fullscreenRequestPending = false;
+            syncPlannerTreeFullscreenUi();
+          } else {
+            enablePlannerTreeFullscreenFallback();
+          }
+        }, 500);
+      }
+    } catch {
+      enablePlannerTreeFullscreenFallback();
+    }
+  }
+
+  function cleanupPlannerTreeFullscreen() {
+    state.planner.fullscreenFallback = false;
+    state.planner.fullscreenRequestPending = false;
+    state.planner.deferredReplan = null;
+    cancelPlannerTreePan();
+    byId("planner-tree-canvas")?.classList.remove("is-pseudo-fullscreen");
+    document.documentElement.classList.remove("has-planner-tree-fullscreen");
+    const nativeElement = techTreeFullscreenElement();
+    if (nativeElement?.id === "planner-tree-canvas") {
+      const exit = document.exitFullscreen || document.webkitExitFullscreen;
+      try {
+        const result = exit?.call(document);
+        if (result?.catch) result.catch(() => {});
+      } catch {
+        // Removing the fullscreen element also asks the browser to exit.
+      }
+    }
+  }
+
+  function handlePlannerTreeFullscreenChange() {
+    state.planner.fullscreenRequestPending = false;
+    syncPlannerTreeFullscreenUi();
+    if (techTreeFullscreenElement()?.id === "planner-tree-canvas" || state.planner.deferredReplan === null) return;
+    const replan = state.planner.deferredReplan;
+    state.planner.deferredReplan = null;
+    requestAnimationFrame(() => patchPlanner({ replan }));
+  }
+
+  function handlePlannerTreeFullscreenError() {
+    if (state.planner.fullscreenRequestPending) enablePlannerTreeFullscreenFallback();
+  }
+
+  function trapPlannerTreeFullscreenFocus(event) {
+    if (!state.planner.fullscreenFallback || event.key !== "Tab") return false;
+    const canvas = byId("planner-tree-canvas");
+    if (!canvas) return false;
+    const focusable = [...canvas.querySelectorAll("button:not([disabled]), [tabindex]:not([tabindex='-1'])")]
+      .filter((element) => element.getAttribute("aria-disabled") !== "true");
+    if (!focusable.length) return false;
+    const current = focusable.indexOf(document.activeElement);
+    if (current < 0 || (!event.shiftKey && current === focusable.length - 1) || (event.shiftKey && current === 0)) {
+      event.preventDefault();
+      focusable[event.shiftKey ? focusable.length - 1 : 0].focus({ preventScroll: true });
+      return true;
+    }
+    return false;
+  }
+
+  function plannerTreeZoomLimits() {
+    const layout = state.planner.layout;
+    const fitted = fittedPlannerTreeView(layout);
+    if (!layout || !fitted) return null;
+    return {
+      fitted,
+      minimumWidth: Math.max(90, layout.bounds.width * 0.04),
+      maximumWidth: Math.max(1200, fitted.width * 4),
+    };
+  }
+
+  function updatePlannerTreeViewControls() {
+    const canvas = byId("planner-tree-canvas");
+    const current = state.planner.viewBox;
+    const limits = plannerTreeZoomLimits();
+    if (!canvas || !current || !limits) return;
+    const percent = Math.max(1, Math.round((limits.fitted.width / current.width) * 100));
+    const output = canvas.querySelector("[data-planner-tree-zoom]");
+    if (output) output.textContent = `${percent}%`;
+    const zoomIn = canvas.querySelector("[data-command='planner-tree-zoom-in']");
+    const zoomOut = canvas.querySelector("[data-command='planner-tree-zoom-out']");
+    if (zoomIn) zoomIn.disabled = current.width <= limits.minimumWidth * 1.001;
+    if (zoomOut) zoomOut.disabled = current.width >= limits.maximumWidth * 0.999;
+  }
+
+  function applyPlannerTreeViewBox() {
+    const svg = byId("planner-tree-svg");
+    const value = plannerTreeViewBoxValue();
+    if (!svg || !value) return;
+    svg.setAttribute("viewBox", value);
+    updatePlannerTreeViewControls();
+  }
+
+  function mountPlannerTree() {
+    if (state.screen !== "planner" || !byId("planner-tree-svg") || !state.planner.layout) return;
+    applyPlannerTreeViewBox();
+    syncPlannerTreeFullscreenUi();
+  }
+
+  function fitPlannerTree() {
+    const fitted = fittedPlannerTreeView();
+    if (!fitted) return;
+    state.planner.viewBox = fitted;
+    state.planner.viewMode = "fit";
+    applyPlannerTreeViewBox();
+  }
+
+  function zoomPlannerTree(factor, anchor = null) {
+    const current = state.planner.viewBox;
+    const limits = plannerTreeZoomLimits();
+    if (!current || !limits || !Number.isFinite(factor) || factor <= 0) return;
+    const anchorX = anchor?.x ?? current.x + current.width / 2;
+    const anchorY = anchor?.y ?? current.y + current.height / 2;
+    const nextWidth = Math.min(limits.maximumWidth, Math.max(limits.minimumWidth, current.width * factor));
+    if (Math.abs(nextWidth - current.width) < 0.0001) return;
+    const scale = nextWidth / current.width;
+    const nextHeight = current.height * scale;
+    const anchorRatioX = (anchorX - current.x) / current.width;
+    const anchorRatioY = (anchorY - current.y) / current.height;
+    state.planner.viewBox = {
+      x: anchorX - nextWidth * anchorRatioX,
+      y: anchorY - nextHeight * anchorRatioY,
+      width: nextWidth,
+      height: nextHeight,
+    };
+    state.planner.viewMode = "manual";
+    applyPlannerTreeViewBox();
+  }
+
+  function panPlannerTree(horizontal, vertical) {
+    const current = state.planner.viewBox;
+    if (!current) return;
+    state.planner.viewBox = {
+      ...current,
+      x: current.x + current.width * horizontal,
+      y: current.y + current.height * vertical,
+    };
+    state.planner.viewMode = "manual";
+    applyPlannerTreeViewBox();
+  }
+
+  function plannerTreeInverseScreenMatrix(svg) {
+    try {
+      return svg.getScreenCTM?.()?.inverse?.() || null;
+    } catch {
+      return null;
+    }
+  }
+
+  function plannerTreePointFromClient(svg, clientX, clientY, inverse = null) {
+    const matrix = inverse || plannerTreeInverseScreenMatrix(svg);
+    if (matrix) {
+      try {
+        if (typeof DOMPoint === "function") {
+          const point = new DOMPoint(clientX, clientY).matrixTransform(matrix);
+          return { x: point.x, y: point.y };
+        }
+        const point = svg.createSVGPoint?.();
+        if (point) {
+          point.x = clientX;
+          point.y = clientY;
+          const transformed = point.matrixTransform(matrix);
+          return { x: transformed.x, y: transformed.y };
+        }
+      } catch {
+        // Fall through to preserveAspectRatio-aware rectangle conversion.
+      }
+    }
+    const rect = svg.getBoundingClientRect();
+    const view = state.planner.viewBox;
+    if (!rect.width || !rect.height || !view) return null;
+    const scale = Math.min(rect.width / view.width, rect.height / view.height);
+    if (!Number.isFinite(scale) || scale <= 0) return null;
+    const insetX = (rect.width - view.width * scale) / 2;
+    const insetY = (rect.height - view.height * scale) / 2;
+    return {
+      x: view.x + (clientX - rect.left - insetX) / scale,
+      y: view.y + (clientY - rect.top - insetY) / scale,
+    };
+  }
+
+  function beginPlannerTreePan(event) {
+    const svg = event.target.closest?.("#planner-tree-svg");
+    if (!svg || event.button !== 0 || !state.planner.viewBox) return;
+    const inverse = plannerTreeInverseScreenMatrix(svg);
+    const start = plannerTreePointFromClient(svg, event.clientX, event.clientY, inverse);
+    if (!start) return;
+    state.planner.drag = {
+      pointerId: event.pointerId,
+      inverse,
+      start,
+      viewBox: { ...state.planner.viewBox },
+    };
+    state.planner.viewMode = "manual";
+    svg.classList.add("is-dragging");
+    svg.setPointerCapture?.(event.pointerId);
+    event.preventDefault();
+  }
+
+  function cancelPlannerTreePan() {
+    const drag = state.planner.drag;
+    const svg = byId("planner-tree-svg");
+    state.planner.drag = null;
+    svg?.classList.remove("is-dragging");
+    if (drag && svg?.hasPointerCapture?.(drag.pointerId)) svg.releasePointerCapture(drag.pointerId);
+  }
+
+  function movePlannerTreePan(event) {
+    const drag = state.planner.drag;
+    const svg = byId("planner-tree-svg");
+    if (!drag || !svg || drag.pointerId !== event.pointerId) return;
+    const point = plannerTreePointFromClient(svg, event.clientX, event.clientY, drag.inverse);
+    if (!point) return;
+    state.planner.viewBox = {
+      ...drag.viewBox,
+      x: drag.viewBox.x - (point.x - drag.start.x),
+      y: drag.viewBox.y - (point.y - drag.start.y),
+    };
+    applyPlannerTreeViewBox();
+    event.preventDefault();
+  }
+
+  function endPlannerTreePan(event) {
+    const drag = state.planner.drag;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    cancelPlannerTreePan();
+  }
+
+  function wheelPlannerTree(event) {
+    const svg = event.target.closest?.("#planner-tree-svg");
+    if (!svg || !state.planner.viewBox) return;
+    const anchor = plannerTreePointFromClient(svg, event.clientX, event.clientY);
+    if (!anchor) return;
+    const factor = Math.min(1.35, Math.max(0.74, Math.exp(event.deltaY * 0.0014)));
+    zoomPlannerTree(factor, anchor);
+    event.preventDefault();
+  }
+
+  function handlePlannerTreeKeydown(event) {
+    if (!event.target.closest?.("#planner-tree-svg")) return false;
+    if (event.key === "+" || event.key === "=") zoomPlannerTree(0.78);
+    else if (event.key === "-" || event.key === "_") zoomPlannerTree(1.28);
+    else if (event.key === "0" || event.key === "Home") fitPlannerTree();
+    else if (event.key === "ArrowLeft") panPlannerTree(-0.1, 0);
+    else if (event.key === "ArrowRight") panPlannerTree(0.1, 0);
+    else if (event.key === "ArrowUp") panPlannerTree(0, -0.1);
+    else if (event.key === "ArrowDown") panPlannerTree(0, 0.1);
+    else return false;
+    event.preventDefault();
+    event.stopPropagation();
+    return true;
   }
 
   function patchPlanner({ replan = true } = {}) {
     if (state.screen !== "planner") return;
+    if (techTreeFullscreenElement()?.id === "planner-tree-canvas") {
+      state.planner.deferredReplan = state.planner.deferredReplan === null
+        ? replan
+        : state.planner.deferredReplan || replan;
+      return;
+    }
     const region = main.querySelector("[data-planner-result]");
-    const previousViewport = region?.querySelector(".planner-tree-viewport");
-    const previousScrollLeft = previousViewport?.scrollLeft || 0;
     const focusToken = captureFocus(region);
     const drawerReturnToken = region?.contains(state.drawerReturnFocus)
       ? focusTokenForElement(state.drawerReturnFocus)
@@ -5389,12 +5805,9 @@
       semanticsSelect.disabled = !context.options.length;
     }
     if (!region) return;
+    cancelPlannerTreePan();
     region.innerHTML = plannerResultMarkup(context);
-    const nextViewport = region.querySelector(".planner-tree-viewport");
-    if (nextViewport) {
-      if (replan) centerPlannerTarget(nextViewport);
-      else nextViewport.scrollLeft = previousScrollLeft;
-    }
+    mountPlannerTree();
     if (drawerReturnToken) {
       state.drawerReturnFocus = findCapturedFocus(region, drawerReturnToken);
     }
@@ -6833,6 +7246,11 @@
           state.planner.goalSemantics = "additional";
           state.planner.goalQuantity = 1;
           state.planner.result = null;
+          state.planner.viewBox = null;
+          state.planner.viewKey = "";
+          state.planner.layout = null;
+          state.planner.drag = null;
+          state.planner.viewMode = "fit";
         }
         persistConfig();
         navigate("actions");
@@ -6872,6 +7290,18 @@
         break;
       case "tree-fullscreen":
         await toggleTechTreeFullscreen();
+        break;
+      case "planner-tree-fit":
+        fitPlannerTree();
+        break;
+      case "planner-tree-zoom-in":
+        zoomPlannerTree(0.78);
+        break;
+      case "planner-tree-zoom-out":
+        zoomPlannerTree(1.28);
+        break;
+      case "planner-tree-fullscreen":
+        await togglePlannerTreeFullscreen();
         break;
       case "filter-actions":
         state.actionFilter = element.dataset.value || "all";
@@ -7033,7 +7463,8 @@
   });
 
   main.addEventListener("keydown", (event) => {
-    if (event.key === "Escape" && techTreeFullscreenElement()?.id === "tech-tree-canvas") {
+    const nativeFullscreenId = techTreeFullscreenElement()?.id;
+    if (event.key === "Escape" && (nativeFullscreenId === "tech-tree-canvas" || nativeFullscreenId === "planner-tree-canvas")) {
       return;
     }
     if (event.key === "Escape" && state.techTree.fullscreenFallback) {
@@ -7044,6 +7475,15 @@
       syncTechTreeFullscreenUi();
       return;
     }
+    if (event.key === "Escape" && state.planner.fullscreenFallback) {
+      event.preventDefault();
+      event.stopPropagation();
+      state.planner.fullscreenFallback = false;
+      state.planner.fullscreenRequestPending = false;
+      syncPlannerTreeFullscreenUi();
+      return;
+    }
+    if (handlePlannerTreeKeydown(event)) return;
     const treeNode = event.target.closest?.("[data-tree-node-id]");
     if (!treeNode) return;
     if (event.key === "Enter" || event.key === " ") {
@@ -7066,10 +7506,16 @@
   });
 
   main.addEventListener("pointerdown", beginTechTreePan);
+  main.addEventListener("pointerdown", beginPlannerTreePan);
   main.addEventListener("pointermove", moveTechTreePan);
+  main.addEventListener("pointermove", movePlannerTreePan);
   main.addEventListener("pointerup", endTechTreePan);
+  main.addEventListener("pointerup", endPlannerTreePan);
   main.addEventListener("pointercancel", endTechTreePan);
+  main.addEventListener("pointercancel", endPlannerTreePan);
+  main.addEventListener("lostpointercapture", endPlannerTreePan);
   main.addEventListener("wheel", wheelTechTree, { passive: false });
+  main.addEventListener("wheel", wheelPlannerTree, { passive: false });
 
   drawerContent.addEventListener("click", (event) => {
     const target = event.target.closest("[data-command]");
@@ -7163,15 +7609,22 @@
   });
 
   window.addEventListener("keydown", (event) => {
-    if (trapTechTreeFullscreenFocus(event)) return;
+    if (trapTechTreeFullscreenFocus(event) || trapPlannerTreeFullscreenFocus(event)) return;
     const editing = event.target.matches("input, textarea, select, [contenteditable='true']");
     if (event.key === "Escape") {
-      if (techTreeFullscreenElement()?.id === "tech-tree-canvas") return;
+      const fullscreenId = techTreeFullscreenElement()?.id;
+      if (fullscreenId === "tech-tree-canvas" || fullscreenId === "planner-tree-canvas") return;
       event.preventDefault();
       if (state.techTree.fullscreenFallback) {
         state.techTree.fullscreenFallback = false;
         state.techTree.fullscreenRequestPending = false;
         syncTechTreeFullscreenUi();
+        return;
+      }
+      if (state.planner.fullscreenFallback) {
+        state.planner.fullscreenFallback = false;
+        state.planner.fullscreenRequestPending = false;
+        syncPlannerTreeFullscreenUi();
         return;
       }
       if (!state.drawer && state.screen === "tree" && clearTechTreeRelationshipFocus()) return;
@@ -7182,7 +7635,7 @@
       trapDrawerFocus(event);
       return;
     }
-    if (editing || state.drawer || event.target.closest?.(".planner-tree-viewport")) return;
+    if (editing || state.drawer || event.target.closest?.(".planner-tree-canvas")) return;
     if (event.key === "ArrowRight" || event.key === "ArrowDown") {
       event.preventDefault();
       moveMenuFocus(1);
@@ -7196,6 +7649,10 @@
   document.addEventListener("webkitfullscreenchange", handleTechTreeFullscreenChange);
   document.addEventListener("fullscreenerror", handleTechTreeFullscreenError);
   document.addEventListener("webkitfullscreenerror", handleTechTreeFullscreenError);
+  document.addEventListener("fullscreenchange", handlePlannerTreeFullscreenChange);
+  document.addEventListener("webkitfullscreenchange", handlePlannerTreeFullscreenChange);
+  document.addEventListener("fullscreenerror", handlePlannerTreeFullscreenError);
+  document.addEventListener("webkitfullscreenerror", handlePlannerTreeFullscreenError);
 
   document.addEventListener("visibilitychange", () => {
     if (!document.hidden) void probeAllConnections();

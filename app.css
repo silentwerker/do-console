@@ -3936,6 +3936,18 @@ body.drawer-open {
   color: var(--lcd-muted);
 }
 
+.planner-flow-key .planner-key-inventory {
+  width: 16px;
+  height: 11px;
+  border: 2px solid var(--teal);
+  background: var(--success-soft);
+  color: var(--teal);
+}
+
+.planner-flow-key .planner-key-inventory::after {
+  display: none;
+}
+
 .planner-flow-key .planner-key-output::after {
   background: currentcolor;
 }
@@ -3968,12 +3980,16 @@ body.drawer-open {
   transform: none;
 }
 
-.planner-tree-viewport {
+.planner-tree-canvas {
+  position: relative;
+  display: flex;
   width: 100%;
+  height: clamp(410px, 56vw, 640px);
   min-width: 0;
+  min-height: 0;
   max-width: 100%;
-  overflow-x: auto;
-  overscroll-behavior-x: contain;
+  flex-direction: column;
+  overflow: hidden;
   border: 3px solid var(--lcd-line);
   background:
     linear-gradient(var(--screen-grid) 1px, transparent 1px),
@@ -3984,19 +4000,153 @@ body.drawer-open {
     inset 4px 4px 0 var(--screen-inset-dark),
     inset -3px -3px 0 var(--screen-inset-light),
     5px 5px 0 var(--hard-shadow);
-  scrollbar-color: var(--lcd-line) var(--lcd-deep);
-  scrollbar-width: thin;
 }
 
-.planner-tree-viewport:focus-visible {
+.planner-tree-canvas.is-wide {
+  height: clamp(300px, 38vw, 470px);
+}
+
+.planner-tree-canvas.is-deep {
+  height: clamp(470px, 64vw, 700px);
+}
+
+.planner-tree-control-bar {
+  position: relative;
+  z-index: 2;
+  display: flex;
+  min-width: 0;
+  min-height: 45px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 6px 8px 7px 10px;
+  border-bottom: 2px solid var(--lcd-line);
+  background: var(--toolbar-bg);
+  box-shadow: 0 3px 0 var(--screen-inset-dark);
+}
+
+.planner-tree-control-copy {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+  color: var(--lcd-muted);
+  font-size: 7px;
+  font-weight: 900;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.planner-tree-control-copy strong {
+  color: var(--amber);
+  font-size: 9px;
+}
+
+.planner-tree-view-controls {
+  flex: 0 0 auto;
+  flex-wrap: nowrap;
+}
+
+.planner-tree-view-controls .game-button {
+  min-width: 36px;
+  min-height: 30px;
+  padding: 5px 9px;
+}
+
+.planner-tree-zoom-label {
+  min-width: 42px;
+  color: var(--teal);
+  font-size: 8px;
+  font-weight: 900;
+  letter-spacing: 0.04em;
+  text-align: center;
+}
+
+.planner-tree-fullscreen-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--amber);
+}
+
+.planner-tree-fullscreen-button svg {
+  flex: 0 0 auto;
+  pointer-events: none;
+}
+
+.planner-tree-viewport {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
+  overscroll-behavior: contain;
+}
+
+.planner-tree-svg:focus-visible {
   outline: 2px solid var(--amber);
-  outline-offset: 2px;
+  outline-offset: -4px;
 }
 
 .planner-tree-svg {
   display: block;
-  min-width: 100%;
+  width: 100%;
+  height: 100%;
   color: var(--lcd-text);
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+}
+
+.planner-tree-svg.is-dragging {
+  cursor: grabbing;
+}
+
+.planner-tree-canvas:fullscreen,
+.planner-tree-canvas:-webkit-full-screen,
+.planner-tree-canvas.is-pseudo-fullscreen {
+  width: 100vw;
+  height: 100vh;
+  max-width: none;
+  max-height: none;
+  border: 0;
+  background:
+    linear-gradient(var(--screen-grid) 1px, transparent 1px),
+    linear-gradient(90deg, var(--screen-grid) 1px, transparent 1px),
+    var(--lcd-deep);
+  background-size: 20px 20px;
+  box-shadow: none;
+}
+
+.planner-tree-canvas:fullscreen::backdrop {
+  background: var(--handheld-plastic);
+}
+
+.planner-tree-canvas.is-pseudo-fullscreen {
+  position: fixed;
+  inset: 0;
+  z-index: 10000;
+}
+
+html.has-planner-tree-fullscreen,
+html.has-planner-tree-fullscreen body {
+  overflow: hidden;
+}
+
+html.has-planner-tree-fullscreen .game-shell,
+html.has-planner-tree-fullscreen .game-stage {
+  overflow: visible;
+}
+
+html.has-planner-tree-fullscreen .game-shell,
+html.has-planner-tree-fullscreen .game-stage {
+  z-index: 10000;
+}
+
+html.has-planner-tree-fullscreen .game-hud,
+html.has-planner-tree-fullscreen .control-legend,
+html.has-planner-tree-fullscreen .game-shell::before,
+html.has-planner-tree-fullscreen .game-shell::after {
+  visibility: hidden;
 }
 
 .planner-edge-line,
@@ -4268,6 +4418,31 @@ body.drawer-open {
     margin-left: 0;
   }
 
+  .planner-tree-canvas,
+  .planner-tree-canvas.is-wide,
+  .planner-tree-canvas.is-deep {
+    height: clamp(360px, 82vw, 540px);
+  }
+
+  .planner-tree-canvas:fullscreen,
+  .planner-tree-canvas:-webkit-full-screen,
+  .planner-tree-canvas.is-pseudo-fullscreen {
+    height: 100vh;
+  }
+
+  .planner-tree-control-copy span {
+    display: none;
+  }
+
+  .planner-tree-control-bar {
+    gap: 6px;
+    padding-inline: 7px;
+  }
+
+  .planner-tree-view-controls {
+    gap: 5px;
+  }
+
   .planner-step-row {
     grid-template-columns: 40px minmax(0, 1fr);
   }
@@ -4282,6 +4457,24 @@ body.drawer-open {
 @media (max-width: 420px) {
   .planner-summary {
     grid-template-columns: minmax(0, 1fr);
+  }
+
+  .planner-tree-control-copy {
+    display: none;
+  }
+
+  .planner-tree-view-controls {
+    width: 100%;
+    justify-content: space-between;
+  }
+
+  .planner-tree-view-controls .game-button {
+    min-width: 34px;
+    padding-inline: 7px;
+  }
+
+  .planner-tree-fullscreen-button span {
+    display: none;
   }
 }
 
