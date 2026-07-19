@@ -3883,6 +3883,10 @@ body.drawer-open {
   text-transform: uppercase;
 }
 
+.planner-mode-note {
+  margin-bottom: 12px;
+}
+
 .planner-flow-key > span {
   display: inline-flex;
   align-items: center;

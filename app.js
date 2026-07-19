@@ -2388,7 +2388,28 @@
     const finalGoalTokens = [...queueFor(request.classId)];
     const producedGoalTokens = finalGoalTokens.filter((token) => token.producedByStepId);
     const inventoryGoalTokens = finalGoalTokens.filter((token) => !token.producedByStepId);
-    const preferredGoalTokens = [...producedGoalTokens, ...inventoryGoalTokens];
+    const stepById = new Map(steps.map((step) => [step.id, step]));
+    const isNewGoalOutput = (token) => {
+      const step = stepById.get(token.producedByStepId);
+      const action = step ? catalog.actionById.get(step.actionId) : null;
+      const output = step?.outputs.find((item) => item.tokenId === token.tokenId);
+      const turnover = action?.sameClassTurnover?.find((item) => item.classId === token.classId);
+      if (!turnover) return true;
+      const sameClassSlots = action.outputSlots.filter((slot) => slot.classId === token.classId);
+      const position = sameClassSlots.findIndex((slot) => slot.slotIndex === output?.slotIndex);
+      return position >= Math.min(turnover.inputs, turnover.outputs);
+    };
+    const newestFirst = (left, right) => {
+      const leftIndex = stepById.get(left.producedByStepId)?.index ?? -1;
+      const rightIndex = stepById.get(right.producedByStepId)?.index ?? -1;
+      return rightIndex - leftIndex || plannerCompareText(left.tokenId, right.tokenId);
+    };
+    const createdGoalTokens = producedGoalTokens.filter(isNewGoalOutput).sort(newestFirst);
+    const turnoverGoalTokens = producedGoalTokens.filter((token) => !isNewGoalOutput(token)).sort(newestFirst);
+    // A produced turnover token can represent an existing tool carried through
+    // the plan. Prefer genuine positive-net outputs so an "additional" goal's
+    // display tree starts at the object the action set actually added.
+    const preferredGoalTokens = [...createdGoalTokens, ...turnoverGoalTokens, ...inventoryGoalTokens];
     const selectedGoalTokens = request.semantics === "additional"
       ? preferredGoalTokens.slice(0, Math.max(0, request.quantity))
       : preferredGoalTokens.slice(0, Math.max(0, goal.targetCount));
@@ -4826,7 +4847,7 @@
     if (!summary.knownCount) return "Time unknown";
     if (!summary.directWorkCount && !summary.complete) return "Time unknown";
     const duration = formatProofDuration(summary.knownMilliseconds);
-    return summary.complete ? duration : `>= ${duration}`;
+    return summary.complete ? `${summary.directWorkCount ? "~" : ""}${duration}` : `>= ${duration}`;
   }
 
   function plannerTimingSummary(stepIds, timingByStep) {
@@ -4853,11 +4874,38 @@
     return { count: ids.length, knownMilliseconds, knownCount, directWorkCount, complete, requiresCwi };
   }
 
+  function plannerWorkloadSummary(stepIds, timingByStep) {
+    const ids = [...new Set(stepIds || [])];
+    let powExpectedAttempts = 0n;
+    let vdfIterations = 0n;
+    let readableStepCount = 0;
+    let complete = true;
+    for (const id of ids) {
+      const workload = timingByStep.get(id)?.workload;
+      if (!workload) {
+        complete = false;
+        continue;
+      }
+      powExpectedAttempts += workload.pow?.expectedAttempts || 0n;
+      vdfIterations += workload.vdf?.totalIterations || 0n;
+      if ((workload.pow?.knownCount || 0) + (workload.vdf?.knownCount || 0) > 0) readableStepCount += 1;
+      if (!workload.complete) complete = false;
+    }
+    return { count: ids.length, powExpectedAttempts, vdfIterations, readableStepCount, complete };
+  }
+
+  function plannerWorkloadLabel(summary) {
+    if (!summary.count) return "No action proof work";
+    if (!summary.readableStepCount) return summary.complete ? "No direct PoW/VDF gates" : "Direct proof counts unreadable";
+    const prefix = summary.complete ? "~" : ">= ";
+    return `${prefix}${summary.powExpectedAttempts.toLocaleString()} PoW trials / ${summary.vdfIterations.toLocaleString()} VDF iterations`;
+  }
+
   function plannerDirectTimingLabel(timing) {
     if (!timing) return "Time unknown";
     if (timing.requiresCwi) return "Run CWI";
     if (timing.totalMilliseconds == null) return "Time unknown";
-    return `${timing.complete ? "" : ">= "}${formatProofDuration(timing.totalMilliseconds)}`;
+    return `${timing.complete ? (timing.hasKnownWork ? "~" : "") : ">= "}${formatProofDuration(timing.totalMilliseconds)}`;
   }
 
   function plannerDirectTimingBreakdown(timing) {
@@ -4872,6 +4920,34 @@
     const stepById = new Map(result.steps.map((step) => [step.id, step]));
     const tokenById = new Map(result.tokens.map((token) => [token.tokenId, token]));
     const expandedSteps = new Set();
+    const goalTokenIds = new Set(result.goalTokenIds || []);
+    const reachableTokenIds = new Set(goalTokenIds);
+    const reachableQueue = [...goalTokenIds];
+    for (let cursor = 0; cursor < reachableQueue.length; cursor += 1) {
+      const token = tokenById.get(reachableQueue[cursor]);
+      const step = token?.producedByStepId ? stepById.get(token.producedByStepId) : null;
+      for (const input of step?.inputs || []) {
+        if (reachableTokenIds.has(input.tokenId)) continue;
+        reachableTokenIds.add(input.tokenId);
+        reachableQueue.push(input.tokenId);
+      }
+    }
+    const preferredOutputTokenByStepId = new Map();
+    for (const step of result.steps) {
+      let preferred = null;
+      for (const output of step.outputs) {
+        if (!reachableTokenIds.has(output.tokenId)) continue;
+        const token = tokenById.get(output.tokenId);
+        const consumerStep = token?.consumedByStepId ? stepById.get(token.consumedByStepId) : null;
+        const consumerInput = consumerStep?.inputs.find((input) => input.tokenId === output.tokenId);
+        const consumerRole = consumerStep && consumerInput
+          ? plannerStepSlotRole(consumerStep, consumerInput.classId, consumerInput.slotIndex, "input", catalog)
+          : "";
+        const score = goalTokenIds.has(output.tokenId) ? 3 : consumerInput ? (consumerRole.startsWith("update-") ? 1 : 2) : 0;
+        if (!preferred || score > preferred.score) preferred = { tokenId: output.tokenId, score };
+      }
+      if (preferred) preferredOutputTokenByStepId.set(step.id, preferred.tokenId);
+    }
 
     const blockedRoot = (status) => {
       const missingClassIds = [...new Set(
@@ -4925,13 +5001,29 @@
       if (token.kind === "inventory" || !token.producedByStepId) return base;
       const step = stepById.get(token.producedByStepId);
       if (!step) return { ...base, state: "blocked" };
+      // Co-produced outputs share one action subtree. Give that subtree to the
+      // goal output first, then a consumed component, and only then a reusable
+      // UPDATE token. This keeps component branches intact without dropping the
+      // tool/equipment action when it is the only meaningful output.
+      const preferredOutputTokenId = preferredOutputTokenByStepId.get(step.id);
+      if (!expandedSteps.has(step.id) && preferredOutputTokenId && preferredOutputTokenId !== token.tokenId) {
+        return { ...base, state: "shared", aliasStep: step };
+      }
       if (path.has(step.id)) return { ...base, state: "cycle", aliasStep: step };
       if (expandedSteps.has(step.id)) return { ...base, state: "shared", aliasStep: step };
       expandedSteps.add(step.id);
       const nextPath = new Set(path).add(step.id);
-      const inputNodes = step.inputs.map((input) => {
+      // Put consumed components before reusable/update equipment so a tool chain
+      // never visually outranks the components the selected object consumes.
+      const orderedInputs = [...step.inputs].sort((left, right) => {
+        const leftRole = plannerStepSlotRole(step, left.classId, left.slotIndex, "input", catalog);
+        const rightRole = plannerStepSlotRole(step, right.classId, right.slotIndex, "input", catalog);
+        return Number(leftRole.startsWith("update-")) - Number(rightRole.startsWith("update-")) || left.slotIndex - right.slotIndex;
+      });
+      const inputNodes = orderedInputs.map((input) => {
+        const role = plannerStepSlotRole(step, input.classId, input.slotIndex, "input", catalog);
         const inputNode = buildToken(input.tokenId, nextPath);
-        inputNode.inputRole = plannerStepSlotRole(step, input.classId, input.slotIndex, "input", catalog);
+        inputNode.inputRole = role;
         return inputNode;
       });
       const stepIds = new Set([step.id]);
@@ -4957,40 +5049,35 @@
     const root = goalTokenId ? buildToken(goalTokenId) : blockedRoot(result.status === "satisfied" ? "inventory" : "blocked");
     root.isRoot = true;
     root.label = result.goal.label;
-    root.timing = plannerTimingSummary(root.stepIds, timingByStep);
+    // The target reports the complete action-set estimate even when UPDATE/tool
+    // turnover is presented as a compact reference elsewhere in the visual.
+    root.timing = plannerTimingSummary(result.steps.map((step) => step.id), timingByStep);
     return root;
   }
 
   function layoutPlannerDisplayTree(root) {
     if (!root) return null;
-    const HORIZONTAL_GAP = 28;
-    const LEVEL_GAP = 74;
+    const HORIZONTAL_GAP = 18;
+    const LEVEL_GAP = 70;
     const TOP = 24;
     const NODE_SIZES = {
-      object: { width: 184, height: 64 },
-      action: { width: 164, height: 58 },
+      object: { width: 164, height: 64 },
+      action: { width: 152, height: 58 },
     };
-    const measure = (node) => {
-      node.size = NODE_SIZES[node.kind];
-      const childWidths = node.children.map(measure);
-      const childrenWidth = childWidths.reduce((sum, width) => sum + width, 0) + Math.max(0, childWidths.length - 1) * HORIZONTAL_GAP;
-      node.span = Math.max(node.size.width, childrenWidth);
-      return node.span;
-    };
-    measure(root);
     const nodes = [];
     const edges = [];
+    const layers = [];
     let maximumDepth = 0;
-    const place = (node, left, depth) => {
+    const collect = (node, depth) => {
       maximumDepth = Math.max(maximumDepth, depth);
-      node.x = left + (node.span - node.size.width) / 2;
-      node.y = TOP + depth * (64 + LEVEL_GAP);
+      node.size = NODE_SIZES[node.kind];
+      node.span = node.size.width;
       node.depth = depth;
       nodes.push(node);
-      const childrenWidth = node.children.reduce((sum, child) => sum + child.span, 0) + Math.max(0, node.children.length - 1) * HORIZONTAL_GAP;
-      let childLeft = left + (node.span - childrenWidth) / 2;
+      if (!layers[depth]) layers[depth] = [];
+      layers[depth].push(node);
       node.children.forEach((child, index) => {
-        place(child, childLeft, depth + 1);
+        collect(child, depth + 1);
         edges.push({
           id: `${child.id}>${node.id}`,
           source: child,
@@ -4999,13 +5086,22 @@
           targetIndex: index,
           targetCount: node.children.length,
         });
-        childLeft += child.span + HORIZONTAL_GAP;
       });
     };
-    place(root, 30, 0);
-    const width = Math.max(720, root.span + 60);
-    const deepest = nodes.reduce((value, node) => node.depth >= value.depth ? node : value, nodes[0]);
-    const height = Math.max(190, deepest.y + deepest.size.height + 30);
+    collect(root, 0);
+    const layerWidths = layers.map((layer) =>
+      layer.reduce((sum, node) => sum + node.size.width, 0) + Math.max(0, layer.length - 1) * HORIZONTAL_GAP,
+    );
+    const width = Math.max(720, Math.max(...layerWidths) + 60);
+    layers.forEach((layer, depth) => {
+      let left = (width - layerWidths[depth]) / 2;
+      for (const node of layer) {
+        node.x = left;
+        node.y = TOP + depth * (64 + LEVEL_GAP);
+        left += node.size.width + HORIZONTAL_GAP;
+      }
+    });
+    const height = Math.max(190, TOP + maximumDepth * (64 + LEVEL_GAP) + 64 + 30);
     return { root, nodes, edges, width, height, maximumDepth };
   }
 
@@ -5026,6 +5122,7 @@
   function plannerTreeSvg(root, timingByStep, cartridgeName) {
     const layout = layoutPlannerDisplayTree(root);
     if (!layout) return "";
+    const denseGraph = layout.nodes.length > 120;
     const edgeMarkup = layout.edges.map((edge) => {
       const sourceX = edge.source.x + edge.source.size.width / 2;
       const sourceY = edge.source.y;
@@ -5037,7 +5134,9 @@
         ? (edge.targetIndex / (edge.targetCount - 1) - 0.5) * laneWindow
         : 0;
       const midY = targetY + gap / 2 + laneOffset;
-      const path = `M ${sourceX} ${sourceY} V ${midY} H ${targetX} V ${targetY}`;
+      const path = denseGraph
+        ? `M ${sourceX} ${sourceY} C ${sourceX} ${midY} ${targetX} ${midY} ${targetX} ${targetY}`
+        : `M ${sourceX} ${sourceY} V ${midY} H ${targetX} V ${targetY}`;
       const label = ({
         input: "USE",
         output: "MAKE",
@@ -5048,11 +5147,12 @@
       const markerRole = edge.role.startsWith("update-") ? "update" : edge.role;
       const labelWidth = Math.max(38, label.length * 5.2 + 12);
       const labelX = sourceX + (targetX - sourceX) * 0.5;
+      const showLabel = !denseGraph || edge.target.depth <= 2;
       return `
         <g class="planner-edge planner-edge-${edge.role}" aria-hidden="true">
           <path class="planner-edge-halo" d="${path}"></path>
           <path class="planner-edge-line" d="${path}" marker-end="url(#planner-arrow-${markerRole})"></path>
-          <g class="planner-edge-label" transform="translate(${labelX} ${midY})"><rect x="${-labelWidth / 2}" y="-7" width="${labelWidth}" height="14"></rect><text y="3">${label}</text></g>
+          ${showLabel ? `<g class="planner-edge-label" transform="translate(${labelX} ${midY})"><rect x="${-labelWidth / 2}" y="-7" width="${labelWidth}" height="14"></rect><text y="3">${label}</text></g>` : ""}
         </g>`;
     }).join("");
     const nodeMarkup = layout.nodes.map((node) => {
@@ -5138,6 +5238,7 @@
       timingByStep.set(step.id, action ? estimateActionProofTiming(action) : null);
     }
     const totalTiming = plannerTimingSummary(result.steps.map((step) => step.id), timingByStep);
+    const totalWorkload = plannerWorkloadSummary(result.steps.map((step) => step.id), timingByStep);
     const hasExecutablePlan = result.status === "planned" || result.status === "satisfied";
     const totalLabel = hasExecutablePlan ? plannerTimingLabel(totalTiming) : "No plan";
     const totalBasis = !hasExecutablePlan
@@ -5178,6 +5279,9 @@
         ? "No actions required"
         : `${result.totals.expandedStates.toLocaleString()} states checked`;
     const hasMissingBranches = tree?.children?.some((child) => child.inputRole === "missing");
+    const treeGuide = result.steps.length > 40
+      ? "Target and direct components stay centered; scroll lower levels for the complete plan. UPDATE tools remain compact references."
+      : "Read down for requirements; arrows flow up toward the target.";
     const goalRule = result.goal.semantics === "additional"
       ? `make +${result.goal.quantity} / ${result.goal.initialCount} on hand / finish with ${result.goal.targetCount}`
       : `have ${result.goal.targetCount}+ / ${result.goal.initialCount} on hand`;
@@ -5201,14 +5305,18 @@
       ...(result.warnings || []),
       ...result.steps.flatMap((step) => step.warnings || []),
     ])].filter(Boolean).map((message) => `<li><span>${escapeHtml(message)}</span></li>`);
+    const inventorySatisfiedNote = result.status === "satisfied" && result.goal.semantics === "target-total"
+      ? '<div class="terminal-note planner-mode-note"><strong>This object is already on hand.</strong> Choose <em>Make one more</em> above to build its component tree, action set, and proof-time estimate.</div>'
+      : "";
     return `
       <div class="planner-summary" aria-label="Plan summary">
         <div class="planner-summary-item"><span>Goal state</span><strong>${escapeHtml(stateLabel)}</strong><small>${escapeHtml(result.goal.label)} / ${escapeHtml(shortText(result.goal.hash, 6, 4))} / ${escapeHtml(goalRule)}</small></div>
-        <div class="planner-summary-item"><span>Total proof work</span><strong aria-live="polite" aria-atomic="true">${escapeHtml(totalLabel)}</strong><small>${escapeHtml(totalBasis)}</small></div>
+        <div class="planner-summary-item"><span>Total proof work</span><strong aria-live="polite" aria-atomic="true">${escapeHtml(totalLabel)}</strong><small>${escapeHtml(totalBasis)}<br />${escapeHtml(plannerWorkloadLabel(totalWorkload))}</small></div>
         <div class="planner-summary-item"><span>Action set</span><strong>${result.totals.actionCount}</strong><small>${escapeHtml(actionSetBasis)}</small></div>
         <div class="planner-summary-item"><span>Grounding</span><strong>${cwi ? `CWI-1 ${cwi.score.toLocaleString()}` : "No CWI"}</strong><small>${escapeHtml(groundingNote)}</small>${cwiControl}</div>
       </div>
-      <div class="planner-flow-key" aria-label="Plan relationship legend"><span><i class="planner-key-input" aria-hidden="true"></i>USE / consumed input</span><span><i class="planner-key-output" aria-hidden="true"></i>MAKE / created output</span><span><i class="planner-key-update" aria-hidden="true"></i>UPDATE / paired turnover</span>${hasMissingBranches ? '<span><i class="planner-key-missing" aria-hidden="true"></i>MISSING / unresolved prerequisite</span>' : ""}<span>Read down for requirements; arrows flow up toward the target.</span></div>
+      ${inventorySatisfiedNote}
+      <div class="planner-flow-key" aria-label="Plan relationship legend"><span><i class="planner-key-input" aria-hidden="true"></i>USE / consumed input</span><span><i class="planner-key-output" aria-hidden="true"></i>MAKE / created output</span><span><i class="planner-key-update" aria-hidden="true"></i>UPDATE / paired turnover</span>${hasMissingBranches ? '<span><i class="planner-key-missing" aria-hidden="true"></i>MISSING / unresolved prerequisite</span>' : ""}<span>${escapeHtml(treeGuide)}</span></div>
       ${plannerTreeSvg(tree, timingByStep, context.cartridge.name)}
       ${plannerStepListMarkup(context, timingByStep)}
       ${diagnosticMarkup.length || warningMarkup.length ? `<div class="terminal-note warning planner-diagnostics"><strong>Plan limits</strong><ul>${[...diagnosticMarkup, ...warningMarkup].slice(0, 8).join("")}</ul></div>` : ""}
