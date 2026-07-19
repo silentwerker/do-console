@@ -8,12 +8,24 @@
 
   const CONFIG_VERSION = 1;
   const STORAGE_KEY = "don.lightConsole.config.v1";
-  const HARDWARE_INDEX_VERSION = 1;
-  const HARDWARE_INDEX_BENCHMARK_ID = "browser-mix-v1";
-  const HARDWARE_INDEX_SCOPE = "browser-runtime-single-worker-synthetic";
+  const HARDWARE_INDEX_VERSION = 2;
+  const HARDWARE_INDEX_LABEL = "CWI-2";
+  const HARDWARE_INDEX_BENCHMARK_ID = "browser-sustained-mix-v2";
+  const HARDWARE_INDEX_SCOPE = "browser-runtime-sustained-single-worker-synthetic";
+  const HARDWARE_INDEX_ALGORITHM = "search32-v1+bigint127-v1:w5000:s5000:min5:max17:adaptive-v1";
   const LEGACY_HARDWARE_INDEX_STORAGE_KEY = "don.lightConsole.clientWorkIndex.v1";
   const HARDWARE_INDEX_SEARCH_REFERENCE = 100_000_000;
   const HARDWARE_INDEX_SEQUENTIAL_REFERENCE = 1_000_000;
+  const HARDWARE_INDEX_WARMUP_MS = 5_000;
+  const HARDWARE_INDEX_SAMPLE_MS = 5_000;
+  const HARDWARE_INDEX_MIN_SAMPLES = 5;
+  const HARDWARE_INDEX_MIN_RESULT_SAMPLES = HARDWARE_INDEX_MIN_SAMPLES + 1;
+  const HARDWARE_INDEX_MAX_SAMPLES = 17;
+  const HARDWARE_INDEX_MAX_AGE_MS = 30 * 24 * 60 * 60_000;
+  const HARDWARE_INDEX_MIN_DURATION_MS = (2 * HARDWARE_INDEX_WARMUP_MS) +
+    (2 * (HARDWARE_INDEX_MIN_SAMPLES + 1) * HARDWARE_INDEX_SAMPLE_MS);
+  const HARDWARE_INDEX_MAX_DURATION_MS = (2 * HARDWARE_INDEX_WARMUP_MS) +
+    (2 * HARDWARE_INDEX_MAX_SAMPLES * HARDWARE_INDEX_SAMPLE_MS);
   const HANDLE_DB = "don-light-console";
   const HANDLE_STORE = "handles";
   const HANDLE_KEY = "config";
@@ -174,6 +186,7 @@
       if (raw) {
         const source = JSON.parse(raw);
         const config = normalizeConfig(source);
+        if (source?.clientWorkIndex && !config.clientWorkIndex) legacyHardwareIndexMigrationPending = true;
         adoptLegacyHardwareIndex(config);
         return config;
       }
@@ -188,48 +201,137 @@
     }
   }
 
+  function hardwareIndexMedian(values) {
+    const sorted = [...values].sort((left, right) => left - right);
+    const middle = Math.floor(sorted.length / 2);
+    return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
+  }
+
+  function hardwareIndexQuantile(values, quantile) {
+    const sorted = [...values].sort((left, right) => left - right);
+    const position = (sorted.length - 1) * quantile;
+    const lower = Math.floor(position);
+    const fraction = position - lower;
+    return sorted[lower + 1] == null
+      ? sorted[lower]
+      : sorted[lower] + (sorted[lower + 1] - sorted[lower]) * fraction;
+  }
+
+  function hardwareIndexLaneStats(samples) {
+    const thirdLength = Math.max(2, Math.ceil(samples.length / 3));
+    const median = hardwareIndexMedian(samples);
+    const p10 = hardwareIndexQuantile(samples, 0.1);
+    const p25 = hardwareIndexQuantile(samples, 0.25);
+    const p90 = hardwareIndexQuantile(samples, 0.9);
+    const earlyMedian = hardwareIndexMedian(samples.slice(0, thirdLength));
+    const lateMedian = hardwareIndexMedian(samples.slice(-thirdLength));
+    const spreadPercent = median > 0 ? ((p90 - p10) / median) * 100 : Infinity;
+    const driftPercent = earlyMedian > 0 ? (Math.abs(lateMedian - earlyMedian) / earlyMedian) * 100 : Infinity;
+    return {
+      median,
+      p10,
+      p25,
+      p90,
+      earlyMedian,
+      lateMedian,
+      estimateRate: Math.min(p25, lateMedian),
+      spreadPercent,
+      driftPercent,
+    };
+  }
+
+  function hardwareIndexStabilityConfirmationCount(searchSamples, sequentialSamples) {
+    let stablePasses = 0;
+    for (let count = HARDWARE_INDEX_MIN_SAMPLES; count <= searchSamples.length; count += 1) {
+      const searchStats = hardwareIndexLaneStats(searchSamples.slice(0, count));
+      const sequentialStats = hardwareIndexLaneStats(sequentialSamples.slice(0, count));
+      const qualifies = Math.max(searchStats.spreadPercent, sequentialStats.spreadPercent) <= 6 &&
+        Math.max(searchStats.driftPercent, sequentialStats.driftPercent) <= 5;
+      stablePasses = qualifies ? stablePasses + 1 : 0;
+      if (stablePasses >= 2) return count;
+    }
+    return 0;
+  }
+
   function normalizeHardwareIndex(value) {
-    if (!value || value.version !== HARDWARE_INDEX_VERSION || value.benchmarkId !== HARDWARE_INDEX_BENCHMARK_ID) return null;
-    const reportedSearchRate = Number(value.searchRate);
-    const reportedSequentialRate = Number(value.sequentialRate);
+    if (
+      !value ||
+      value.version !== HARDWARE_INDEX_VERSION ||
+      value.benchmarkId !== HARDWARE_INDEX_BENCHMARK_ID ||
+      value.scope !== HARDWARE_INDEX_SCOPE ||
+      value.algorithm !== HARDWARE_INDEX_ALGORITHM ||
+      Number(value.workerCount) !== 1 ||
+      Number(value.warmupDurationMs) !== HARDWARE_INDEX_WARMUP_MS ||
+      Number(value.sampleDurationMs) !== HARDWARE_INDEX_SAMPLE_MS
+    ) return null;
     const durationMs = Number(value.durationMs);
     const measuredAt = String(value.measuredAt || "");
-    const normalizeSamples = (samples) => Array.isArray(samples)
-      ? samples.map(Number).filter((sample) => Number.isFinite(sample) && sample > 0).slice(0, 3)
-      : [];
+    const measuredTimestamp = new Date(measuredAt).valueOf();
+    const normalizeSamples = (samples) => Array.isArray(samples) ? samples.map(Number) : [];
     const searchSamples = normalizeSamples(value.searchSamples);
     const sequentialSamples = normalizeSamples(value.sequentialSamples);
+    const sampleCount = searchSamples.length;
+    const expectedDurationMs = (2 * HARDWARE_INDEX_WARMUP_MS) +
+      (2 * sampleCount * HARDWARE_INDEX_SAMPLE_MS);
     if (
-      !Number.isFinite(reportedSearchRate) || reportedSearchRate <= 0 ||
-      !Number.isFinite(reportedSequentialRate) || reportedSequentialRate <= 0 ||
-      !Number.isFinite(durationMs) || durationMs <= 0 ||
-      searchSamples.length !== 3 || sequentialSamples.length !== 3 ||
-      Number.isNaN(new Date(measuredAt).valueOf())
+      !Number.isFinite(durationMs) || durationMs < expectedDurationMs * 0.95 || durationMs > expectedDurationMs * 2.5 ||
+      searchSamples.length !== sequentialSamples.length ||
+      sampleCount < HARDWARE_INDEX_MIN_RESULT_SAMPLES || sampleCount > HARDWARE_INDEX_MAX_SAMPLES ||
+      !searchSamples.every((sample) => Number.isFinite(sample) && sample > 0) ||
+      !sequentialSamples.every((sample) => Number.isFinite(sample) && sample > 0) ||
+      !Number.isFinite(measuredTimestamp) ||
+      measuredTimestamp > Date.now() + 5 * 60_000 ||
+      measuredTimestamp < Date.now() - HARDWARE_INDEX_MAX_AGE_MS
     ) return null;
-    const median = (samples) => [...samples].sort((left, right) => left - right)[1];
-    const searchRate = median(searchSamples);
-    const sequentialRate = median(sequentialSamples);
-    const score = hardwareIndexScore(searchRate, sequentialRate);
-    if (!Number.isFinite(score)) return null;
+    const searchStats = hardwareIndexLaneStats(searchSamples);
+    const sequentialStats = hardwareIndexLaneStats(sequentialSamples);
+    const stabilityConfirmationCount = hardwareIndexStabilityConfirmationCount(searchSamples, sequentialSamples);
+    if (
+      (stabilityConfirmationCount && stabilityConfirmationCount !== sampleCount) ||
+      (!stabilityConfirmationCount && sampleCount < HARDWARE_INDEX_MAX_SAMPLES)
+    ) return null;
+    const stabilityConfirmed = stabilityConfirmationCount === sampleCount;
+    const searchRate = searchStats.estimateRate;
+    const sequentialRate = sequentialStats.estimateRate;
+    const score = hardwareIndexScore(searchStats.median, sequentialStats.median);
+    if (!Number.isFinite(score) || searchRate <= 0 || sequentialRate <= 0) return null;
+    const logicalProcessors = Math.max(1, Math.min(256, Math.round(Number(value.logicalProcessors) || 1)));
     return {
       version: HARDWARE_INDEX_VERSION,
       benchmarkId: HARDWARE_INDEX_BENCHMARK_ID,
       scope: HARDWARE_INDEX_SCOPE,
+      algorithm: HARDWARE_INDEX_ALGORITHM,
       workerCount: 1,
+      logicalProcessors,
+      warmupDurationMs: HARDWARE_INDEX_WARMUP_MS,
+      sampleDurationMs: HARDWARE_INDEX_SAMPLE_MS,
+      sampleCount,
       score,
+      referenceFactor: hardwareIndexReferenceFactor(searchStats.median, sequentialStats.median),
       searchRate,
       sequentialRate,
+      searchMedianRate: searchStats.median,
+      sequentialMedianRate: sequentialStats.median,
+      searchSpreadPercent: searchStats.spreadPercent,
+      sequentialSpreadPercent: sequentialStats.spreadPercent,
+      searchDriftPercent: searchStats.driftPercent,
+      sequentialDriftPercent: sequentialStats.driftPercent,
       searchSamples,
       sequentialSamples,
       durationMs,
       measuredAt,
-      stability: hardwareIndexStability(searchSamples, sequentialSamples),
+      stability: hardwareIndexStability(searchStats, sequentialStats),
+      stabilityConfirmed,
+      confidence: hardwareIndexConfidence(searchStats, sequentialStats, sampleCount, stabilityConfirmed),
     };
   }
 
   function loadLegacyHardwareIndex() {
     try {
-      return normalizeHardwareIndex(JSON.parse(localStorage.getItem(LEGACY_HARDWARE_INDEX_STORAGE_KEY) || "null"));
+      const raw = localStorage.getItem(LEGACY_HARDWARE_INDEX_STORAGE_KEY);
+      if (!raw) return null;
+      legacyHardwareIndexMigrationPending = true;
+      return normalizeHardwareIndex(JSON.parse(raw));
     } catch {
       return null;
     }
@@ -331,7 +433,7 @@
     }
     patchCurrentConfigPreview();
     if (homePromptVisible) {
-      toast("Client work index updated", `CWI-1 ${result.score.toLocaleString()} / ${persistent ? "saved in browser config" : "this tab only"}`, "success");
+      toast("Client work index updated", `${HARDWARE_INDEX_LABEL} ${result.score.toLocaleString()} / ${persistent ? "saved locally" : "this tab only"}`, "success");
     }
     if (resultChanged || persistent !== wasPersistent) patchHardwareIndex();
     return persistent;
@@ -369,6 +471,8 @@
       runToken: 0,
       persistent: Boolean(savedHardwareIndex),
       restoreFocus: false,
+      progress: null,
+      cancelRun: null,
     },
     drawer: null,
     editingConnectionId: null,
@@ -418,6 +522,32 @@
       resumeArmed: false,
     },
   };
+
+  function currentHardwareIndex() {
+    const current = normalizeHardwareIndex(state.hardwareIndex.result);
+    if (current) return current;
+    if (!state.hardwareIndex.result) return null;
+    const stored = loadStoredHardwareIndex();
+    if (stored) {
+      state.hardwareIndex.result = stored;
+      state.config.clientWorkIndex = stored;
+      state.hardwareIndex.persistent = true;
+      return stored;
+    }
+    state.hardwareIndex.result = null;
+    state.config.clientWorkIndex = null;
+    state.hardwareIndex.persistent = false;
+    if (state.hardwareIndex.status !== "running") {
+      state.hardwareIndex.status = "idle";
+      state.hardwareIndex.error = "";
+    }
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(state.config));
+    } catch {
+      // Expired or invalid CWI data is still ignored for this tab.
+    }
+    return null;
+  }
 
   function applyTheme(themeId) {
     const selected = THEME_OPTIONS.find((theme) => theme.id === themeId) || THEME_OPTIONS[0];
@@ -599,6 +729,14 @@
       storedResult,
     );
     state.config.clientWorkIndex = mergedResult;
+    if (state.hardwareIndex && !mergedResult && previousResult && !normalizeHardwareIndex(previousResult)) {
+      state.hardwareIndex.result = null;
+      state.hardwareIndex.persistent = false;
+      if (state.hardwareIndex.status !== "running") {
+        state.hardwareIndex.status = "idle";
+        state.hardwareIndex.error = "";
+      }
+    }
     if (state.hardwareIndex && compareHardwareIndexes(mergedResult, previousResult) > 0) {
       state.hardwareIndex.result = mergedResult;
       if (state.hardwareIndex.status !== "running") {
@@ -1434,6 +1572,7 @@
   }
 
   function render() {
+    currentHardwareIndex();
     if (state.planner.drag) cancelPlannerTreePan();
     if (state.screen !== "tree") cleanupTechTreeFullscreen();
     if (state.screen !== "planner") cleanupPlannerTreeFullscreen();
@@ -1503,7 +1642,7 @@
             ${menuTile("connections", "NET", "Connections", "Choose, add, edit, remove, or configure Driver connections.", { className: "menu-tile-network", meta: `${state.config.connections.length} saved` })}
             ${menuTile("config", "CFG", "Menu Config", "Open, save, reset, or link portable console settings.", { className: "menu-tile-settings", meta: state.linkedConfigName ? "Linked" : "Browser" })}
           </nav>
-          ${!state.hardwareIndex.result || state.hardwareIndex.status === "running" ? homeHardwareIndexRegionMarkup() : ""}
+          ${!currentHardwareIndex() || state.hardwareIndex.status === "running" ? homeHardwareIndexRegionMarkup() : ""}
         </div>
         ${!online && status.error ? `<div class="terminal-note error">${escapeHtml(status.error)}</div>` : ""}
       </section>`;
@@ -3079,7 +3218,7 @@
   // rates; they are not selected-Driver or end-to-end wall-clock estimates.
   function estimateActionProofTiming(
     action,
-    cwiResult = state.hardwareIndex.result,
+    cwiResult = currentHardwareIndex(),
     workload = actionProofWorkload(action),
   ) {
     const cwi = normalizeHardwareIndex(cwiResult);
@@ -3129,7 +3268,12 @@
   }
 
   function compactProofDurationNumber(value) {
-    if (value < 0.01) return "<0.01";
+    if (value === 0) return "0";
+    if (value < 0.000000000001) return "0.000000000001";
+    if (value < 1) {
+      const decimals = Math.min(12, Math.max(3, Math.ceil(-Math.log10(value)) + 2));
+      return value.toFixed(decimals).replace(/0+$/, "").replace(/\.$/, "");
+    }
     if (value < 10) return value.toFixed(2).replace(/\.00$/, "").replace(/(\.\d)0$/, "$1");
     if (value < 100) return value.toFixed(1).replace(/\.0$/, "");
     return Math.round(value).toLocaleString();
@@ -3138,20 +3282,27 @@
   function formatProofDuration(milliseconds) {
     if (milliseconds == null || Number.isNaN(milliseconds)) return "Unknown";
     if (!Number.isFinite(milliseconds)) return ">999 years";
-    if (milliseconds <= 0) return "0 ms";
-    if (milliseconds < 0.001) return `${compactProofDurationNumber(milliseconds * 1_000_000)} ns`;
-    if (milliseconds < 1) return `${compactProofDurationNumber(milliseconds * 1000)} us`;
-    if (milliseconds < 1000) return `${compactProofDurationNumber(milliseconds)} ms`;
+    if (milliseconds < 0) return "Unknown";
+    if (milliseconds === 0) return "0 sec";
     const seconds = milliseconds / 1000;
-    if (seconds < 60) return `${compactProofDurationNumber(seconds)} sec`;
+    if (seconds < 59.95) return `${compactProofDurationNumber(seconds)} sec`;
+    if (seconds < 60) return "1 min";
     const minutes = seconds / 60;
-    if (minutes < 60) return `${compactProofDurationNumber(minutes)} min`;
+    if (minutes < 59.95) return `${compactProofDurationNumber(minutes)} min`;
+    if (minutes < 60) return "1 hr";
     const hours = minutes / 60;
-    if (hours < 24) return `${compactProofDurationNumber(hours)} hr`;
+    if (hours < 23.95) return `${compactProofDurationNumber(hours)} hr`;
+    if (hours < 24) return "1 day";
     const days = hours / 24;
-    if (days < 365.25) return `${compactProofDurationNumber(days)} days`;
+    if (days < 365.2) {
+      const value = compactProofDurationNumber(days);
+      return `${value} ${value === "1" ? "day" : "days"}`;
+    }
+    if (days < 365.25) return "1 year";
     const years = days / 365.25;
-    return years > 999 ? ">999 years" : `${compactProofDurationNumber(years)} years`;
+    if (years > 999) return ">999 years";
+    const value = compactProofDurationNumber(years);
+    return `${value} ${value === "1" ? "year" : "years"}`;
   }
 
   function hardwareIndexWorkerMain() {
@@ -3194,41 +3345,127 @@
       return { rate: operations / (elapsedMs / 1000), checksum: value.toString(16).slice(-16), elapsedMs };
     }
 
-    self.addEventListener("message", () => {
+    function median(values) {
+      const sorted = [...values].sort((left, right) => left - right);
+      const middle = Math.floor(sorted.length / 2);
+      return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
+    }
+
+    function quantile(values, amount) {
+      const sorted = [...values].sort((left, right) => left - right);
+      const position = (sorted.length - 1) * amount;
+      const lower = Math.floor(position);
+      const fraction = position - lower;
+      return sorted[lower + 1] == null
+        ? sorted[lower]
+        : sorted[lower] + (sorted[lower + 1] - sorted[lower]) * fraction;
+    }
+
+    function laneQuality(samples) {
+      const center = median(samples);
+      const thirdLength = Math.max(2, Math.ceil(samples.length / 3));
+      const early = median(samples.slice(0, thirdLength));
+      const late = median(samples.slice(-thirdLength));
+      return {
+        spreadPercent: center > 0 ? ((quantile(samples, 0.9) - quantile(samples, 0.1)) / center) * 100 : Infinity,
+        driftPercent: early > 0 ? (Math.abs(late - early) / early) * 100 : Infinity,
+      };
+    }
+
+    self.addEventListener("message", (event) => {
       try {
-        measureSearch(55);
-        measureSequential(55);
-        const searchSamples = [measureSearch(150), measureSearch(150), measureSearch(150)];
-        const sequentialSamples = [measureSequential(150), measureSequential(150), measureSequential(150)];
-        const median = (values) => [...values].sort((left, right) => left - right)[Math.floor(values.length / 2)];
+        const warmupDurationMs = Number(event.data?.warmupDurationMs);
+        const sampleDurationMs = Number(event.data?.sampleDurationMs);
+        const minSamples = Number(event.data?.minSamples);
+        const maxSamples = Number(event.data?.maxSamples);
+        const maximumDurationMs = (2 * warmupDurationMs) + (2 * maxSamples * sampleDurationMs);
+        if (
+          !Number.isFinite(warmupDurationMs) || warmupDurationMs < 1000 ||
+          !Number.isFinite(sampleDurationMs) || sampleDurationMs < 1000 ||
+          !Number.isInteger(minSamples) || !Number.isInteger(maxSamples) ||
+          minSamples < 3 || maxSamples < minSamples
+        ) throw new Error("The benchmark profile is invalid.");
+
+        let durationMs = 0;
+        const searchSamples = [];
+        const sequentialSamples = [];
+        const checksums = [];
+        const progress = (phase, stabilityConfirmed = false) => self.postMessage({
+          type: "progress",
+          phase,
+          elapsedMs: durationMs,
+          completedSamples: searchSamples.length + sequentialSamples.length,
+          sampleCount: Math.min(searchSamples.length, sequentialSamples.length),
+          maximumDurationMs,
+          stabilityConfirmed,
+        });
+        progress("Warming search lane");
+        const searchWarmup = measureSearch(warmupDurationMs);
+        durationMs += searchWarmup.elapsedMs;
+        checksums.push(searchWarmup.checksum);
+        progress("Warming sequential lane");
+        const sequentialWarmup = measureSequential(warmupDurationMs);
+        durationMs += sequentialWarmup.elapsedMs;
+        checksums.push(sequentialWarmup.checksum);
+
+        let stablePasses = 0;
+        for (let round = 0; round < maxSamples; round += 1) {
+          const lanes = round % 2 === 0 ? ["search", "sequential"] : ["sequential", "search"];
+          for (const lane of lanes) {
+            progress(`Sampling ${lane} lane / round ${round + 1}`);
+            const sample = lane === "search" ? measureSearch(sampleDurationMs) : measureSequential(sampleDurationMs);
+            durationMs += sample.elapsedMs;
+            checksums.push(sample.checksum);
+            (lane === "search" ? searchSamples : sequentialSamples).push(sample.rate);
+          }
+          if (searchSamples.length >= minSamples) {
+            const searchQuality = laneQuality(searchSamples);
+            const sequentialQuality = laneQuality(sequentialSamples);
+            const qualifies = Math.max(searchQuality.spreadPercent, sequentialQuality.spreadPercent) <= 6 &&
+              Math.max(searchQuality.driftPercent, sequentialQuality.driftPercent) <= 5;
+            stablePasses = qualifies ? stablePasses + 1 : 0;
+            progress(
+              qualifies ? `Stability confirmed ${stablePasses} of 2` : "Variation detected / extending test",
+              stablePasses >= 2,
+            );
+            if (stablePasses >= 2) break;
+          }
+        }
         self.postMessage({
-          searchRate: median(searchSamples.map((sample) => sample.rate)),
-          sequentialRate: median(sequentialSamples.map((sample) => sample.rate)),
-          searchSamples: searchSamples.map((sample) => sample.rate),
-          sequentialSamples: sequentialSamples.map((sample) => sample.rate),
-          durationMs: [...searchSamples, ...sequentialSamples].reduce((sum, sample) => sum + sample.elapsedMs, 0),
-          checksum: `${searchSamples.map((sample) => sample.checksum).join(".")}:${sequentialSamples.map((sample) => sample.checksum).join(".")}`,
+          type: "result",
+          searchSamples,
+          sequentialSamples,
+          durationMs,
+          checksum: checksums.join(":"),
         });
       } catch (error) {
-        self.postMessage({ error: error?.message || "The benchmark worker failed." });
+        self.postMessage({ type: "error", error: error?.message || "The benchmark worker failed." });
       }
     }, { once: true });
   }
 
-  function hardwareIndexScore(searchRate, sequentialRate) {
+  function hardwareIndexReferenceFactor(searchRate, sequentialRate) {
     const searchRatio = searchRate / HARDWARE_INDEX_SEARCH_REFERENCE;
     const sequentialRatio = sequentialRate / HARDWARE_INDEX_SEQUENTIAL_REFERENCE;
-    return Math.max(1, Math.round(100 * Math.sqrt(searchRatio) * Math.sqrt(sequentialRatio)));
+    if (searchRatio <= 0 || sequentialRatio <= 0) return NaN;
+    return 2 / ((1 / searchRatio) + (1 / sequentialRatio));
   }
 
-  function hardwareIndexStability(searchSamples, sequentialSamples) {
-    const deviation = (samples) => {
-      const sorted = [...samples].sort((left, right) => left - right);
-      const median = sorted[Math.floor(sorted.length / 2)];
-      return Math.max(...samples.map((sample) => Math.abs(sample - median) / median));
-    };
-    const spread = Math.max(deviation(searchSamples), deviation(sequentialSamples));
-    return spread <= 0.05 ? "stable" : spread <= 0.12 ? "fair" : "noisy";
+  function hardwareIndexScore(searchRate, sequentialRate) {
+    return Math.max(1, Math.round(100 * hardwareIndexReferenceFactor(searchRate, sequentialRate)));
+  }
+
+  function hardwareIndexStability(searchStats, sequentialStats) {
+    const spread = Math.max(searchStats.spreadPercent, sequentialStats.spreadPercent);
+    const drift = Math.max(searchStats.driftPercent, sequentialStats.driftPercent);
+    return spread <= 6 && drift <= 5 ? "stable" : spread <= 12 && drift <= 10 ? "fair" : "noisy";
+  }
+
+  function hardwareIndexConfidence(searchStats, sequentialStats, sampleCount, stabilityConfirmed) {
+    const stability = hardwareIndexStability(searchStats, sequentialStats);
+    if (stability === "stable" && sampleCount >= 6 && stabilityConfirmed) return "high";
+    if (stability !== "noisy") return "medium";
+    return "low";
   }
 
   function formatHardwareRate(value) {
@@ -3237,30 +3474,90 @@
     return `${Math.round(value).toLocaleString()}/s`;
   }
 
+  function formatHardwarePercent(value) {
+    if (!Number.isFinite(value)) return "unknown";
+    return `${value < 10 ? value.toFixed(1) : Math.round(value)}%`;
+  }
+
+  function formatHardwareFactor(value) {
+    if (!Number.isFinite(value)) return "unknown";
+    return `${value < 10 ? value.toFixed(2) : value.toFixed(1)}×`;
+  }
+
+  function hardwareIndexProgressDetail(progress = state.hardwareIndex.progress) {
+    const rounds = Math.max(0, Number(progress?.sampleCount) || 0);
+    if (!rounds) return `Two 5 sec warmups, then paired 10 sec rounds / earliest finish about ${formatProofDuration(HARDWARE_INDEX_MIN_DURATION_MS)}.`;
+    if (rounds < HARDWARE_INDEX_MIN_SAMPLES) {
+      return `${rounds} of ${HARDWARE_INDEX_MIN_SAMPLES} minimum rounds complete / extends until stable.`;
+    }
+    const ceiling = formatProofDuration(Math.max(0, HARDWARE_INDEX_MAX_DURATION_MS - (Number(progress?.elapsedMs) || 0)));
+    return `${rounds} rounds complete / checking spread and sustained-rate drift / up to ${ceiling} remaining.`;
+  }
+
+  function hardwareIndexProgressTargetMs(progress = state.hardwareIndex.progress) {
+    const elapsedMs = Math.max(0, Number(progress?.elapsedMs) || 0);
+    if (progress?.stabilityConfirmed) return Math.max(1, elapsedMs);
+    if (elapsedMs < HARDWARE_INDEX_MIN_DURATION_MS) return HARDWARE_INDEX_MIN_DURATION_MS;
+    return Math.min(HARDWARE_INDEX_MAX_DURATION_MS, elapsedMs + (2 * HARDWARE_INDEX_SAMPLE_MS));
+  }
+
+  function hardwareIndexProgressMarkup(extraClass = "") {
+    const progress = state.hardwareIndex.progress || {};
+    const elapsedMs = Math.max(0, Math.min(HARDWARE_INDEX_MAX_DURATION_MS, Number(progress.elapsedMs) || 0));
+    const targetMs = hardwareIndexProgressTargetMs(progress);
+    const phase = String(progress.phase || "Starting benchmark worker");
+    return `
+      <div class="cwi-progress${extraClass ? ` ${extraClass}` : ""}">
+        <div class="cwi-progress-copy"><span data-cwi-progress-phase>${escapeHtml(phase)}</span><strong data-cwi-progress-time>${escapeHtml(formatProofDuration(elapsedMs))} elapsed</strong></div>
+        <progress data-cwi-progress-meter max="${targetMs}" value="${Math.min(elapsedMs, targetMs)}" aria-label="Client work index progress" aria-valuetext="${escapeHtml(`${phase}. ${formatProofDuration(elapsedMs)} elapsed.`)}"></progress>
+        <small data-cwi-progress-detail>${escapeHtml(hardwareIndexProgressDetail(progress))}</small>
+      </div>`;
+  }
+
+  function updateHardwareIndexProgressUi() {
+    if (state.hardwareIndex.status !== "running") return;
+    const progress = state.hardwareIndex.progress || {};
+    const elapsedMs = Math.max(0, Math.min(HARDWARE_INDEX_MAX_DURATION_MS, Number(progress.elapsedMs) || 0));
+    const targetMs = hardwareIndexProgressTargetMs(progress);
+    const phase = String(progress.phase || "Running sustained benchmark");
+    document.querySelectorAll("[data-cwi-progress-meter]").forEach((meter) => {
+      meter.max = targetMs;
+      meter.value = Math.min(elapsedMs, targetMs);
+      meter.setAttribute("aria-valuetext", `${phase}. ${formatProofDuration(elapsedMs)} elapsed.`);
+    });
+    document.querySelectorAll("[data-cwi-progress-phase]").forEach((element) => { element.textContent = phase; });
+    document.querySelectorAll("[data-cwi-progress-time]").forEach((element) => {
+      element.textContent = `${formatProofDuration(elapsedMs)} elapsed`;
+    });
+    document.querySelectorAll("[data-cwi-progress-detail]").forEach((element) => {
+      element.textContent = hardwareIndexProgressDetail(progress);
+    });
+  }
+
   function homeHardwareIndexContentMarkup() {
     const benchmark = state.hardwareIndex;
-    const result = benchmark.result;
+    const result = currentHardwareIndex();
     const running = benchmark.status === "running";
     const failed = benchmark.status === "error" && !result;
     const title = running
-      ? "Checking this browser"
+      ? result ? `Refreshing ${HARDWARE_INDEX_LABEL}` : "Measuring browser compute"
       : result
-        ? benchmark.persistent ? `CWI-1 ${result.score.toLocaleString()} stored` : `CWI-1 ${result.score.toLocaleString()} ready`
+        ? benchmark.persistent ? `${HARDWARE_INDEX_LABEL} ${result.score.toLocaleString()} stored` : `${HARDWARE_INDEX_LABEL} ${result.score.toLocaleString()} ready`
         : failed
           ? "Client check unavailable"
           : "Client index not set";
     const copy = running
-      ? "Six quick samples are running off the main UI thread. Keep this tab visible."
+      ? "Paired search/chain rounds run off the UI thread for about 1–3 minutes. Keep this tab visible."
       : result
         ? benchmark.persistent
-          ? `Saved in this browser config / ${result.stability} samples. Open Menu Config for the component rates.`
+          ? `Saved locally / ${formatHardwareFactor(result.referenceFactor)} the fixed reference / ${result.confidence} confidence.`
           : "Browser storage was unavailable. This result is available for this tab only."
         : failed
           ? benchmark.error
-          : "Optional one-second browser calibration for modeled proof-work timing. No Driver request.";
+          : "Run a sustained local browser calibration for clearer proof-work estimates. No Driver request.";
     let button;
     if (running) {
-      button = '<button class="game-button menu-focusable" type="button" data-command="run-hardware-index" data-hardware-index-focus aria-label="Client work index check running" aria-describedby="home-cwi-help" disabled>Testing...</button>';
+      button = '<button class="game-button menu-focusable" type="button" data-command="cancel-hardware-index" data-hardware-index-focus aria-label="Cancel client work index test" aria-describedby="home-cwi-help">Cancel</button>';
     } else if (result) {
       button = '<button class="game-button menu-focusable" type="button" data-command="config" data-hardware-index-focus aria-label="Open client work index details">View details</button>';
     } else {
@@ -3274,7 +3571,7 @@
         <span class="home-cwi-kicker">Local calibration</span>
         <h2 id="home-cwi-title">${escapeHtml(title)}</h2>
         <p id="home-cwi-help">${escapeHtml(copy)}</p>
-        ${running ? '<div class="run-request-track home-cwi-track" role="progressbar" aria-label="Running client work index"><span></span></div>' : ""}
+        ${running ? hardwareIndexProgressMarkup("home-cwi-track") : ""}
       </div>
       ${button}`;
   }
@@ -3283,54 +3580,59 @@
     return `
       <section class="home-cwi-prompt" id="home-cwi-prompt" tabindex="-1" data-hardware-index data-hardware-index-view="home" data-cwi-state="${state.hardwareIndex.status}" aria-labelledby="home-cwi-title">
         <span class="sr-only" data-hardware-index-announcement aria-live="polite" aria-atomic="true">${escapeHtml(hardwareIndexAnnouncement())}</span>
-        <div class="home-cwi-content" data-hardware-index-content aria-busy="${state.hardwareIndex.status === "running"}">${homeHardwareIndexContentMarkup()}</div>
+        <div class="home-cwi-content" data-hardware-index-content>${homeHardwareIndexContentMarkup()}</div>
       </section>`;
   }
 
   function hardwareIndexContentMarkup() {
     const benchmark = state.hardwareIndex;
-    const result = benchmark.result;
+    const result = currentHardwareIndex();
     const running = benchmark.status === "running";
-    const buttonLabel = running ? "Testing..." : result ? "Re-run" : "Run quick check";
-    const buttonAriaLabel = running ? "Testing client work index" : result ? "Re-run client work index" : "Run client work index quick check";
+    const buttonLabel = running ? "Cancel test" : result ? "Re-run CWI" : "Run CWI";
+    const buttonAriaLabel = running ? "Cancel client work index test" : result ? "Re-run client work index" : "Run client work index";
+    const buttonCommand = running ? "cancel-hardware-index" : "run-hardware-index";
     let readout;
     if (running) {
       readout = `
-        <div class="hardware-index-score is-running"><span>Client work index / synthetic</span><strong>CWI-1 TEST</strong><small>Six short samples / keep this tab visible</small></div>
-        <div class="run-request-track hardware-index-track" role="progressbar" aria-label="Running client work index" aria-valuetext="Testing search-style and sequential browser performance"><span></span></div>`;
+        <div class="hardware-index-score is-running"><span>Client work index / sustained synthetic</span><strong>${HARDWARE_INDEX_LABEL} TEST</strong><small>Adaptive 1–3 minute profile / ${result ? "last valid score remains active" : "no prior score yet"}</small></div>
+        ${hardwareIndexProgressMarkup("hardware-index-track")}`;
     } else if (result) {
-      const searchIndex = Math.max(1, Math.round(100 * (result.searchRate / HARDWARE_INDEX_SEARCH_REFERENCE)));
-      const sequentialIndex = Math.max(1, Math.round(100 * (result.sequentialRate / HARDWARE_INDEX_SEQUENTIAL_REFERENCE)));
+      const searchIndex = Math.max(1, Math.round(100 * (result.searchMedianRate / HARDWARE_INDEX_SEARCH_REFERENCE)));
+      const sequentialIndex = Math.max(1, Math.round(100 * (result.sequentialMedianRate / HARDWARE_INDEX_SEQUENTIAL_REFERENCE)));
+      const maximumSpread = Math.max(result.searchSpreadPercent, result.sequentialSpreadPercent);
+      const maximumDrift = Math.max(result.searchDriftPercent, result.sequentialDriftPercent);
       const resultNote = benchmark.status === "error"
         ? `Last ${benchmark.persistent ? "saved" : "tab-only"} result retained / re-run failed: ${benchmark.error}`
-        : `Single worker / ${result.stability} samples / ${benchmark.persistent ? "saved in browser config" : "this tab only"} / tested ${formatDate(result.measuredAt)}`;
+        : `${formatHardwareFactor(result.referenceFactor)} fixed reference / confidence ${result.confidence} / ${benchmark.persistent ? "saved locally" : "this tab only"} / tested ${formatDate(result.measuredAt)}`;
       readout = `
-        <div class="hardware-index-score"><span>Client work index / synthetic</span><strong>CWI-1 ${result.score.toLocaleString()}</strong><small class="hardware-index-result-note${benchmark.status === "error" ? " is-error" : ""}">${escapeHtml(resultNote)}</small></div>
+        <div class="hardware-index-score"><span>Client work index / sustained synthetic</span><strong>${HARDWARE_INDEX_LABEL} ${result.score.toLocaleString()}</strong><small class="hardware-index-result-note${benchmark.status === "error" ? " is-error" : ""}">${escapeHtml(resultNote)}</small></div>
         <dl class="hardware-index-metrics">
-          <div><dt>Search-style mix</dt><dd><strong>${escapeHtml(formatHardwareRate(result.searchRate))}</strong><small>Index ${searchIndex.toLocaleString()}</small></dd></div>
-          <div><dt>Sequential chain</dt><dd><strong>${escapeHtml(formatHardwareRate(result.sequentialRate))}</strong><small>Index ${sequentialIndex.toLocaleString()} / not a VDF</small></dd></div>
+          <div><dt>Search lane</dt><dd><strong>Index ${searchIndex.toLocaleString()}</strong><small>${escapeHtml(formatHardwareRate(result.searchRate))} conservative / ${escapeHtml(formatHardwareRate(result.searchMedianRate))} median</small></dd></div>
+          <div><dt>Sequential lane</dt><dd><strong>Index ${sequentialIndex.toLocaleString()}</strong><small>${escapeHtml(formatHardwareRate(result.sequentialRate))} conservative / ${escapeHtml(formatHardwareRate(result.sequentialMedianRate))} median / not a VDF</small></dd></div>
+          <div><dt>Measurement confidence</dt><dd><strong>${escapeHtml(result.confidence.toUpperCase())}</strong><small>${result.sampleCount} rounds/lane / ${escapeHtml(formatHardwarePercent(maximumSpread))} spread / ${escapeHtml(formatHardwarePercent(maximumDrift))} drift</small></dd></div>
+          <div><dt>Test profile</dt><dd><strong>${escapeHtml(formatProofDuration(result.durationMs))}</strong><small>${result.stabilityConfirmed ? "stable adaptive stop" : "three-minute ceiling"} / 1 browser worker / ${result.logicalProcessors} logical processor${result.logicalProcessors === 1 ? "" : "s"} reported</small></dd></div>
         </dl>`;
     } else {
       readout = `
         <div class="hardware-index-score${benchmark.status === "error" ? " is-error" : ""}">
-          <span>Client work index / synthetic</span><strong>CWI-1 --</strong><small>${escapeHtml(benchmark.error || "Not tested on this browser")}</small>
+          <span>Client work index / sustained synthetic</span><strong>${HARDWARE_INDEX_LABEL} --</strong><small>${escapeHtml(benchmark.error || "Not tested on this browser")}</small>
         </div>`;
     }
     return `
       <div class="hardware-index-heading">
         ${readout}
-        <button class="game-button" type="button" data-command="run-hardware-index" data-hardware-index-focus aria-label="${buttonAriaLabel}"${running ? " disabled" : ""}>${buttonLabel}</button>
+        <button class="game-button" type="button" data-command="${buttonCommand}" data-hardware-index-focus aria-label="${buttonAriaLabel}">${buttonLabel}</button>
       </div>
-      <p class="hardware-index-note">CWI-1 100 is a fixed v1 reference: 100M independent mixes/sec plus 1M dependent BigInt steps/sec. The console divides readable direct proof-work counts by these component rates to produce a synthetic browser-equivalent model. CWI does not measure the selected Driver, actual DON proof kernels, network, queue, or commit work, so the model is not Driver or end-to-end wall-clock truth.</p>`;
+      <p class="hardware-index-note"><strong>${HARDWARE_INDEX_LABEL} 100</strong> means reference speed for a fixed workload split evenly between 100M independent mixes/sec and 1M dependent BigInt steps/sec; 200 means roughly twice that reference throughput. The score is a balanced harmonic result, while time estimates use each lane's conservative lower-quarter/tail rate directly. This is sustained single-worker JavaScript capability—not a percentile, multicore score, DON proof kernel, selected Driver measurement, or end-to-end wall-clock promise.</p>`;
   }
 
   function hardwareIndexAnnouncement() {
     const benchmark = state.hardwareIndex;
-    const result = benchmark.result;
-    if (benchmark.status === "running") return "Client work index test started. Keep this tab visible.";
-    if (benchmark.status === "error" && result) return `Client work index re-run failed. CWI-1 ${result.score.toLocaleString()} retained. ${benchmark.error}`;
+    const result = currentHardwareIndex();
+    if (benchmark.status === "running") return "Client work index sustained test started. It can take up to three minutes. Keep this tab visible.";
+    if (benchmark.status === "error" && result) return `Client work index re-run failed. ${HARDWARE_INDEX_LABEL} ${result.score.toLocaleString()} retained. ${benchmark.error}`;
     if (benchmark.status === "error") return `Client work index failed. ${benchmark.error}`;
-    if (result) return `Client work index ready. CWI-1 ${result.score.toLocaleString()}. ${result.stability} samples. ${benchmark.persistent ? "Saved in browser config." : "Available for this tab only."}`;
+    if (result) return `Client work index ready. ${HARDWARE_INDEX_LABEL} ${result.score.toLocaleString()}, ${formatHardwareFactor(result.referenceFactor)} the fixed reference, with ${result.confidence} confidence. ${benchmark.persistent ? "Saved locally." : "Available for this tab only."}`;
     return "";
   }
 
@@ -3352,7 +3654,7 @@
       const view = region.dataset.hardwareIndexView;
       if (
         view === "home" &&
-        state.hardwareIndex.result &&
+        currentHardwareIndex() &&
         state.hardwareIndex.status !== "running"
       ) {
         removedFocusedHome ||= focusedInIndex === region;
@@ -3374,11 +3676,13 @@
           ? actionProofTimingAnnouncement(proofAction)
           : hardwareIndexAnnouncement();
       }
-      if (content) content.setAttribute("aria-busy", String(state.hardwareIndex.status === "running"));
       region.dataset.cwiState = state.hardwareIndex.status;
     });
     if (focusRunningStatus) {
-      focusedInIndex.focus({ preventScroll: true });
+      requestAnimationFrame(() => {
+        const button = focusedInIndex.querySelector("[data-hardware-index-focus]");
+        if (button && !button.disabled) button.focus({ preventScroll: true });
+      });
     }
     if (focusReturnPending) {
       state.hardwareIndex.restoreFocus = false;
@@ -3389,20 +3693,28 @@
         const button = removedFocusedHome
           ? document.querySelector(".home-menu-list .menu-focusable")
           : document.querySelector("[data-hardware-index] [data-hardware-index-focus]");
-        if (button && !button.disabled) button.focus({ preventScroll: true });
+        const target = button && !button.disabled
+          ? button
+          : !removedFocusedHome && focusedInIndex?.isConnected
+            ? focusedInIndex
+            : null;
+        target?.focus({ preventScroll: true });
       });
     }
     if (state.screen === "planner") patchPlanner({ replan: false });
   }
 
   async function runHardwareIndex() {
-    if (state.hardwareIndex.status === "running") return;
+    if (state.hardwareIndex.status === "running") {
+      cancelHardwareIndex();
+      return;
+    }
     if (document.activeElement?.closest?.('[data-command="run-hardware-index"]')) {
       state.hardwareIndex.restoreFocus = true;
     }
     if (document.hidden) {
       state.hardwareIndex.status = "error";
-      state.hardwareIndex.error = "Keep this tab visible before starting the quick check.";
+      state.hardwareIndex.error = "Keep this tab visible before starting the sustained test.";
       patchHardwareIndex();
       if (!document.querySelector("[data-hardware-index]")) toast("Client work index paused", state.hardwareIndex.error, "error");
       return;
@@ -3418,6 +3730,14 @@
     const token = ++state.hardwareIndex.runToken;
     state.hardwareIndex.status = "running";
     state.hardwareIndex.error = "";
+    state.hardwareIndex.progress = {
+      phase: "Starting benchmark worker",
+      elapsedMs: 0,
+      completedSamples: 0,
+      sampleCount: 0,
+      maximumDurationMs: HARDWARE_INDEX_MAX_DURATION_MS,
+      stabilityConfirmed: false,
+    };
     patchHardwareIndex();
     let workerUrl = "";
     let worker = null;
@@ -3434,56 +3754,90 @@
           settled = true;
           clearTimeout(timeout);
           document.removeEventListener("visibilitychange", onVisibilityChange);
+          state.hardwareIndex.cancelRun = null;
           handler(value);
         };
         const onVisibilityChange = () => {
-          if (document.hidden) finish(reject, new Error("The quick check stopped because this tab was hidden."));
+          if (document.hidden) finish(reject, new Error("The sustained test stopped because this tab was hidden."));
         };
-        timeout = setTimeout(() => finish(reject, new Error("The quick index timed out.")), 7000);
+        timeout = setTimeout(() => finish(reject, new Error("The sustained client index timed out.")), HARDWARE_INDEX_MAX_DURATION_MS + 90_000);
+        state.hardwareIndex.cancelRun = () => {
+          const error = new Error("Client work index test cancelled.");
+          error.name = "AbortError";
+          finish(reject, error);
+        };
         document.addEventListener("visibilitychange", onVisibilityChange);
         worker.addEventListener("message", (event) => {
-          if (document.hidden) finish(reject, new Error("The quick check stopped because this tab was hidden."));
-          else if (event.data?.error) finish(reject, new Error(event.data.error));
-          else finish(resolve, event.data);
-        }, { once: true });
+          if (document.hidden) {
+            finish(reject, new Error("The sustained test stopped because this tab was hidden."));
+            return;
+          }
+          if (event.data?.type === "progress") {
+            if (settled || token !== state.hardwareIndex.runToken) return;
+            state.hardwareIndex.progress = {
+              phase: String(event.data.phase || "Running sustained benchmark").slice(0, 120),
+              elapsedMs: Math.max(0, Number(event.data.elapsedMs) || 0),
+              completedSamples: Math.max(0, Math.round(Number(event.data.completedSamples) || 0)),
+              sampleCount: Math.max(0, Math.round(Number(event.data.sampleCount) || 0)),
+              maximumDurationMs: HARDWARE_INDEX_MAX_DURATION_MS,
+              stabilityConfirmed: Boolean(event.data.stabilityConfirmed),
+            };
+            updateHardwareIndexProgressUi();
+            return;
+          }
+          if (event.data?.type === "error" || event.data?.error) {
+            finish(reject, new Error(event.data.error || "The benchmark worker failed."));
+            return;
+          }
+          if (event.data?.type === "result") finish(resolve, event.data);
+        });
         worker.addEventListener("error", (event) => {
           if (settled) return;
           event.preventDefault();
           finish(reject, new Error(event.message || "The benchmark worker could not start."));
         }, { once: true });
         try {
-          worker.postMessage({ run: true });
+          worker.postMessage({
+            run: true,
+            warmupDurationMs: HARDWARE_INDEX_WARMUP_MS,
+            sampleDurationMs: HARDWARE_INDEX_SAMPLE_MS,
+            minSamples: HARDWARE_INDEX_MIN_SAMPLES,
+            maxSamples: HARDWARE_INDEX_MAX_SAMPLES,
+          });
         } catch (error) {
           finish(reject, error);
         }
       });
       if (token !== state.hardwareIndex.runToken) return;
-      if (document.hidden) throw new Error("The quick check stopped because this tab was hidden.");
-      const searchRate = Number(raw?.searchRate);
-      const sequentialRate = Number(raw?.sequentialRate);
+      if (document.hidden) throw new Error("The sustained test stopped because this tab was hidden.");
       const durationMs = Number(raw?.durationMs);
       const normalizeSamples = (samples) => Array.isArray(samples) ? samples.map(Number) : [];
       const searchSamples = normalizeSamples(raw?.searchSamples);
       const sequentialSamples = normalizeSamples(raw?.sequentialSamples);
-      const validSamples = (samples) => samples.length === 3 && samples.every((sample) => Number.isFinite(sample) && sample > 0);
+      const validSamples = (samples) =>
+        samples.length >= HARDWARE_INDEX_MIN_RESULT_SAMPLES &&
+        samples.length <= HARDWARE_INDEX_MAX_SAMPLES &&
+        samples.every((sample) => Number.isFinite(sample) && sample > 0);
       if (
-        !Number.isFinite(searchRate) || searchRate <= 0 ||
-        !Number.isFinite(sequentialRate) || sequentialRate <= 0 ||
         !Number.isFinite(durationMs) || durationMs <= 0 ||
-        !validSamples(searchSamples) || !validSamples(sequentialSamples)
+        !validSamples(searchSamples) || !validSamples(sequentialSamples) ||
+        searchSamples.length !== sequentialSamples.length
       ) {
         throw new Error("The benchmark returned an invalid result.");
       }
       const result = normalizeHardwareIndex({
         version: HARDWARE_INDEX_VERSION,
         benchmarkId: HARDWARE_INDEX_BENCHMARK_ID,
-        searchRate,
-        sequentialRate,
+        scope: HARDWARE_INDEX_SCOPE,
+        algorithm: HARDWARE_INDEX_ALGORITHM,
+        workerCount: 1,
+        logicalProcessors: navigator.hardwareConcurrency || 1,
+        warmupDurationMs: HARDWARE_INDEX_WARMUP_MS,
+        sampleDurationMs: HARDWARE_INDEX_SAMPLE_MS,
         searchSamples,
         sequentialSamples,
         durationMs,
         measuredAt: new Date().toISOString(),
-        stability: hardwareIndexStability(searchSamples, sequentialSamples),
       });
       if (!result) throw new Error("The benchmark result could not be normalized.");
       const ranFromHome = Boolean(document.querySelector('[data-hardware-index-view="home"]'));
@@ -3492,19 +3846,34 @@
       state.hardwareIndex.persistent = persistHardwareIndex(result);
       const savedResult = state.hardwareIndex.result || result;
       if (ranFromHome || !document.querySelector("[data-hardware-index]")) {
-        toast("Client work index ready", `CWI-1 ${savedResult.score.toLocaleString()} / ${state.hardwareIndex.persistent ? "saved in browser config" : "this tab only"}`, "success");
+        toast("Client work index ready", `${HARDWARE_INDEX_LABEL} ${savedResult.score.toLocaleString()} / ${formatHardwareFactor(savedResult.referenceFactor)} reference / ${state.hardwareIndex.persistent ? "saved locally" : "this tab only"}`, "success");
       }
     } catch (error) {
       if (token !== state.hardwareIndex.runToken) return;
-      state.hardwareIndex.status = "error";
-      state.hardwareIndex.error = error.message;
-      if (!document.querySelector("[data-hardware-index]")) toast("Client work index failed", error.message, "error");
+      if (error?.name === "AbortError") {
+        state.hardwareIndex.status = currentHardwareIndex() ? "ready" : "idle";
+        state.hardwareIndex.error = "";
+        toast("Client work index stopped", currentHardwareIndex() ? "Last valid score retained." : "No score was saved.");
+      } else {
+        state.hardwareIndex.status = "error";
+        state.hardwareIndex.error = error.message;
+        if (!document.querySelector("[data-hardware-index]")) toast("Client work index failed", error.message, "error");
+      }
     } finally {
       worker?.terminate();
       if (workerUrl) globalThis.URL.revokeObjectURL(workerUrl);
-      if (token === state.hardwareIndex.runToken) state.hardwareIndex.worker = null;
+      if (token === state.hardwareIndex.runToken) {
+        state.hardwareIndex.worker = null;
+        state.hardwareIndex.cancelRun = null;
+        state.hardwareIndex.progress = null;
+      }
       patchHardwareIndex();
     }
+  }
+
+  function cancelHardwareIndex() {
+    if (state.hardwareIndex.status !== "running") return;
+    state.hardwareIndex.cancelRun?.();
   }
 
   function techTreeClassId(value, explicitHash = "") {
@@ -4859,7 +5228,7 @@
     return position >= 0 && position < pairedCount ? `update-${endpoint}` : endpoint;
   }
 
-  function plannerTimingLabel(summary, emptyLabel = "0 ms") {
+  function plannerTimingLabel(summary, emptyLabel = "0 sec") {
     if (!summary.count) return emptyLabel;
     if (summary.requiresCwi) return "Run CWI";
     if (!summary.knownCount) return "Time unknown";
@@ -5346,12 +5715,16 @@
       "search-limit": "Search limit",
       "invalid-goal": "Invalid goal",
     }[result.status] || result.status;
-    const cwi = state.hardwareIndex.result;
+    const cwi = currentHardwareIndex();
     const cwiControl = !cwi && totalTiming.requiresCwi
-      ? gameButton(state.hardwareIndex.status === "running" ? "CWI running..." : "Run CWI", "run-hardware-index", { tone: "primary", disabled: state.hardwareIndex.status === "running" })
+      ? gameButton(
+          state.hardwareIndex.status === "running" ? "Cancel CWI" : "Run CWI",
+          "run-hardware-index",
+          { tone: "primary" },
+        )
       : "";
     const groundingNote = cwi
-      ? `${cwi.stability} / ${formatDate(cwi.measuredAt)}`
+      ? `${cwi.confidence} confidence / ${formatHardwareFactor(cwi.referenceFactor)} reference / ${formatDate(cwi.measuredAt)}`
       : totalTiming.requiresCwi
         ? "Required to time readable gates"
         : totalTiming.directWorkCount
@@ -5414,7 +5787,7 @@
         <div class="planner-summary-item"><span>Goal state</span><strong>${escapeHtml(stateLabel)}</strong><small>${escapeHtml(result.goal.label)} / ${escapeHtml(shortText(result.goal.hash, 6, 4))} / ${escapeHtml(goalRule)}</small></div>
         <div class="planner-summary-item"><span>Total proof work</span><strong aria-live="polite" aria-atomic="true">${escapeHtml(totalLabel)}</strong><small>${escapeHtml(totalBasis)}<br />${escapeHtml(plannerWorkloadLabel(totalWorkload))}</small></div>
         <div class="planner-summary-item"><span>Action set</span><strong>${result.totals.actionCount}</strong><small>${escapeHtml(actionSetBasis)}</small></div>
-        <div class="planner-summary-item"><span>Grounding</span><strong>${cwi ? `CWI-1 ${cwi.score.toLocaleString()}` : "No CWI"}</strong><small>${escapeHtml(groundingNote)}</small>${cwiControl}</div>
+        <div class="planner-summary-item"><span>Grounding</span><strong>${cwi ? `${HARDWARE_INDEX_LABEL} ${cwi.score.toLocaleString()}` : "No CWI"}</strong><small>${escapeHtml(groundingNote)}</small>${cwiControl}</div>
       </div>
       ${inventorySatisfiedNote}
       <div class="planner-flow-key" aria-label="Plan relationship legend"><span><i class="planner-key-input" aria-hidden="true"></i>USE / consumed input</span><span><i class="planner-key-output" aria-hidden="true"></i>MAKE / created output</span><span><i class="planner-key-update" aria-hidden="true"></i>UPDATE / paired turnover</span>${inventoryKey}${hasMissingBranches ? '<span><i class="planner-key-missing" aria-hidden="true"></i>MISSING / unresolved prerequisite</span>' : ""}<span>${escapeHtml(treeGuide)}</span></div>
@@ -6128,7 +6501,7 @@
   }
 
   function actionProofComponentTimingLabel(value, milliseconds, timing) {
-    if (value.complete && value.callCount === 0) return "0 modeled";
+    if (value.complete && value.callCount === 0) return "0 sec";
     if (milliseconds != null) return `${value.complete ? "~" : ">="}${formatProofDuration(milliseconds)}`;
     if (timing.requiresCwi && value.knownCount > 0) {
       return state.hardwareIndex.status === "running" ? "Calibrating..." : "CWI required";
@@ -6179,8 +6552,8 @@
         : "";
     return `
       <div class="proof-cwi-source">
-        <span><b>CWI-1 ${cwi.score.toLocaleString()}</b> / ${escapeHtml(cwi.stability)} samples${escapeHtml(liveState)}</span>
-        <small>Search ${escapeHtml(formatHardwareRate(cwi.searchRate))} / sequential ${escapeHtml(formatHardwareRate(cwi.sequentialRate))} / measured ${escapeHtml(formatDate(cwi.measuredAt))}</small>
+        <span><b>${HARDWARE_INDEX_LABEL} ${cwi.score.toLocaleString()}</b> / ${escapeHtml(cwi.confidence)} confidence / ${escapeHtml(formatHardwareFactor(cwi.referenceFactor))} reference${escapeHtml(liveState)}</span>
+        <small>Conservative search ${escapeHtml(formatHardwareRate(cwi.searchRate))} / sequential ${escapeHtml(formatHardwareRate(cwi.sequentialRate))} / ${cwi.sampleCount} sustained rounds / measured ${escapeHtml(formatDate(cwi.measuredAt))}</small>
       </div>`;
   }
 
@@ -6190,21 +6563,21 @@
     const failed = state.hardwareIndex.status === "error";
     const title = running ? "Measuring this browser" : failed ? "Client calibration failed" : "Client calibration required";
     const copy = running
-      ? "Six synthetic component samples are running off the main UI thread."
+      ? "Paired search/chain samples are running off the main UI thread for about 1–3 minutes."
       : failed
         ? state.hardwareIndex.error || "The browser could not complete CWI."
-        : "Run the one-second CWI check to model the readable proof work on this browser.";
+        : "Run CWI-2 to measure sustained browser capability and model the readable proof work.";
     return `
       <div class="proof-cwi-callout${failed ? " is-error" : ""}">
-        <div><span>Local CWI-1</span><strong>${escapeHtml(title)}</strong><small>${escapeHtml(copy)}</small></div>
-        <button class="game-button" type="button" data-command="run-hardware-index" data-hardware-index-focus${running ? " disabled" : ""}>${running ? "Testing..." : failed ? "Retry CWI" : "Run CWI"}</button>
-        ${running ? '<div class="run-request-track proof-cwi-track" role="progressbar" aria-label="Running client work index"><span></span></div>' : ""}
+        <div><span>Local ${HARDWARE_INDEX_LABEL}</span><strong>${escapeHtml(title)}</strong><small>${escapeHtml(copy)}</small></div>
+        <button class="game-button" type="button" data-command="${running ? "cancel-hardware-index" : "run-hardware-index"}" data-hardware-index-focus>${running ? "Cancel" : failed ? "Retry CWI" : "Run CWI"}</button>
+        ${running ? hardwareIndexProgressMarkup("proof-cwi-track") : ""}
       </div>`;
   }
 
   function actionProofRequirementsContentMarkup(action) {
     const workload = actionProofWorkload(action);
-    const timing = estimateActionProofTiming(action, state.hardwareIndex.result, workload);
+    const timing = estimateActionProofTiming(action, currentHardwareIndex(), workload);
     const rating = (kind, value, milliseconds) => `
       <div class="proof-rating proof-rating-${value.level.toLowerCase()}">
         <span>${kind}</span>
@@ -6238,7 +6611,7 @@
       <section class="game-panel action-proof-panel" data-hardware-index data-hardware-index-view="action-proof" data-action-key="${escapeHtml(key)}" data-cwi-state="${escapeHtml(state.hardwareIndex.status)}" tabindex="-1" aria-labelledby="action-proof-title">
         <span class="sr-only" data-hardware-index-announcement aria-live="polite" aria-atomic="true">${escapeHtml(actionProofTimingAnnouncement(action))}</span>
         <div class="game-panel-header"><h3 id="action-proof-title">Direct work gates</h3><span>CWI browser model</span></div>
-        <div class="game-panel-body" data-hardware-index-content aria-busy="${state.hardwareIndex.status === "running"}">${actionProofRequirementsContentMarkup(action)}</div>
+        <div class="game-panel-body" data-hardware-index-content>${actionProofRequirementsContentMarkup(action)}</div>
       </section>`;
   }
 
@@ -6947,12 +7320,12 @@
           ${menuTile("reset-config", "RST", "Reset defaults", "Restore the local Driver profile and clear saved cartridge selections.", { meta: "Caution" })}
         </div>
         <div class="game-panel hardware-index-panel">
-          <div class="game-panel-header"><h2>Client work index</h2><span>Quick browser test</span></div>
+          <div class="game-panel-header"><h2>Client work index</h2><span>Sustained browser test</span></div>
           <div class="game-panel-body">
-            <p class="screen-copy hardware-index-intro">Run two brief single-worker loops to get a rough search-style and sequential-work index for this browser. The test takes about one second and needs this tab to stay visible. When browser storage is available, its result is saved in the local config.</p>
+            <p class="screen-copy hardware-index-intro">Measure sustained search-style and dependent-chain JavaScript performance with five-second lane samples. A stable run finishes in about 70 seconds; runs with noise or sustained-rate drift extend automatically, up to three minutes. Keep this tab visible. The score and its conservative component rates are saved locally for 30 days when browser storage is available.</p>
             <div class="hardware-index" id="config-cwi-panel" tabindex="-1" data-hardware-index data-hardware-index-view="full">
               <span class="sr-only" data-hardware-index-announcement aria-live="polite" aria-atomic="true">${escapeHtml(hardwareIndexAnnouncement())}</span>
-              <div data-hardware-index-content aria-busy="${state.hardwareIndex.status === "running"}">${hardwareIndexContentMarkup()}</div>
+              <div data-hardware-index-content>${hardwareIndexContentMarkup()}</div>
             </div>
           </div>
         </div>
@@ -7369,6 +7742,9 @@
       case "run-hardware-index":
         await runHardwareIndex();
         break;
+      case "cancel-hardware-index":
+        cancelHardwareIndex();
+        break;
       case "open-config":
         await openConfigFile();
         break;
@@ -7585,6 +7961,10 @@
     if (event.key === LEGACY_HARDWARE_INDEX_STORAGE_KEY && event.newValue) {
       try {
         const legacyResult = normalizeHardwareIndex(JSON.parse(event.newValue));
+        if (!legacyResult) {
+          localStorage.removeItem(LEGACY_HARDWARE_INDEX_STORAGE_KEY);
+          return;
+        }
         const saved = synchronizeHardwareIndexFromStorage(legacyResult, state.config);
         if (saved) {
           try {
