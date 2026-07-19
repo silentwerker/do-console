@@ -8,28 +8,21 @@
 
   const CONFIG_VERSION = 1;
   const STORAGE_KEY = "don.lightConsole.config.v1";
-  const HARDWARE_INDEX_VERSION = 2;
-  const HARDWARE_INDEX_LABEL = "CWI-2";
-  const HARDWARE_INDEX_BENCHMARK_ID = "browser-sustained-mix-v2";
-  const HARDWARE_INDEX_SCOPE = "browser-runtime-sustained-single-worker-synthetic";
-  const HARDWARE_INDEX_ALGORITHM = "search32-v1+bigint127-v1:w5000:s5000:min5:max17:adaptive-v1";
+  const HARDWARE_INDEX_VERSION = 3;
+  const HARDWARE_INDEX_LABEL = "CWI-3";
+  const HARDWARE_INDEX_BENCHMARK_ID = "driver-craft-rocket-mineiron-v1";
+  const HARDWARE_INDEX_SCOPE = "selected-driver-committed-action-lifecycle";
+  const HARDWARE_INDEX_ALGORITHM = "craft-rocket::MineIron/request-to-live-verified-v1";
   const LEGACY_HARDWARE_INDEX_STORAGE_KEY = "don.lightConsole.clientWorkIndex.v1";
-  const HARDWARE_INDEX_SEARCH_REFERENCE = 100_000_000;
-  const HARDWARE_INDEX_SEQUENTIAL_REFERENCE = 1_000_000;
-  const HARDWARE_INDEX_WARMUP_MS = 5_000;
-  const HARDWARE_INDEX_SAMPLE_MS = 5_000;
-  const HARDWARE_INDEX_MIN_SAMPLES = 5;
-  const HARDWARE_INDEX_MIN_RESULT_SAMPLES = HARDWARE_INDEX_MIN_SAMPLES + 1;
-  const HARDWARE_INDEX_MAX_SAMPLES = 17;
   const HARDWARE_INDEX_MAX_AGE_MS = 30 * 24 * 60 * 60_000;
-  const HARDWARE_INDEX_MIN_DURATION_MS = (2 * HARDWARE_INDEX_WARMUP_MS) +
-    (2 * (HARDWARE_INDEX_MIN_SAMPLES + 1) * HARDWARE_INDEX_SAMPLE_MS);
-  const HARDWARE_INDEX_MAX_DURATION_MS = (2 * HARDWARE_INDEX_WARMUP_MS) +
-    (2 * HARDWARE_INDEX_MAX_SAMPLES * HARDWARE_INDEX_SAMPLE_MS);
+  const HARDWARE_INDEX_MAX_RUN_MS = 30 * 60_000;
+  const HARDWARE_INDEX_PENDING_MAX_AGE_MS = 24 * 60 * 60_000;
+  const HARDWARE_INDEX_POLL_MS = 1_200;
+  const HARDWARE_INDEX_ACTION = Object.freeze({ pluginName: "craft-rocket", name: "MineIron" });
+  const clearedHardwareIndexRunUrls = new Set();
   const HANDLE_DB = "don-light-console";
   const HANDLE_STORE = "handles";
   const HANDLE_KEY = "config";
-  let legacyHardwareIndexMigrationPending = false;
   const TERMINAL_RUNS = new Set(["succeeded", "failed"]);
   const DEFAULT_SYNCHRONIZER = "https://synchronizer.don.pateldhvani.com";
   const DEFAULT_RELAYER = "https://relayer.don.pateldhvani.com";
@@ -103,7 +96,8 @@
       connections: [defaultConnection()],
       activeCartridgeByConnection: {},
       recentRunIdsByConnection: {},
-      clientWorkIndex: null,
+      clientWorkIndexes: {},
+      clientWorkIndexRuns: {},
       ui: { lastScreen: "home", theme: "desk-classic", soundsMuted: false, music: { lastTrack: "" } },
     };
   }
@@ -151,6 +145,11 @@
     }
     const requestedActive = String(source.activeConnectionId || "");
     const activeConnectionId = ids.has(requestedActive) ? requestedActive : connections[0].id;
+    const clientWorkIndexes = normalizeHardwareIndexMap(source.clientWorkIndexes);
+    const clientWorkIndexRuns = pruneHardwareIndexRunMap(
+      normalizeHardwareIndexRunMap(source.clientWorkIndexRuns),
+      clientWorkIndexes,
+    );
     return {
       version: CONFIG_VERSION,
       activeConnectionId,
@@ -168,7 +167,8 @@
               ]),
             )
           : {},
-      clientWorkIndex: normalizeHardwareIndex(source.clientWorkIndex),
+      clientWorkIndexes,
+      clientWorkIndexRuns,
       ui: {
         lastScreen: String(source.ui?.lastScreen || "home"),
         theme: THEME_IDS.has(source.ui?.theme) ? source.ui.theme : "desk-classic",
@@ -186,71 +186,29 @@
       if (raw) {
         const source = JSON.parse(raw);
         const config = normalizeConfig(source);
-        if (source?.clientWorkIndex && !config.clientWorkIndex) legacyHardwareIndexMigrationPending = true;
-        adoptLegacyHardwareIndex(config);
+        if (source?.clientWorkIndex) {
+          delete source.clientWorkIndex;
+          try { localStorage.removeItem(LEGACY_HARDWARE_INDEX_STORAGE_KEY); } catch { /* best effort */ }
+        }
         return config;
       }
-      const config = defaultConfig();
-      adoptLegacyHardwareIndex(config);
-      return config;
+      return defaultConfig();
     } catch (error) {
       console.warn("Could not load saved console config", error);
-      const config = defaultConfig();
-      adoptLegacyHardwareIndex(config);
-      return config;
+      return defaultConfig();
     }
   }
 
-  function hardwareIndexMedian(values) {
-    const sorted = [...values].sort((left, right) => left - right);
-    const middle = Math.floor(sorted.length / 2);
-    return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
-  }
-
-  function hardwareIndexQuantile(values, quantile) {
-    const sorted = [...values].sort((left, right) => left - right);
-    const position = (sorted.length - 1) * quantile;
-    const lower = Math.floor(position);
-    const fraction = position - lower;
-    return sorted[lower + 1] == null
-      ? sorted[lower]
-      : sorted[lower] + (sorted[lower + 1] - sorted[lower]) * fraction;
-  }
-
-  function hardwareIndexLaneStats(samples) {
-    const thirdLength = Math.max(2, Math.ceil(samples.length / 3));
-    const median = hardwareIndexMedian(samples);
-    const p10 = hardwareIndexQuantile(samples, 0.1);
-    const p25 = hardwareIndexQuantile(samples, 0.25);
-    const p90 = hardwareIndexQuantile(samples, 0.9);
-    const earlyMedian = hardwareIndexMedian(samples.slice(0, thirdLength));
-    const lateMedian = hardwareIndexMedian(samples.slice(-thirdLength));
-    const spreadPercent = median > 0 ? ((p90 - p10) / median) * 100 : Infinity;
-    const driftPercent = earlyMedian > 0 ? (Math.abs(lateMedian - earlyMedian) / earlyMedian) * 100 : Infinity;
-    return {
-      median,
-      p10,
-      p25,
-      p90,
-      earlyMedian,
-      lateMedian,
-      estimateRate: Math.min(p25, lateMedian),
-      spreadPercent,
-      driftPercent,
-    };
-  }
-
-  function hardwareIndexStabilityConfirmationCount(searchSamples, sequentialSamples) {
-    let stablePasses = 0;
-    for (let count = HARDWARE_INDEX_MIN_SAMPLES; count <= searchSamples.length; count += 1) {
-      const searchStats = hardwareIndexLaneStats(searchSamples.slice(0, count));
-      const sequentialStats = hardwareIndexLaneStats(sequentialSamples.slice(0, count));
-      const qualifies = Math.max(searchStats.spreadPercent, sequentialStats.spreadPercent) <= 6 &&
-        Math.max(searchStats.driftPercent, sequentialStats.driftPercent) <= 5;
-      stablePasses = qualifies ? stablePasses + 1 : 0;
-      if (stablePasses >= 2) return count;
+  function normalizedDriverUrl(value) {
+    try {
+      return cleanUrl(value);
+    } catch {
+      return "";
     }
-    return 0;
+  }
+
+  function hardwareIndexConnectionKey(connection) {
+    return normalizedDriverUrl(connection?.driverUrl);
   }
 
   function normalizeHardwareIndex(value) {
@@ -260,89 +218,130 @@
       value.benchmarkId !== HARDWARE_INDEX_BENCHMARK_ID ||
       value.scope !== HARDWARE_INDEX_SCOPE ||
       value.algorithm !== HARDWARE_INDEX_ALGORITHM ||
-      Number(value.workerCount) !== 1 ||
-      Number(value.warmupDurationMs) !== HARDWARE_INDEX_WARMUP_MS ||
-      Number(value.sampleDurationMs) !== HARDWARE_INDEX_SAMPLE_MS
+      !sameQualified(value.action, HARDWARE_INDEX_ACTION)
     ) return null;
-    const durationMs = Number(value.durationMs);
-    const measuredAt = String(value.measuredAt || "");
+    const driverUrl = normalizedDriverUrl(value.driverUrl);
+    const driverVersion = String(value.driverVersion || "").slice(0, 160);
+    const actionHash = String(value.actionHash || "").trim().slice(0, 512);
+    const runId = String(value.runId || "").trim().slice(0, 256);
+    const reportedDurationMs = Number(value.durationMs);
+    const requestedAt = String(value.requestedAt || "");
+    const acceptedAt = String(value.acceptedAt || "");
+    const completedAt = String(value.completedAt || value.measuredAt || "");
+    const measuredAt = completedAt;
+    const requestedTimestamp = new Date(requestedAt).valueOf();
+    const acceptedTimestamp = new Date(acceptedAt).valueOf();
     const measuredTimestamp = new Date(measuredAt).valueOf();
-    const normalizeSamples = (samples) => Array.isArray(samples) ? samples.map(Number) : [];
-    const searchSamples = normalizeSamples(value.searchSamples);
-    const sequentialSamples = normalizeSamples(value.sequentialSamples);
-    const sampleCount = searchSamples.length;
-    const expectedDurationMs = (2 * HARDWARE_INDEX_WARMUP_MS) +
-      (2 * sampleCount * HARDWARE_INDEX_SAMPLE_MS);
+    const durationMs = measuredTimestamp - requestedTimestamp;
+    const outputFiles = Array.isArray(value.outputFiles)
+      ? value.outputFiles.map(String).filter(Boolean).slice(0, 16)
+      : [];
     if (
-      !Number.isFinite(durationMs) || durationMs < expectedDurationMs * 0.95 || durationMs > expectedDurationMs * 2.5 ||
-      searchSamples.length !== sequentialSamples.length ||
-      sampleCount < HARDWARE_INDEX_MIN_RESULT_SAMPLES || sampleCount > HARDWARE_INDEX_MAX_SAMPLES ||
-      !searchSamples.every((sample) => Number.isFinite(sample) && sample > 0) ||
-      !sequentialSamples.every((sample) => Number.isFinite(sample) && sample > 0) ||
-      !Number.isFinite(measuredTimestamp) ||
+      !driverUrl || !actionHash || !runId ||
+      !Number.isFinite(reportedDurationMs) || Math.abs(reportedDurationMs - durationMs) > 1 ||
+      !Number.isFinite(durationMs) || durationMs <= 0 || durationMs > 24 * 60 * 60_000 || outputFiles.length !== 1 ||
+      !Number.isFinite(requestedTimestamp) || !Number.isFinite(acceptedTimestamp) || !Number.isFinite(measuredTimestamp) ||
+      acceptedTimestamp < requestedTimestamp || measuredTimestamp < acceptedTimestamp ||
       measuredTimestamp > Date.now() + 5 * 60_000 ||
       measuredTimestamp < Date.now() - HARDWARE_INDEX_MAX_AGE_MS
     ) return null;
-    const searchStats = hardwareIndexLaneStats(searchSamples);
-    const sequentialStats = hardwareIndexLaneStats(sequentialSamples);
-    const stabilityConfirmationCount = hardwareIndexStabilityConfirmationCount(searchSamples, sequentialSamples);
-    if (
-      (stabilityConfirmationCount && stabilityConfirmationCount !== sampleCount) ||
-      (!stabilityConfirmationCount && sampleCount < HARDWARE_INDEX_MAX_SAMPLES)
-    ) return null;
-    const stabilityConfirmed = stabilityConfirmationCount === sampleCount;
-    const searchRate = searchStats.estimateRate;
-    const sequentialRate = sequentialStats.estimateRate;
-    const score = hardwareIndexScore(searchStats.median, sequentialStats.median);
-    if (!Number.isFinite(score) || searchRate <= 0 || sequentialRate <= 0) return null;
-    const logicalProcessors = Math.max(1, Math.min(256, Math.round(Number(value.logicalProcessors) || 1)));
     return {
       version: HARDWARE_INDEX_VERSION,
       benchmarkId: HARDWARE_INDEX_BENCHMARK_ID,
       scope: HARDWARE_INDEX_SCOPE,
       algorithm: HARDWARE_INDEX_ALGORITHM,
-      workerCount: 1,
-      logicalProcessors,
-      warmupDurationMs: HARDWARE_INDEX_WARMUP_MS,
-      sampleDurationMs: HARDWARE_INDEX_SAMPLE_MS,
-      sampleCount,
-      score,
-      referenceFactor: hardwareIndexReferenceFactor(searchStats.median, sequentialStats.median),
-      searchRate,
-      sequentialRate,
-      searchMedianRate: searchStats.median,
-      sequentialMedianRate: sequentialStats.median,
-      searchSpreadPercent: searchStats.spreadPercent,
-      sequentialSpreadPercent: sequentialStats.spreadPercent,
-      searchDriftPercent: searchStats.driftPercent,
-      sequentialDriftPercent: sequentialStats.driftPercent,
-      searchSamples,
-      sequentialSamples,
+      driverUrl,
+      driverVersion,
+      action: { ...HARDWARE_INDEX_ACTION },
+      actionHash,
+      runId,
       durationMs,
+      requestedAt,
+      acceptedAt,
+      completedAt,
       measuredAt,
-      stability: hardwareIndexStability(searchStats, sequentialStats),
-      stabilityConfirmed,
-      confidence: hardwareIndexConfidence(searchStats, sequentialStats, sampleCount, stabilityConfirmed),
+      outputFiles,
+      mineIronPerHour: 3_600_000 / durationMs,
     };
   }
 
-  function loadLegacyHardwareIndex() {
-    try {
-      const raw = localStorage.getItem(LEGACY_HARDWARE_INDEX_STORAGE_KEY);
-      if (!raw) return null;
-      legacyHardwareIndexMigrationPending = true;
-      return normalizeHardwareIndex(JSON.parse(raw));
-    } catch {
-      return null;
+  function normalizeHardwareIndexMap(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+    const normalized = {};
+    for (const candidate of Object.values(value)) {
+      const result = normalizeHardwareIndex(candidate);
+      if (result) normalized[result.driverUrl] = newestHardwareIndex(normalized[result.driverUrl], result);
     }
+    return normalized;
   }
 
-  function adoptLegacyHardwareIndex(config) {
-    const legacyResult = loadLegacyHardwareIndex();
-    if (legacyResult) {
-      config.clientWorkIndex = newestHardwareIndex(config.clientWorkIndex, legacyResult);
-      legacyHardwareIndexMigrationPending = true;
+  function normalizeHardwareIndexRun(value) {
+    if (
+      !value ||
+      value.version !== HARDWARE_INDEX_VERSION ||
+      value.benchmarkId !== HARDWARE_INDEX_BENCHMARK_ID ||
+      value.scope !== HARDWARE_INDEX_SCOPE ||
+      value.algorithm !== HARDWARE_INDEX_ALGORITHM ||
+      !sameQualified(value.action, HARDWARE_INDEX_ACTION)
+    ) return null;
+    const driverUrl = normalizedDriverUrl(value.driverUrl);
+    const driverVersion = String(value.driverVersion || "").slice(0, 160);
+    const actionHash = String(value.actionHash || "").trim().slice(0, 512);
+    const runId = String(value.runId || "").trim().slice(0, 256);
+    const phase = new Set(["submitting", "outcome-unknown", "accepted"]).has(value.phase)
+      ? value.phase
+      : runId
+        ? "accepted"
+        : "";
+    const submissionId = String(value.submissionId || "").trim().slice(0, 256);
+    const requestedAt = String(value.requestedAt || value.acceptedAt || "");
+    const acceptedAt = String(value.acceptedAt || "");
+    const timestamp = new Date(requestedAt).valueOf();
+    const acceptedTimestamp = new Date(acceptedAt).valueOf();
+    if (
+      !driverUrl || !actionHash || !phase || (!runId && !submissionId) ||
+      (phase === "accepted" && (!runId || !Number.isFinite(acceptedTimestamp))) || !Number.isFinite(timestamp) ||
+      timestamp > Date.now() + 5 * 60_000 ||
+      timestamp < Date.now() - HARDWARE_INDEX_PENDING_MAX_AGE_MS
+    ) return null;
+    return {
+      version: HARDWARE_INDEX_VERSION,
+      benchmarkId: HARDWARE_INDEX_BENCHMARK_ID,
+      scope: HARDWARE_INDEX_SCOPE,
+      algorithm: HARDWARE_INDEX_ALGORITHM,
+      driverUrl,
+      driverVersion,
+      connectionId: String(value.connectionId || "").slice(0, 256),
+      connectionName: String(value.connectionName || "Driver").slice(0, 160),
+      action: { ...HARDWARE_INDEX_ACTION },
+      actionHash,
+      runId,
+      phase,
+      submissionId,
+      outcomeUnknown: phase === "outcome-unknown",
+      requestedAt,
+      acceptedAt,
+    };
+  }
+
+  function normalizeHardwareIndexRunMap(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+    const normalized = {};
+    for (const candidate of Object.values(value)) {
+      const run = normalizeHardwareIndexRun(candidate);
+      if (run) normalized[run.driverUrl] = run;
     }
+    return normalized;
+  }
+
+  function pruneHardwareIndexRunMap(runs, results) {
+    const pruned = normalizeHardwareIndexRunMap(runs);
+    const normalizedResults = normalizeHardwareIndexMap(results);
+    for (const [key, run] of Object.entries(pruned)) {
+      const result = normalizedResults[key];
+      if (result && new Date(result.measuredAt).valueOf() >= new Date(run.requestedAt).valueOf()) delete pruned[key];
+    }
+    return pruned;
   }
 
   function hardwareIndexTimestamp(result) {
@@ -374,25 +373,40 @@
     }, null);
   }
 
-  function loadStoredHardwareIndex() {
-    try {
-      const raw = localStorage.getItem(STORAGE_KEY);
-      if (!raw) return null;
-      return normalizeHardwareIndex(JSON.parse(raw)?.clientWorkIndex);
-    } catch {
-      return null;
+  function mergeHardwareIndexMaps(...maps) {
+    const merged = {};
+    for (const map of maps.map(normalizeHardwareIndexMap)) {
+      for (const [key, result] of Object.entries(map)) {
+        merged[key] = newestHardwareIndex(merged[key], result);
+      }
     }
+    return merged;
   }
 
-  function repairStoredHardwareIndex(configSource, result) {
+  function mergeHardwareIndexRunMaps(...maps) {
+    const merged = {};
+    const phaseRank = { submitting: 0, "outcome-unknown": 1, accepted: 2 };
+    for (const map of maps.map(normalizeHardwareIndexRunMap)) {
+      for (const [key, run] of Object.entries(map)) {
+        const previous = merged[key];
+        const timeDifference = new Date(run.requestedAt).valueOf() - new Date(previous?.requestedAt || 0).valueOf();
+        if (
+          !previous ||
+          timeDifference > 0 ||
+          (timeDifference === 0 && (phaseRank[run.phase] || 0) > (phaseRank[previous.phase] || 0))
+        ) merged[key] = run;
+      }
+    }
+    return merged;
+  }
+
+  function loadStoredHardwareIndexes() {
     try {
-      const source = configSource && typeof configSource === "object" && !Array.isArray(configSource)
-        ? configSource
-        : state.config;
-      localStorage.setItem(STORAGE_KEY, JSON.stringify({ ...source, clientWorkIndex: result }));
-      return true;
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (!raw) return {};
+      return normalizeHardwareIndexMap(JSON.parse(raw)?.clientWorkIndexes);
     } catch {
-      return false;
+      return {};
     }
   }
 
@@ -402,29 +416,36 @@
       : state.config;
     try {
       const raw = localStorage.getItem(STORAGE_KEY);
-      if (!raw) return { config: fallback, result: null };
+      if (!raw) return { config: fallback, results: {}, runs: {} };
       const parsed = JSON.parse(raw);
       const validConfig = parsed && typeof parsed === "object" && !Array.isArray(parsed);
       const config = validConfig ? parsed : fallback;
-      return { config, result: validConfig ? normalizeHardwareIndex(parsed.clientWorkIndex) : null };
+      return {
+        config,
+        results: validConfig ? normalizeHardwareIndexMap(parsed.clientWorkIndexes) : {},
+        runs: validConfig ? normalizeHardwareIndexRunMap(parsed.clientWorkIndexRuns) : {},
+      };
     } catch {
-      return { config: fallback, result: null };
+      return { config: fallback, results: {}, runs: {} };
     }
   }
 
-  function synchronizeHardwareIndexFromStorage(candidateResult, fallbackConfig) {
-    const currentResult = normalizeHardwareIndex(state.hardwareIndex.result);
+  function synchronizeHardwareIndexFromStorage(candidateConfig, fallbackConfig) {
+    const currentResult = currentHardwareIndex();
     const snapshot = loadStoredConfigSnapshot(fallbackConfig);
-    const result = newestHardwareIndex(currentResult, candidateResult, snapshot.result);
-    if (!result) return false;
-
+    const candidateResults = normalizeHardwareIndexMap(candidateConfig?.clientWorkIndexes);
+    const candidateRuns = normalizeHardwareIndexRunMap(candidateConfig?.clientWorkIndexRuns);
+    state.config.clientWorkIndexes = mergeHardwareIndexMaps(state.config.clientWorkIndexes, candidateResults, snapshot.results);
+    state.config.clientWorkIndexRuns = pruneHardwareIndexRunMap(
+      mergeHardwareIndexRunMaps(state.config.clientWorkIndexRuns, candidateRuns, snapshot.runs),
+      state.config.clientWorkIndexes,
+    );
+    const result = hardwareIndexForConnection(state.config, activeConnection());
     const resultChanged = !sameHardwareIndex(result, currentResult);
     const wasPersistent = state.hardwareIndex.persistent;
-    const alreadyStored = sameHardwareIndex(snapshot.result, result);
-    const persistent = alreadyStored || repairStoredHardwareIndex(snapshot.config, result);
+    const persistent = Boolean(result && sameHardwareIndex(snapshot.results[result.driverUrl], result));
     const homePromptVisible = resultChanged && Boolean(document.querySelector('[data-hardware-index-view="home"]'));
 
-    state.config.clientWorkIndex = result;
     state.hardwareIndex.result = result;
     state.hardwareIndex.persistent = persistent;
     if (resultChanged && state.hardwareIndex.status !== "running") {
@@ -433,19 +454,41 @@
     }
     patchCurrentConfigPreview();
     if (homePromptVisible) {
-      toast("Client work index updated", `${HARDWARE_INDEX_LABEL} ${result.score.toLocaleString()} / ${persistent ? "saved locally" : "this tab only"}`, "success");
+      toast("Client work index updated", `${formatProofDuration(result.durationMs)} MineIron lifecycle / ${persistent ? "saved locally" : "this tab only"}`, "success");
     }
     if (resultChanged || persistent !== wasPersistent) patchHardwareIndex();
     return persistent;
   }
 
   function persistHardwareIndex(result) {
-    state.config.clientWorkIndex = result;
+    clearedHardwareIndexRunUrls.add(result.driverUrl);
+    state.config.clientWorkIndexes[result.driverUrl] = result;
+    delete state.config.clientWorkIndexRuns[result.driverUrl];
+    state.hardwareIndex.result = result;
     return persistConfig(false, false);
   }
 
+  function persistHardwareIndexRun(run) {
+    clearedHardwareIndexRunUrls.delete(run.driverUrl);
+    state.config.clientWorkIndexRuns[run.driverUrl] = run;
+    return persistConfig(false, false);
+  }
+
+  function clearHardwareIndexRun(driverUrl) {
+    const key = normalizedDriverUrl(driverUrl);
+    clearedHardwareIndexRunUrls.add(key);
+    delete state.config.clientWorkIndexRuns[key];
+    persistConfig(false, false);
+  }
+
+  function hardwareIndexForConnection(config, connection) {
+    const key = hardwareIndexConnectionKey(connection);
+    return key ? normalizeHardwareIndex(config?.clientWorkIndexes?.[key]) : null;
+  }
+
   const initialConfig = loadConfig();
-  const savedHardwareIndex = initialConfig.clientWorkIndex;
+  const initialConnection = initialConfig.connections.find((item) => item.id === initialConfig.activeConnectionId) || initialConfig.connections[0];
+  const savedHardwareIndex = hardwareIndexForConnection(initialConfig, initialConnection);
 
   const state = {
     config: initialConfig,
@@ -467,12 +510,12 @@
       status: savedHardwareIndex ? "ready" : "idle",
       result: savedHardwareIndex,
       error: "",
-      worker: null,
       runToken: 0,
       persistent: Boolean(savedHardwareIndex),
       restoreFocus: false,
       progress: null,
-      cancelRun: null,
+      activeRun: null,
+      progressTimer: null,
     },
     drawer: null,
     editingConnectionId: null,
@@ -524,27 +567,36 @@
   };
 
   function currentHardwareIndex() {
-    const current = normalizeHardwareIndex(state.hardwareIndex.result);
-    if (current) return current;
-    if (!state.hardwareIndex.result) return null;
-    const stored = loadStoredHardwareIndex();
-    if (stored) {
-      state.hardwareIndex.result = stored;
-      state.config.clientWorkIndex = stored;
-      state.hardwareIndex.persistent = true;
-      return stored;
+    const connection = activeConnection();
+    if (!connection) return null;
+    const stored = loadStoredHardwareIndexes();
+    state.config.clientWorkIndexes = mergeHardwareIndexMaps(state.config.clientWorkIndexes, stored);
+    const current = hardwareIndexForConnection(state.config, connection);
+    const action = state.workspace.actions.find((item) => sameQualified(item.action, HARDWARE_INDEX_ACTION));
+    const catalogIsAuthoritative = Boolean(
+      state.workspace.connectionId === connection.id &&
+      !state.workspace.loading &&
+      !state.workspace.errors.actions &&
+      Array.isArray(state.workspace.actions)
+    );
+    const driverVersion = state.workspace.connectionId === connection.id
+      ? String(state.workspace.health?.version || "")
+      : "";
+    const contextMatches = Boolean(
+      current &&
+      current.driverUrl === hardwareIndexConnectionKey(connection) &&
+      (!catalogIsAuthoritative || (action?.hash && action.hash === current.actionHash)) &&
+      (!driverVersion || driverVersion === current.driverVersion)
+    );
+    if (contextMatches) {
+      state.hardwareIndex.result = current;
+      state.hardwareIndex.persistent = sameHardwareIndex(stored[current.driverUrl], current);
+      return current;
     }
     state.hardwareIndex.result = null;
-    state.config.clientWorkIndex = null;
     state.hardwareIndex.persistent = false;
-    if (state.hardwareIndex.status !== "running") {
+    if (state.hardwareIndex.status === "ready") {
       state.hardwareIndex.status = "idle";
-      state.hardwareIndex.error = "";
-    }
-    try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(state.config));
-    } catch {
-      // Expired or invalid CWI data is still ignored for this tab.
     }
     return null;
   }
@@ -722,27 +774,25 @@
     const previousResult = state.hardwareIndex?.result || null;
     const previousPersistent = Boolean(state.hardwareIndex?.persistent);
     state.config = normalizeConfig(state.config);
-    const storedResult = loadStoredHardwareIndex();
-    const mergedResult = newestHardwareIndex(
-      state.config.clientWorkIndex,
-      state.hardwareIndex?.result,
-      storedResult,
+    const storedSnapshot = loadStoredConfigSnapshot(state.config);
+    state.config.clientWorkIndexes = mergeHardwareIndexMaps(
+      state.config.clientWorkIndexes,
+      storedSnapshot.results,
     );
-    state.config.clientWorkIndex = mergedResult;
-    if (state.hardwareIndex && !mergedResult && previousResult && !normalizeHardwareIndex(previousResult)) {
-      state.hardwareIndex.result = null;
-      state.hardwareIndex.persistent = false;
-      if (state.hardwareIndex.status !== "running") {
-        state.hardwareIndex.status = "idle";
-        state.hardwareIndex.error = "";
-      }
-    }
-    if (state.hardwareIndex && compareHardwareIndexes(mergedResult, previousResult) > 0) {
-      state.hardwareIndex.result = mergedResult;
-      if (state.hardwareIndex.status !== "running") {
-        state.hardwareIndex.status = "ready";
-        state.hardwareIndex.error = "";
-      }
+    state.config.clientWorkIndexRuns = mergeHardwareIndexRunMaps(
+      state.config.clientWorkIndexRuns,
+      storedSnapshot.runs,
+    );
+    for (const key of clearedHardwareIndexRunUrls) delete state.config.clientWorkIndexRuns[key];
+    state.config.clientWorkIndexRuns = pruneHardwareIndexRunMap(
+      state.config.clientWorkIndexRuns,
+      state.config.clientWorkIndexes,
+    );
+    const mergedResult = hardwareIndexForConnection(state.config, activeConnection());
+    state.hardwareIndex.result = mergedResult;
+    if (state.hardwareIndex.status !== "running") {
+      state.hardwareIndex.status = mergedResult ? "ready" : "idle";
+      if (mergedResult) state.hardwareIndex.error = "";
     }
     applyTheme(state.config.ui.theme);
     updateMusicUi();
@@ -755,10 +805,10 @@
       toast("Config was not saved", error.message, "error");
     }
     if (saved) {
-      if (state.hardwareIndex?.result && mergedResult) state.hardwareIndex.persistent = true;
+      state.hardwareIndex.persistent = Boolean(mergedResult);
+      clearedHardwareIndexRunUrls.clear();
       try {
         localStorage.removeItem(LEGACY_HARDWARE_INDEX_STORAGE_KEY);
-        legacyHardwareIndexMigrationPending = false;
       } catch {
         // A leftover legacy record is harmless because the config field takes precedence.
       }
@@ -773,7 +823,8 @@
 
   function configText() {
     const portableConfig = { ...state.config };
-    delete portableConfig.clientWorkIndex;
+    delete portableConfig.clientWorkIndexes;
+    delete portableConfig.clientWorkIndexRuns;
     return `${JSON.stringify(portableConfig, null, 2)}\n`;
   }
 
@@ -1017,9 +1068,11 @@
   }
 
   async function applyImportedConfig(text, handle = null) {
-    const localClientWorkIndex = state.config.clientWorkIndex;
+    const localClientWorkIndexes = state.config.clientWorkIndexes;
+    const localClientWorkIndexRuns = state.config.clientWorkIndexRuns;
     const parsed = normalizeConfig(JSON.parse(text));
-    parsed.clientWorkIndex = localClientWorkIndex;
+    parsed.clientWorkIndexes = localClientWorkIndexes;
+    parsed.clientWorkIndexRuns = localClientWorkIndexRuns;
     state.config = parsed;
     applyTheme(parsed.ui.theme);
     if (handle) await rememberConfigHandle(handle);
@@ -1283,6 +1336,7 @@
     }
     updateHeader();
     render();
+    void resumePendingHardwareIndexForConnection(connection);
   }
 
   function resetWorkspace() {
@@ -1642,7 +1696,7 @@
             ${menuTile("connections", "NET", "Connections", "Choose, add, edit, remove, or configure Driver connections.", { className: "menu-tile-network", meta: `${state.config.connections.length} saved` })}
             ${menuTile("config", "CFG", "Menu Config", "Open, save, reset, or link portable console settings.", { className: "menu-tile-settings", meta: state.linkedConfigName ? "Linked" : "Browser" })}
           </nav>
-          ${!currentHardwareIndex() || state.hardwareIndex.status === "running" ? homeHardwareIndexRegionMarkup() : ""}
+          ${!currentHardwareIndex() || state.hardwareIndex.status === "running" || hardwareIndexPendingForConnection() ? homeHardwareIndexRegionMarkup() : ""}
         </div>
         ${!online && status.error ? `<div class="terminal-note error">${escapeHtml(status.error)}</div>` : ""}
       </section>`;
@@ -3213,9 +3267,10 @@
     };
   }
 
-  // Stable timing surface for the action drawer and the goal planner. Durations are
-  // synthetic browser-equivalent work derived directly from normalized CWI component
-  // rates; they are not selected-Driver or end-to-end wall-clock estimates.
+  // CWI-3 deliberately uses one transparent baseline: the observed selected-Driver
+  // lifecycle of a committed craft-rocket::MineIron run. MineIron itself is an
+  // observation; every other action is only a one-action average, never a fabricated
+  // PoW or VDF component rate.
   function estimateActionProofTiming(
     action,
     cwiResult = currentHardwareIndex(),
@@ -3223,47 +3278,31 @@
   ) {
     const cwi = normalizeHardwareIndex(cwiResult);
     const hasCwi = Boolean(cwi);
-    const powHasKnownWork = workload.pow.expectedAttempts > 0n;
-    const vdfHasKnownWork = workload.vdf.totalIterations > 0n;
-    const hasKnownWork = powHasKnownWork || vdfHasKnownWork;
-    const millisecondsFor = (units, rate) => {
-      if (!hasCwi || units <= 0n) return units === 0n ? 0 : null;
-      const milliseconds = (Number(units) / rate) * 1000;
-      return Number.isNaN(milliseconds) || milliseconds < 0 ? null : milliseconds;
-    };
-    const powMilliseconds = powHasKnownWork
-      ? millisecondsFor(workload.pow.expectedAttempts, cwi?.searchRate)
-      : workload.pow.complete && workload.pow.callCount === 0
-        ? 0
-        : null;
-    const vdfMilliseconds = vdfHasKnownWork
-      ? millisecondsFor(workload.vdf.totalIterations, cwi?.sequentialRate)
-      : workload.vdf.complete && workload.vdf.callCount === 0
-        ? 0
-        : null;
-    const complete = workload.complete;
-    const partial = !complete && hasKnownWork;
-    let totalMilliseconds = null;
-    if (complete && !hasKnownWork) {
-      totalMilliseconds = 0;
-    } else if (hasCwi && hasKnownWork) {
-      totalMilliseconds = (powMilliseconds || 0) + (vdfMilliseconds || 0);
-    }
+    const benchmarkAction = Boolean(
+      cwi &&
+      sameQualified(action?.action, HARDWARE_INDEX_ACTION) &&
+      String(action?.hash || "") === cwi.actionHash
+    );
+    const directWorkKnown = (workload.pow.knownCount || 0) + (workload.vdf.knownCount || 0) > 0;
+    const totalMilliseconds = hasCwi ? cwi.durationMs : null;
     return {
       workload,
       cwi,
       hasCwi,
-      hasKnownWork,
-      requiresCwi: hasKnownWork && !hasCwi,
-      complete,
-      partial,
-      lowerBound: partial && totalMilliseconds != null,
-      coverage: complete ? workload.coverage : partial ? "partial" : "unknown",
+      hasKnownWork: true,
+      directWorkKnown,
+      requiresCwi: !hasCwi,
+      complete: hasCwi,
+      partial: false,
+      lowerBound: false,
+      coverage: hasCwi ? (benchmarkAction ? "observed" : "average") : "unknown",
+      estimateKind: hasCwi ? (benchmarkAction ? "observed" : "average") : "unavailable",
+      benchmarkAction,
       totalMilliseconds,
-      powMilliseconds,
-      vdfMilliseconds,
-      powLowerBound: !workload.pow.complete && powMilliseconds != null,
-      vdfLowerBound: !workload.vdf.complete && vdfMilliseconds != null,
+      powMilliseconds: null,
+      vdfMilliseconds: null,
+      powLowerBound: false,
+      vdfLowerBound: false,
     };
   }
 
@@ -3305,224 +3344,69 @@
     return `${value} ${value === "1" ? "year" : "years"}`;
   }
 
-  function hardwareIndexWorkerMain() {
-    const SEARCH_BATCH = 16_384;
-    const SEQUENTIAL_BATCH = 256;
-    const MODULUS = (1n << 127n) - 1n;
-    const SEQUENTIAL_ADDEND = 0x9e3779b97f4a7c15n;
+  function mineIronBenchmarkAction() {
+    return state.workspace.actions.find((item) => sameQualified(item.action, HARDWARE_INDEX_ACTION)) || null;
+  }
 
-    function measureSearch(durationMs) {
-      let checksum = 0x6d2b79f5 | 0;
-      let nonce = 0;
-      let operations = 0;
-      const startedAt = performance.now();
-      do {
-        for (let index = 0; index < SEARCH_BATCH; index += 1) {
-          let value = (nonce + index + 0x9e3779b9) | 0;
-          value = Math.imul(value ^ (value >>> 16), 0x21f0aaad);
-          value = Math.imul(value ^ (value >>> 15), 0x735a2d97);
-          value ^= value >>> 15;
-          checksum = (checksum ^ value) | 0;
-        }
-        nonce = (nonce + SEARCH_BATCH) | 0;
-        operations += SEARCH_BATCH;
-      } while (performance.now() - startedAt < durationMs);
-      const elapsedMs = performance.now() - startedAt;
-      return { rate: operations / (elapsedMs / 1000), checksum, elapsedMs };
+  function mineIronBenchmarkPreflight(action) {
+    if (!action?.hash) return "Install the craft-rocket cartridge with MineIron on this Driver before running CWI.";
+    const inputs = Array.isArray(action.totalInputs) ? action.totalInputs : [];
+    const outputs = Array.isArray(action.totalOutputs) ? action.totalOutputs : [];
+    if (inputs.length !== 0) return "This MineIron build is not benchmark-safe: it declares input objects.";
+    if (outputs.length !== 1 || !sameQualified(outputs[0]?.class, { pluginName: "craft-rocket", name: "Iron" })) {
+      return "This MineIron build is not benchmark-safe: it must declare exactly one craft-rocket::Iron output.";
     }
+    return "";
+  }
 
-    function measureSequential(durationMs) {
-      let value = 0x123456789abcdef123456789abcdefn;
-      let operations = 0;
-      const startedAt = performance.now();
-      do {
-        for (let index = 0; index < SEQUENTIAL_BATCH; index += 1) {
-          value = (value * value + SEQUENTIAL_ADDEND) % MODULUS;
-        }
-        operations += SEQUENTIAL_BATCH;
-      } while (performance.now() - startedAt < durationMs);
-      const elapsedMs = performance.now() - startedAt;
-      return { rate: operations / (elapsedMs / 1000), checksum: value.toString(16).slice(-16), elapsedMs };
+  function hardwareIndexPendingForConnection(connection = activeConnection()) {
+    const key = hardwareIndexConnectionKey(connection);
+    return key ? normalizeHardwareIndexRun(state.config.clientWorkIndexRuns?.[key]) : null;
+  }
+
+  function hardwareIndexPendingHasRun(pending) {
+    return Boolean(pending?.phase === "accepted" && pending.runId);
+  }
+
+  function hardwareIndexPendingLockCopy(pending) {
+    if (hardwareIndexPendingHasRun(pending)) {
+      return `Run ${shortText(pending.runId)} was already accepted. Resume tracking it; do not start another benchmark.`;
     }
-
-    function median(values) {
-      const sorted = [...values].sort((left, right) => left - right);
-      const middle = Math.floor(sorted.length / 2);
-      return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
-    }
-
-    function quantile(values, amount) {
-      const sorted = [...values].sort((left, right) => left - right);
-      const position = (sorted.length - 1) * amount;
-      const lower = Math.floor(position);
-      const fraction = position - lower;
-      return sorted[lower + 1] == null
-        ? sorted[lower]
-        : sorted[lower] + (sorted[lower + 1] - sorted[lower]) * fraction;
-    }
-
-    function laneQuality(samples) {
-      const center = median(samples);
-      const thirdLength = Math.max(2, Math.ceil(samples.length / 3));
-      const early = median(samples.slice(0, thirdLength));
-      const late = median(samples.slice(-thirdLength));
-      return {
-        spreadPercent: center > 0 ? ((quantile(samples, 0.9) - quantile(samples, 0.1)) / center) * 100 : Infinity,
-        driftPercent: early > 0 ? (Math.abs(late - early) / early) * 100 : Infinity,
-      };
-    }
-
-    self.addEventListener("message", (event) => {
-      try {
-        const warmupDurationMs = Number(event.data?.warmupDurationMs);
-        const sampleDurationMs = Number(event.data?.sampleDurationMs);
-        const minSamples = Number(event.data?.minSamples);
-        const maxSamples = Number(event.data?.maxSamples);
-        const maximumDurationMs = (2 * warmupDurationMs) + (2 * maxSamples * sampleDurationMs);
-        if (
-          !Number.isFinite(warmupDurationMs) || warmupDurationMs < 1000 ||
-          !Number.isFinite(sampleDurationMs) || sampleDurationMs < 1000 ||
-          !Number.isInteger(minSamples) || !Number.isInteger(maxSamples) ||
-          minSamples < 3 || maxSamples < minSamples
-        ) throw new Error("The benchmark profile is invalid.");
-
-        let durationMs = 0;
-        const searchSamples = [];
-        const sequentialSamples = [];
-        const checksums = [];
-        const progress = (phase, stabilityConfirmed = false) => self.postMessage({
-          type: "progress",
-          phase,
-          elapsedMs: durationMs,
-          completedSamples: searchSamples.length + sequentialSamples.length,
-          sampleCount: Math.min(searchSamples.length, sequentialSamples.length),
-          maximumDurationMs,
-          stabilityConfirmed,
-        });
-        progress("Warming search lane");
-        const searchWarmup = measureSearch(warmupDurationMs);
-        durationMs += searchWarmup.elapsedMs;
-        checksums.push(searchWarmup.checksum);
-        progress("Warming sequential lane");
-        const sequentialWarmup = measureSequential(warmupDurationMs);
-        durationMs += sequentialWarmup.elapsedMs;
-        checksums.push(sequentialWarmup.checksum);
-
-        let stablePasses = 0;
-        for (let round = 0; round < maxSamples; round += 1) {
-          const lanes = round % 2 === 0 ? ["search", "sequential"] : ["sequential", "search"];
-          for (const lane of lanes) {
-            progress(`Sampling ${lane} lane / round ${round + 1}`);
-            const sample = lane === "search" ? measureSearch(sampleDurationMs) : measureSequential(sampleDurationMs);
-            durationMs += sample.elapsedMs;
-            checksums.push(sample.checksum);
-            (lane === "search" ? searchSamples : sequentialSamples).push(sample.rate);
-          }
-          if (searchSamples.length >= minSamples) {
-            const searchQuality = laneQuality(searchSamples);
-            const sequentialQuality = laneQuality(sequentialSamples);
-            const qualifies = Math.max(searchQuality.spreadPercent, sequentialQuality.spreadPercent) <= 6 &&
-              Math.max(searchQuality.driftPercent, sequentialQuality.driftPercent) <= 5;
-            stablePasses = qualifies ? stablePasses + 1 : 0;
-            progress(
-              qualifies ? `Stability confirmed ${stablePasses} of 2` : "Variation detected / extending test",
-              stablePasses >= 2,
-            );
-            if (stablePasses >= 2) break;
-          }
-        }
-        self.postMessage({
-          type: "result",
-          searchSamples,
-          sequentialSamples,
-          durationMs,
-          checksum: checksums.join(":"),
-        });
-      } catch (error) {
-        self.postMessage({ type: "error", error: error?.message || "The benchmark worker failed." });
-      }
-    }, { once: true });
+    return "A MineIron submission may already have reached this Driver, but no trustworthy run id was returned. The benchmark is locked to prevent a duplicate Iron; inspect Driver Activity before clearing local console data.";
   }
 
-  function hardwareIndexReferenceFactor(searchRate, sequentialRate) {
-    const searchRatio = searchRate / HARDWARE_INDEX_SEARCH_REFERENCE;
-    const sequentialRatio = sequentialRate / HARDWARE_INDEX_SEQUENTIAL_REFERENCE;
-    if (searchRatio <= 0 || sequentialRatio <= 0) return NaN;
-    return 2 / ((1 / searchRatio) + (1 / sequentialRatio));
-  }
-
-  function hardwareIndexScore(searchRate, sequentialRate) {
-    return Math.max(1, Math.round(100 * hardwareIndexReferenceFactor(searchRate, sequentialRate)));
-  }
-
-  function hardwareIndexStability(searchStats, sequentialStats) {
-    const spread = Math.max(searchStats.spreadPercent, sequentialStats.spreadPercent);
-    const drift = Math.max(searchStats.driftPercent, sequentialStats.driftPercent);
-    return spread <= 6 && drift <= 5 ? "stable" : spread <= 12 && drift <= 10 ? "fair" : "noisy";
-  }
-
-  function hardwareIndexConfidence(searchStats, sequentialStats, sampleCount, stabilityConfirmed) {
-    const stability = hardwareIndexStability(searchStats, sequentialStats);
-    if (stability === "stable" && sampleCount >= 6 && stabilityConfirmed) return "high";
-    if (stability !== "noisy") return "medium";
-    return "low";
-  }
-
-  function formatHardwareRate(value) {
-    if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(value >= 10_000_000 ? 1 : 2)}M/s`;
-    if (value >= 1_000) return `${(value / 1_000).toFixed(value >= 10_000 ? 1 : 2)}K/s`;
-    return `${Math.round(value).toLocaleString()}/s`;
-  }
-
-  function formatHardwarePercent(value) {
-    if (!Number.isFinite(value)) return "unknown";
-    return `${value < 10 ? value.toFixed(1) : Math.round(value)}%`;
-  }
-
-  function formatHardwareFactor(value) {
-    if (!Number.isFinite(value)) return "unknown";
-    return `${value < 10 ? value.toFixed(2) : value.toFixed(1)}×`;
+  function formatMineIronRate(result) {
+    const value = Number(result?.mineIronPerHour);
+    if (!Number.isFinite(value) || value <= 0) return "Unknown";
+    return `${value < 10 ? value.toFixed(2) : value < 100 ? value.toFixed(1) : Math.round(value).toLocaleString()} / hr`;
   }
 
   function hardwareIndexProgressDetail(progress = state.hardwareIndex.progress) {
-    const rounds = Math.max(0, Number(progress?.sampleCount) || 0);
-    if (!rounds) return `Two 5 sec warmups, then paired 10 sec rounds / earliest finish about ${formatProofDuration(HARDWARE_INDEX_MIN_DURATION_MS)}.`;
-    if (rounds < HARDWARE_INDEX_MIN_SAMPLES) {
-      return `${rounds} of ${HARDWARE_INDEX_MIN_SAMPLES} minimum rounds complete / extends until stable.`;
-    }
-    const ceiling = formatProofDuration(Math.max(0, HARDWARE_INDEX_MAX_DURATION_MS - (Number(progress?.elapsedMs) || 0)));
-    return `${rounds} rounds complete / checking spread and sustained-rate drift / up to ${ceiling} remaining.`;
-  }
-
-  function hardwareIndexProgressTargetMs(progress = state.hardwareIndex.progress) {
-    const elapsedMs = Math.max(0, Number(progress?.elapsedMs) || 0);
-    if (progress?.stabilityConfirmed) return Math.max(1, elapsedMs);
-    if (elapsedMs < HARDWARE_INDEX_MIN_DURATION_MS) return HARDWARE_INDEX_MIN_DURATION_MS;
-    return Math.min(HARDWARE_INDEX_MAX_DURATION_MS, elapsedMs + (2 * HARDWARE_INDEX_SAMPLE_MS));
+    const message = String(progress?.message || "Waiting for retained Driver state.");
+    return `${message} This benchmark creates and commits one real craft-rocket::Iron; closing this page does not cancel it.`;
   }
 
   function hardwareIndexProgressMarkup(extraClass = "") {
     const progress = state.hardwareIndex.progress || {};
-    const elapsedMs = Math.max(0, Math.min(HARDWARE_INDEX_MAX_DURATION_MS, Number(progress.elapsedMs) || 0));
-    const targetMs = hardwareIndexProgressTargetMs(progress);
-    const phase = String(progress.phase || "Starting benchmark worker");
+    const elapsedMs = Math.max(0, Number(progress.elapsedMs) || 0);
+    const phase = String(progress.phase || "Starting MineIron action");
     return `
       <div class="cwi-progress${extraClass ? ` ${extraClass}` : ""}">
         <div class="cwi-progress-copy"><span data-cwi-progress-phase>${escapeHtml(phase)}</span><strong data-cwi-progress-time>${escapeHtml(formatProofDuration(elapsedMs))} elapsed</strong></div>
-        <progress data-cwi-progress-meter max="${targetMs}" value="${Math.min(elapsedMs, targetMs)}" aria-label="Client work index progress" aria-valuetext="${escapeHtml(`${phase}. ${formatProofDuration(elapsedMs)} elapsed.`)}"></progress>
+        <progress data-cwi-progress-meter aria-label="Client work index run in progress" aria-valuetext="${escapeHtml(`${phase}. ${formatProofDuration(elapsedMs)} elapsed.`)}"></progress>
         <small data-cwi-progress-detail>${escapeHtml(hardwareIndexProgressDetail(progress))}</small>
+        <span class="sr-only" data-cwi-progress-announcement aria-live="polite" aria-atomic="true">${escapeHtml(phase)}</span>
       </div>`;
   }
 
   function updateHardwareIndexProgressUi() {
     if (state.hardwareIndex.status !== "running") return;
     const progress = state.hardwareIndex.progress || {};
-    const elapsedMs = Math.max(0, Math.min(HARDWARE_INDEX_MAX_DURATION_MS, Number(progress.elapsedMs) || 0));
-    const targetMs = hardwareIndexProgressTargetMs(progress);
-    const phase = String(progress.phase || "Running sustained benchmark");
+    if (progress.acceptedAt) progress.elapsedMs = Math.max(0, Date.now() - new Date(progress.acceptedAt).valueOf());
+    const elapsedMs = Math.max(0, Number(progress.elapsedMs) || 0);
+    const phase = String(progress.phase || "Following MineIron action");
     document.querySelectorAll("[data-cwi-progress-meter]").forEach((meter) => {
-      meter.max = targetMs;
-      meter.value = Math.min(elapsedMs, targetMs);
+      meter.removeAttribute("value");
       meter.setAttribute("aria-valuetext", `${phase}. ${formatProofDuration(elapsedMs)} elapsed.`);
     });
     document.querySelectorAll("[data-cwi-progress-phase]").forEach((element) => { element.textContent = phase; });
@@ -3532,43 +3416,51 @@
     document.querySelectorAll("[data-cwi-progress-detail]").forEach((element) => {
       element.textContent = hardwareIndexProgressDetail(progress);
     });
+    document.querySelectorAll("[data-cwi-progress-announcement]").forEach((element) => {
+      if (element.textContent !== phase) element.textContent = phase;
+    });
   }
 
   function homeHardwareIndexContentMarkup() {
     const benchmark = state.hardwareIndex;
     const result = currentHardwareIndex();
+    const pending = hardwareIndexPendingForConnection();
     const running = benchmark.status === "running";
     const failed = benchmark.status === "error" && !result;
+    const activeRunName = benchmark.activeRun?.connectionName || activeConnection()?.name || "selected Driver";
     const title = running
-      ? result ? `Refreshing ${HARDWARE_INDEX_LABEL}` : "Measuring browser compute"
+      ? `MineIron running on ${activeRunName}`
       : result
-        ? benchmark.persistent ? `${HARDWARE_INDEX_LABEL} ${result.score.toLocaleString()} stored` : `${HARDWARE_INDEX_LABEL} ${result.score.toLocaleString()} ready`
-        : failed
-          ? "Client check unavailable"
-          : "Client index not set";
+        ? `${HARDWARE_INDEX_LABEL} / ${formatProofDuration(result.durationMs)}`
+        : pending
+          ? hardwareIndexPendingHasRun(pending) ? "MineIron run needs tracking" : "MineIron outcome needs review"
+          : failed
+            ? "Driver check needs attention"
+            : "Driver index not measured";
     const copy = running
-      ? "Paired search/chain rounds run off the UI thread for about 1–3 minutes. Keep this tab visible."
+      ? "Following one real MineIron action through proof generation, commit, and live completion. This action cannot be cancelled from the console."
       : result
-        ? benchmark.persistent
-          ? `Saved locally / ${formatHardwareFactor(result.referenceFactor)} the fixed reference / ${result.confidence} confidence.`
-          : "Browser storage was unavailable. This result is available for this tab only."
-        : failed
-          ? benchmark.error
-          : "Run a sustained local browser calibration for clearer proof-work estimates. No Driver request.";
+        ? `${formatMineIronRate(result)} MineIron-equivalent throughput / ${benchmark.persistent ? "saved locally" : "this tab only"}.`
+        : pending
+          ? hardwareIndexPendingLockCopy(pending)
+          : failed
+            ? benchmark.error
+            : "Run one real craft-rocket::MineIron lifecycle on the selected Driver. The resulting Iron is committed and kept.";
     let button;
     if (running) {
-      button = '<button class="game-button menu-focusable" type="button" data-command="cancel-hardware-index" data-hardware-index-focus aria-label="Cancel client work index test" aria-describedby="home-cwi-help">Cancel</button>';
+      button = '<button class="game-button menu-focusable" type="button" data-hardware-index-focus aria-disabled="true" aria-describedby="home-cwi-help">Run in progress</button>';
     } else if (result) {
       button = '<button class="game-button menu-focusable" type="button" data-command="config" data-hardware-index-focus aria-label="Open client work index details">View details</button>';
+    } else if (pending && !hardwareIndexPendingHasRun(pending)) {
+      button = '<button class="game-button menu-focusable" type="button" data-command="activity" data-hardware-index-focus aria-describedby="home-cwi-help">Review Activity</button>';
     } else {
-      const buttonText = failed ? "Retry" : "Run check";
-      const buttonLabel = failed ? "Retry client work index check" : "Run client work index check";
-      button = `<button class="game-button menu-focusable" type="button" data-command="run-hardware-index" data-hardware-index-focus aria-label="${buttonLabel}" aria-describedby="home-cwi-help">${buttonText}</button>`;
+      const buttonText = pending ? "Resume" : failed ? "Retry CWI" : "Run live test";
+      button = `<button class="game-button menu-focusable" type="button" data-command="run-hardware-index" data-hardware-index-focus aria-describedby="home-cwi-help">${buttonText}</button>`;
     }
     return `
       <span class="home-cwi-mark" aria-hidden="true">CWI</span>
       <div class="home-cwi-copy">
-        <span class="home-cwi-kicker">Local calibration</span>
+        <span class="home-cwi-kicker">Selected Driver calibration</span>
         <h2 id="home-cwi-title">${escapeHtml(title)}</h2>
         <p id="home-cwi-help">${escapeHtml(copy)}</p>
         ${running ? hardwareIndexProgressMarkup("home-cwi-track") : ""}
@@ -3587,52 +3479,68 @@
   function hardwareIndexContentMarkup() {
     const benchmark = state.hardwareIndex;
     const result = currentHardwareIndex();
+    const pending = hardwareIndexPendingForConnection();
     const running = benchmark.status === "running";
-    const buttonLabel = running ? "Cancel test" : result ? "Re-run CWI" : "Run CWI";
-    const buttonAriaLabel = running ? "Cancel client work index test" : result ? "Re-run client work index" : "Run client work index";
-    const buttonCommand = running ? "cancel-hardware-index" : "run-hardware-index";
+    const buttonLabel = running
+      ? "Run in progress"
+      : pending
+        ? hardwareIndexPendingHasRun(pending) ? "Resume tracking" : "Submission locked"
+        : result
+          ? "Run & commit again"
+          : "Run & commit MineIron";
+    const buttonMarkup = running
+      ? `<button class="game-button" type="button" data-hardware-index-focus aria-disabled="true">${buttonLabel}</button>`
+      : pending && !hardwareIndexPendingHasRun(pending)
+        ? '<button class="game-button" type="button" data-command="activity" data-hardware-index-focus>Review Activity</button>'
+      : `<button class="game-button" type="button" data-command="run-hardware-index" data-hardware-index-focus>${buttonLabel}</button>`;
     let readout;
     if (running) {
+      const activeRun = benchmark.activeRun;
       readout = `
-        <div class="hardware-index-score is-running"><span>Client work index / sustained synthetic</span><strong>${HARDWARE_INDEX_LABEL} TEST</strong><small>Adaptive 1–3 minute profile / ${result ? "last valid score remains active" : "no prior score yet"}</small></div>
+        <div class="hardware-index-score is-running"><span>Client work index / selected Driver lifecycle</span><strong>${HARDWARE_INDEX_LABEL} RUN</strong><small>${escapeHtml(activeRun?.connectionName || "Driver")} / run ${escapeHtml(shortText(activeRun?.runId))} / prior valid result remains available</small></div>
         ${hardwareIndexProgressMarkup("hardware-index-track")}`;
     } else if (result) {
-      const searchIndex = Math.max(1, Math.round(100 * (result.searchMedianRate / HARDWARE_INDEX_SEARCH_REFERENCE)));
-      const sequentialIndex = Math.max(1, Math.round(100 * (result.sequentialMedianRate / HARDWARE_INDEX_SEQUENTIAL_REFERENCE)));
-      const maximumSpread = Math.max(result.searchSpreadPercent, result.sequentialSpreadPercent);
-      const maximumDrift = Math.max(result.searchDriftPercent, result.sequentialDriftPercent);
       const resultNote = benchmark.status === "error"
-        ? `Last ${benchmark.persistent ? "saved" : "tab-only"} result retained / re-run failed: ${benchmark.error}`
-        : `${formatHardwareFactor(result.referenceFactor)} fixed reference / confidence ${result.confidence} / ${benchmark.persistent ? "saved locally" : "this tab only"} / tested ${formatDate(result.measuredAt)}`;
+        ? `Last saved result retained / tracking failed: ${benchmark.error}`
+        : `${benchmark.persistent ? "saved locally" : "this tab only"} / completed ${formatDate(result.measuredAt)}`;
       readout = `
-        <div class="hardware-index-score"><span>Client work index / sustained synthetic</span><strong>${HARDWARE_INDEX_LABEL} ${result.score.toLocaleString()}</strong><small class="hardware-index-result-note${benchmark.status === "error" ? " is-error" : ""}">${escapeHtml(resultNote)}</small></div>
+        <div class="hardware-index-score"><span>Client work index / observed MineIron lifecycle</span><strong>${escapeHtml(formatProofDuration(result.durationMs))}</strong><small class="hardware-index-result-note${benchmark.status === "error" ? " is-error" : ""}">${escapeHtml(resultNote)}</small></div>
         <dl class="hardware-index-metrics">
-          <div><dt>Search lane</dt><dd><strong>Index ${searchIndex.toLocaleString()}</strong><small>${escapeHtml(formatHardwareRate(result.searchRate))} conservative / ${escapeHtml(formatHardwareRate(result.searchMedianRate))} median</small></dd></div>
-          <div><dt>Sequential lane</dt><dd><strong>Index ${sequentialIndex.toLocaleString()}</strong><small>${escapeHtml(formatHardwareRate(result.sequentialRate))} conservative / ${escapeHtml(formatHardwareRate(result.sequentialMedianRate))} median / not a VDF</small></dd></div>
-          <div><dt>Measurement confidence</dt><dd><strong>${escapeHtml(result.confidence.toUpperCase())}</strong><small>${result.sampleCount} rounds/lane / ${escapeHtml(formatHardwarePercent(maximumSpread))} spread / ${escapeHtml(formatHardwarePercent(maximumDrift))} drift</small></dd></div>
-          <div><dt>Test profile</dt><dd><strong>${escapeHtml(formatProofDuration(result.durationMs))}</strong><small>${result.stabilityConfirmed ? "stable adaptive stop" : "three-minute ceiling"} / 1 browser worker / ${result.logicalProcessors} logical processor${result.logicalProcessors === 1 ? "" : "s"} reported</small></dd></div>
+          <div><dt>Transparent throughput</dt><dd><strong>${escapeHtml(formatMineIronRate(result))}</strong><small>derived from one completed lifecycle / not a percentile or synthetic score</small></dd></div>
+          <div><dt>Benchmark action</dt><dd><strong>craft-rocket::MineIron</strong><small>observed from request start through proof, chain commit, and verified live output</small></dd></div>
+          <div><dt>Driver binding</dt><dd><strong>${escapeHtml(result.driverVersion || "Version unavailable")}</strong><small>${escapeHtml(result.driverUrl)} / action ${escapeHtml(shortText(result.actionHash, 10, 7))}</small></dd></div>
+          <div><dt>Committed output</dt><dd><strong>${escapeHtml(result.outputFiles[0] ? shortText(result.outputFiles[0], 18, 10) : "Iron verified live")}</strong><small>run ${escapeHtml(shortText(result.runId))} / benchmark output is real and retained</small></dd></div>
         </dl>`;
     } else {
+      const emptyDetail = pending
+        ? hardwareIndexPendingHasRun(pending)
+          ? `Accepted run ${shortText(pending.runId)} is saved locally and must be followed to completion.`
+          : hardwareIndexPendingLockCopy(pending)
+        : benchmark.error || "No completed MineIron benchmark for this Driver and action build.";
       readout = `
         <div class="hardware-index-score${benchmark.status === "error" ? " is-error" : ""}">
-          <span>Client work index / sustained synthetic</span><strong>${HARDWARE_INDEX_LABEL} --</strong><small>${escapeHtml(benchmark.error || "Not tested on this browser")}</small>
+          <span>Client work index / selected Driver lifecycle</span><strong>${HARDWARE_INDEX_LABEL} --</strong><small>${escapeHtml(emptyDetail)}</small>
         </div>`;
     }
     return `
       <div class="hardware-index-heading">
         ${readout}
-        <button class="game-button" type="button" data-command="${buttonCommand}" data-hardware-index-focus aria-label="${buttonAriaLabel}">${buttonLabel}</button>
+        ${buttonMarkup}
       </div>
-      <p class="hardware-index-note"><strong>${HARDWARE_INDEX_LABEL} 100</strong> means reference speed for a fixed workload split evenly between 100M independent mixes/sec and 1M dependent BigInt steps/sec; 200 means roughly twice that reference throughput. The score is a balanced harmonic result, while time estimates use each lane's conservative lower-quarter/tail rate directly. This is sustained single-worker JavaScript capability—not a percentile, multicore score, DON proof kernel, selected Driver measurement, or end-to-end wall-clock promise.</p>`;
+      <p class="hardware-index-note"><strong>${HARDWARE_INDEX_LABEL}</strong> is the measured wall-clock lifecycle of one real <code>craft-rocket::MineIron</code> action on the selected Driver, from request start through proof generation, commit, and verified live output. Every completed test creates and keeps one on-chain Iron. Planner estimates use this duration as a transparent per-action average: MineIron is directly observed; every other action is not action-specific and may differ substantially.</p>`;
   }
 
   function hardwareIndexAnnouncement() {
     const benchmark = state.hardwareIndex;
     const result = currentHardwareIndex();
-    if (benchmark.status === "running") return "Client work index sustained test started. It can take up to three minutes. Keep this tab visible.";
-    if (benchmark.status === "error" && result) return `Client work index re-run failed. ${HARDWARE_INDEX_LABEL} ${result.score.toLocaleString()} retained. ${benchmark.error}`;
+    const pending = hardwareIndexPendingForConnection();
+    if (benchmark.status === "running") return `Client work index MineIron run is in progress. ${formatProofDuration(benchmark.progress?.elapsedMs || 0)} elapsed. It cannot be cancelled from this console.`;
+    if (benchmark.status === "error" && result) return `Client work index tracking failed. The last observed MineIron lifecycle of ${formatProofDuration(result.durationMs)} is retained. ${benchmark.error}`;
     if (benchmark.status === "error") return `Client work index failed. ${benchmark.error}`;
-    if (result) return `Client work index ready. ${HARDWARE_INDEX_LABEL} ${result.score.toLocaleString()}, ${formatHardwareFactor(result.referenceFactor)} the fixed reference, with ${result.confidence} confidence. ${benchmark.persistent ? "Saved locally." : "Available for this tab only."}`;
+    if (pending) return hardwareIndexPendingHasRun(pending)
+      ? `A previously accepted MineIron benchmark run is waiting to be tracked. Run id ${pending.runId}.`
+      : hardwareIndexPendingLockCopy(pending);
+    if (result) return `Client work index ready. One MineIron lifecycle took ${formatProofDuration(result.durationMs)} on the selected Driver. ${benchmark.persistent ? "Saved locally." : "Available for this tab only."}`;
     return "";
   }
 
@@ -3641,7 +3549,11 @@
     const focusedElement = document.activeElement;
     const focusedInIndex = focusedElement?.closest?.("[data-hardware-index]");
     const focusedControlWillBeReplaced = Boolean(focusedInIndex && focusedElement !== focusedInIndex);
-    const focusRunningStatus = state.hardwareIndex.restoreFocus && state.hardwareIndex.status === "running" && focusedInIndex;
+    const focusRunningStatus = Boolean(
+      state.hardwareIndex.restoreFocus &&
+      state.hardwareIndex.status === "running" &&
+      focusedInIndex
+    );
     const restoreFocus = focusReturnPending && (
       !focusedElement ||
       focusedElement === document.body ||
@@ -3652,11 +3564,7 @@
     let removedFocusedHome = false;
     document.querySelectorAll("[data-hardware-index]").forEach((region) => {
       const view = region.dataset.hardwareIndexView;
-      if (
-        view === "home" &&
-        currentHardwareIndex() &&
-        state.hardwareIndex.status !== "running"
-      ) {
+      if (view === "home" && currentHardwareIndex() && state.hardwareIndex.status !== "running") {
         removedFocusedHome ||= focusedInIndex === region;
         region.remove();
         return;
@@ -3680,13 +3588,10 @@
     });
     if (focusRunningStatus) {
       requestAnimationFrame(() => {
-        const button = focusedInIndex.querySelector("[data-hardware-index-focus]");
-        if (button && !button.disabled) button.focus({ preventScroll: true });
+        focusedInIndex.querySelector("[data-hardware-index-focus]")?.focus({ preventScroll: true });
       });
     }
-    if (focusReturnPending) {
-      state.hardwareIndex.restoreFocus = false;
-    }
+    if (focusReturnPending) state.hardwareIndex.restoreFocus = false;
     const restorePatchedControl = focusedControlWillBeReplaced && !removedFocusedHome && state.hardwareIndex.status !== "running";
     if (restoreFocus || removedFocusedHome || restorePatchedControl) {
       requestAnimationFrame(() => {
@@ -3704,178 +3609,288 @@
     if (state.screen === "planner") patchPlanner({ replan: false });
   }
 
-  async function runHardwareIndex() {
-    if (state.hardwareIndex.status === "running") {
-      cancelHardwareIndex();
-      return;
-    }
-    if (document.activeElement?.closest?.('[data-command="run-hardware-index"]')) {
-      state.hardwareIndex.restoreFocus = true;
-    }
-    if (document.hidden) {
-      state.hardwareIndex.status = "error";
-      state.hardwareIndex.error = "Keep this tab visible before starting the sustained test.";
-      patchHardwareIndex();
-      if (!document.querySelector("[data-hardware-index]")) toast("Client work index paused", state.hardwareIndex.error, "error");
-      return;
-    }
-    if (typeof Worker !== "function" || typeof Blob !== "function" || typeof globalThis.URL?.createObjectURL !== "function") {
-      state.hardwareIndex.status = "error";
-      state.hardwareIndex.error = "This browser cannot start the benchmark worker.";
-      patchHardwareIndex();
-      if (!document.querySelector("[data-hardware-index]")) toast("Client work index unavailable", state.hardwareIndex.error, "error");
-      return;
-    }
+  function hardwareIndexRunPhase(snapshot) {
+    const status = String(snapshot?.status || "queued").toLowerCase();
+    if (status === "generateproof" || status === "running") return "Generating MineIron proof";
+    if (status === "committing") return "Committing benchmark Iron";
+    if (status === "succeeded") return "Verifying live Iron output";
+    if (status === "failed") return "MineIron action failed";
+    return "Queued by selected Driver";
+  }
 
+  function hardwareIndexRunMatchesCurrentWorkspace(run) {
+    const connection = activeConnection();
+    return Boolean(
+      connection &&
+      state.workspace.connectionId === connection.id &&
+      connection.id === run.connectionId &&
+      hardwareIndexConnectionKey(connection) === run.driverUrl
+    );
+  }
+
+  function validateHardwareIndexRunSnapshot(snapshot, run) {
+    if (!snapshot || typeof snapshot !== "object") throw new Error("The Driver returned an invalid benchmark run snapshot.");
+    if (String(snapshot.runId || "") !== run.runId) {
+      throw new Error(`The Driver returned run ${shortText(snapshot.runId)} while tracking ${shortText(run.runId)}; the benchmark remains locked.`);
+    }
+    if (!sameQualified(snapshot.action, HARDWARE_INDEX_ACTION)) {
+      throw new Error(`Run ${shortText(run.runId)} does not identify craft-rocket::MineIron; the benchmark remains locked.`);
+    }
+    return snapshot;
+  }
+
+  async function verifyHardwareIndexOutput(snapshot, connection) {
+    const outputFiles = Array.isArray(snapshot?.result?.outputFiles) ? snapshot.result.outputFiles.map(String) : [];
+    if (outputFiles.length !== 1) throw new Error("The completed benchmark did not report exactly one output object.");
+    let lastError = null;
+    for (const outputPath of outputFiles) {
+      const fileName = outputPath.split(/[\\/]/).pop();
+      if (!fileName) continue;
+      try {
+        const object = await driverRequest(connection, `/objects/${encodeURIComponent(fileName)}`, { timeout: 12000 });
+        if (sameQualified(object?.class, { pluginName: "craft-rocket", name: "Iron" }) && String(object?.status || "").toLowerCase() === "live") {
+          return { outputFiles, object };
+        }
+        lastError = new Error(`${fileName} is not a live craft-rocket::Iron.`);
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    throw new Error(`The action succeeded, but its live Iron output could not be verified${lastError?.message ? `: ${lastError.message}` : "."}`);
+  }
+
+  async function followHardwareIndexRun(run, token) {
+    const connection = {
+      id: run.connectionId || `cwi-${run.driverUrl}`,
+      name: run.connectionName || "Benchmark Driver",
+      driverUrl: run.driverUrl,
+    };
+    for (;;) {
+      if (token !== state.hardwareIndex.runToken) throw new Error("Benchmark tracking was superseded in this tab.");
+      const snapshot = validateHardwareIndexRunSnapshot(
+        await driverRequest(connection, `/actions/runs/${encodeURIComponent(run.runId)}`, { timeout: 10000 }),
+        run,
+      );
+      if (hardwareIndexRunMatchesCurrentWorkspace(run)) mergeRun(snapshot);
+      const latest = Array.isArray(snapshot?.progress) && snapshot.progress.length
+        ? snapshot.progress[snapshot.progress.length - 1]
+        : null;
+      state.hardwareIndex.progress = {
+        phase: hardwareIndexRunPhase(snapshot),
+        message: String(latest?.message || `Driver status: ${snapshot?.status || "queued"}`).slice(0, 300),
+        acceptedAt: run.requestedAt,
+        elapsedMs: Math.max(0, Date.now() - new Date(run.requestedAt).valueOf()),
+      };
+      updateHardwareIndexProgressUi();
+      const status = String(snapshot?.status || "").toLowerCase();
+      if (status === "failed") {
+        const error = new Error(snapshot?.error || "The MineIron benchmark action failed.");
+        error.hardwareIndexTerminal = true;
+        throw error;
+      }
+      if (status === "succeeded") {
+        const verified = await verifyHardwareIndexOutput(snapshot, connection);
+        return { snapshot, verified };
+      }
+      const elapsedMs = Date.now() - new Date(run.requestedAt).valueOf();
+      if (elapsedMs > HARDWARE_INDEX_MAX_RUN_MS) {
+        throw new Error(`Run ${shortText(run.runId)} is still non-terminal after ${formatProofDuration(elapsedMs)}. Its id is saved; Resume tracking later instead of starting another Iron.`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, HARDWARE_INDEX_POLL_MS));
+    }
+  }
+
+  async function trackHardwareIndexRun(run, { resumed = false } = {}) {
+    if (state.hardwareIndex.status === "running") return;
     const token = ++state.hardwareIndex.runToken;
     state.hardwareIndex.status = "running";
     state.hardwareIndex.error = "";
+    state.hardwareIndex.activeRun = run;
     state.hardwareIndex.progress = {
-      phase: "Starting benchmark worker",
-      elapsedMs: 0,
-      completedSamples: 0,
-      sampleCount: 0,
-      maximumDurationMs: HARDWARE_INDEX_MAX_DURATION_MS,
-      stabilityConfirmed: false,
+      phase: resumed ? "Resuming retained MineIron run" : "MineIron accepted by Driver",
+      message: resumed ? "Reading the existing run; no new action was submitted." : "Following the accepted action to terminal success.",
+      acceptedAt: run.requestedAt,
+      elapsedMs: Math.max(0, Date.now() - new Date(run.requestedAt).valueOf()),
     };
+    clearInterval(state.hardwareIndex.progressTimer);
+    state.hardwareIndex.progressTimer = setInterval(updateHardwareIndexProgressUi, 500);
     patchHardwareIndex();
-    let workerUrl = "";
-    let worker = null;
     try {
-      const source = `(${hardwareIndexWorkerMain.toString()})();`;
-      workerUrl = globalThis.URL.createObjectURL(new Blob([source], { type: "text/javascript" }));
-      worker = new Worker(workerUrl, { name: "don-client-work-index" });
-      state.hardwareIndex.worker = worker;
-      const raw = await new Promise((resolve, reject) => {
-        let settled = false;
-        let timeout = 0;
-        const finish = (handler, value) => {
-          if (settled) return;
-          settled = true;
-          clearTimeout(timeout);
-          document.removeEventListener("visibilitychange", onVisibilityChange);
-          state.hardwareIndex.cancelRun = null;
-          handler(value);
-        };
-        const onVisibilityChange = () => {
-          if (document.hidden) finish(reject, new Error("The sustained test stopped because this tab was hidden."));
-        };
-        timeout = setTimeout(() => finish(reject, new Error("The sustained client index timed out.")), HARDWARE_INDEX_MAX_DURATION_MS + 90_000);
-        state.hardwareIndex.cancelRun = () => {
-          const error = new Error("Client work index test cancelled.");
-          error.name = "AbortError";
-          finish(reject, error);
-        };
-        document.addEventListener("visibilitychange", onVisibilityChange);
-        worker.addEventListener("message", (event) => {
-          if (document.hidden) {
-            finish(reject, new Error("The sustained test stopped because this tab was hidden."));
-            return;
-          }
-          if (event.data?.type === "progress") {
-            if (settled || token !== state.hardwareIndex.runToken) return;
-            state.hardwareIndex.progress = {
-              phase: String(event.data.phase || "Running sustained benchmark").slice(0, 120),
-              elapsedMs: Math.max(0, Number(event.data.elapsedMs) || 0),
-              completedSamples: Math.max(0, Math.round(Number(event.data.completedSamples) || 0)),
-              sampleCount: Math.max(0, Math.round(Number(event.data.sampleCount) || 0)),
-              maximumDurationMs: HARDWARE_INDEX_MAX_DURATION_MS,
-              stabilityConfirmed: Boolean(event.data.stabilityConfirmed),
-            };
-            updateHardwareIndexProgressUi();
-            return;
-          }
-          if (event.data?.type === "error" || event.data?.error) {
-            finish(reject, new Error(event.data.error || "The benchmark worker failed."));
-            return;
-          }
-          if (event.data?.type === "result") finish(resolve, event.data);
-        });
-        worker.addEventListener("error", (event) => {
-          if (settled) return;
-          event.preventDefault();
-          finish(reject, new Error(event.message || "The benchmark worker could not start."));
-        }, { once: true });
-        try {
-          worker.postMessage({
-            run: true,
-            warmupDurationMs: HARDWARE_INDEX_WARMUP_MS,
-            sampleDurationMs: HARDWARE_INDEX_SAMPLE_MS,
-            minSamples: HARDWARE_INDEX_MIN_SAMPLES,
-            maxSamples: HARDWARE_INDEX_MAX_SAMPLES,
-          });
-        } catch (error) {
-          finish(reject, error);
-        }
-      });
+      const { snapshot, verified } = await followHardwareIndexRun(run, token);
       if (token !== state.hardwareIndex.runToken) return;
-      if (document.hidden) throw new Error("The sustained test stopped because this tab was hidden.");
-      const durationMs = Number(raw?.durationMs);
-      const normalizeSamples = (samples) => Array.isArray(samples) ? samples.map(Number) : [];
-      const searchSamples = normalizeSamples(raw?.searchSamples);
-      const sequentialSamples = normalizeSamples(raw?.sequentialSamples);
-      const validSamples = (samples) =>
-        samples.length >= HARDWARE_INDEX_MIN_RESULT_SAMPLES &&
-        samples.length <= HARDWARE_INDEX_MAX_SAMPLES &&
-        samples.every((sample) => Number.isFinite(sample) && sample > 0);
-      if (
-        !Number.isFinite(durationMs) || durationMs <= 0 ||
-        !validSamples(searchSamples) || !validSamples(sequentialSamples) ||
-        searchSamples.length !== sequentialSamples.length
-      ) {
-        throw new Error("The benchmark returned an invalid result.");
-      }
+      const completedAt = new Date().toISOString();
       const result = normalizeHardwareIndex({
         version: HARDWARE_INDEX_VERSION,
         benchmarkId: HARDWARE_INDEX_BENCHMARK_ID,
         scope: HARDWARE_INDEX_SCOPE,
         algorithm: HARDWARE_INDEX_ALGORITHM,
-        workerCount: 1,
-        logicalProcessors: navigator.hardwareConcurrency || 1,
-        warmupDurationMs: HARDWARE_INDEX_WARMUP_MS,
-        sampleDurationMs: HARDWARE_INDEX_SAMPLE_MS,
-        searchSamples,
-        sequentialSamples,
-        durationMs,
-        measuredAt: new Date().toISOString(),
+        driverUrl: run.driverUrl,
+        driverVersion: run.driverVersion,
+        action: HARDWARE_INDEX_ACTION,
+        actionHash: run.actionHash,
+        runId: run.runId,
+        durationMs: Math.max(1, new Date(completedAt).valueOf() - new Date(run.requestedAt).valueOf()),
+        requestedAt: run.requestedAt,
+        acceptedAt: run.acceptedAt,
+        completedAt,
+        outputFiles: verified.outputFiles,
       });
-      if (!result) throw new Error("The benchmark result could not be normalized.");
-      const ranFromHome = Boolean(document.querySelector('[data-hardware-index-view="home"]'));
-      state.hardwareIndex.status = "ready";
-      state.hardwareIndex.result = result;
-      state.hardwareIndex.persistent = persistHardwareIndex(result);
-      const savedResult = state.hardwareIndex.result || result;
-      if (ranFromHome || !document.querySelector("[data-hardware-index]")) {
-        toast("Client work index ready", `${HARDWARE_INDEX_LABEL} ${savedResult.score.toLocaleString()} / ${formatHardwareFactor(savedResult.referenceFactor)} reference / ${state.hardwareIndex.persistent ? "saved locally" : "this tab only"}`, "success");
-      }
+      if (!result || String(snapshot?.status).toLowerCase() !== "succeeded") throw new Error("The completed MineIron result could not be normalized.");
+      const persisted = persistHardwareIndex(result);
+      state.hardwareIndex.result = hardwareIndexConnectionKey(activeConnection()) === result.driverUrl ? result : currentHardwareIndex();
+      state.hardwareIndex.persistent = persisted;
+      state.hardwareIndex.status = state.hardwareIndex.result ? "ready" : "idle";
+      state.hardwareIndex.error = "";
+      toast("Client work index ready", `${formatProofDuration(result.durationMs)} / one live Iron committed / ${persisted ? "saved locally" : "this tab only"}`, "success", 7000);
+      if (activeConnection()?.driverUrl === run.driverUrl) void refreshCatalogAndObjects(activeConnection(), state.workspaceGeneration);
     } catch (error) {
       if (token !== state.hardwareIndex.runToken) return;
-      if (error?.name === "AbortError") {
-        state.hardwareIndex.status = currentHardwareIndex() ? "ready" : "idle";
-        state.hardwareIndex.error = "";
-        toast("Client work index stopped", currentHardwareIndex() ? "Last valid score retained." : "No score was saved.");
-      } else {
-        state.hardwareIndex.status = "error";
-        state.hardwareIndex.error = error.message;
-        if (!document.querySelector("[data-hardware-index]")) toast("Client work index failed", error.message, "error");
-      }
+      if (error.hardwareIndexTerminal) clearHardwareIndexRun(run.driverUrl);
+      state.hardwareIndex.status = "error";
+      state.hardwareIndex.error = error.message;
+      toast("Client work index not saved", error.message, "error", 9000);
     } finally {
-      worker?.terminate();
-      if (workerUrl) globalThis.URL.revokeObjectURL(workerUrl);
       if (token === state.hardwareIndex.runToken) {
-        state.hardwareIndex.worker = null;
-        state.hardwareIndex.cancelRun = null;
+        clearInterval(state.hardwareIndex.progressTimer);
+        state.hardwareIndex.progressTimer = null;
         state.hardwareIndex.progress = null;
+        state.hardwareIndex.activeRun = null;
+        patchHardwareIndex();
       }
-      patchHardwareIndex();
     }
   }
 
-  function cancelHardwareIndex() {
-    if (state.hardwareIndex.status !== "running") return;
-    state.hardwareIndex.cancelRun?.();
+  async function resumePendingHardwareIndexForConnection(connection = activeConnection()) {
+    if (!connection || state.hardwareIndex.status === "running") return;
+    const pending = hardwareIndexPendingForConnection(connection);
+    if (!pending) return;
+    if (hardwareIndexPendingHasRun(pending)) {
+      await trackHardwareIndexRun(pending, { resumed: true });
+      return;
+    }
+    state.hardwareIndex.status = "error";
+    state.hardwareIndex.error = hardwareIndexPendingLockCopy(pending);
+    patchHardwareIndex();
   }
 
+  async function runHardwareIndex() {
+    if (state.hardwareIndex.status === "running") return;
+    if (document.activeElement?.closest?.('[data-command="run-hardware-index"]')) state.hardwareIndex.restoreFocus = true;
+    const connection = activeConnection();
+    if (!connection) return;
+    const pending = hardwareIndexPendingForConnection(connection);
+    if (pending) {
+      if (hardwareIndexPendingHasRun(pending)) await trackHardwareIndexRun(pending, { resumed: true });
+      else {
+        state.hardwareIndex.status = "error";
+        state.hardwareIndex.error = hardwareIndexPendingLockCopy(pending);
+        patchHardwareIndex();
+      }
+      return;
+    }
+    const action = mineIronBenchmarkAction();
+    const status = connectionStatus(connection.id).state;
+    if (status !== "online" || state.workspace.connectionId !== connection.id) {
+      state.hardwareIndex.status = "error";
+      state.hardwareIndex.error = "The selected Driver must be online and loaded before CWI can run.";
+      patchHardwareIndex();
+      return;
+    }
+    const preflightError = mineIronBenchmarkPreflight(action);
+    if (preflightError) {
+      state.hardwareIndex.status = "error";
+      state.hardwareIndex.error = preflightError;
+      patchHardwareIndex();
+      return;
+    }
+    const capturedConnection = { ...connection };
+    const capturedWorkspaceGeneration = state.workspaceGeneration;
+    const requestedAt = new Date().toISOString();
+    const submission = normalizeHardwareIndexRun({
+      version: HARDWARE_INDEX_VERSION,
+      benchmarkId: HARDWARE_INDEX_BENCHMARK_ID,
+      scope: HARDWARE_INDEX_SCOPE,
+      algorithm: HARDWARE_INDEX_ALGORITHM,
+      driverUrl: capturedConnection.driverUrl,
+      driverVersion: String(state.workspace.health?.version || ""),
+      connectionId: capturedConnection.id,
+      connectionName: capturedConnection.name,
+      action: HARDWARE_INDEX_ACTION,
+      actionHash: action.hash,
+      runId: "",
+      phase: "submitting",
+      submissionId: newId("cwi-submit"),
+      requestedAt,
+      acceptedAt: "",
+    });
+    if (!submission || !persistHardwareIndexRun(submission)) {
+      state.hardwareIndex.status = "error";
+      state.hardwareIndex.error = "The console could not save a durable MineIron submission lock, so no action was sent.";
+      patchHardwareIndex();
+      return;
+    }
+    state.hardwareIndex.status = "running";
+    state.hardwareIndex.error = "";
+    state.hardwareIndex.progress = {
+      phase: "Submitting MineIron action",
+      message: "Waiting for the selected Driver to return a retained run id.",
+      acceptedAt: requestedAt,
+      elapsedMs: 0,
+    };
+    patchHardwareIndex();
+    let requestStarted = false;
+    let acceptedByDriver = false;
+    try {
+      requestStarted = true;
+      const accepted = await driverRequest(
+        capturedConnection,
+        "/actions/run",
+        jsonOptions("POST", { input: { action: HARDWARE_INDEX_ACTION, inputObjectPaths: [] } }, 30000),
+      );
+      if (!accepted?.runId) {
+        const error = new Error("The Driver returned success without a run id. The submission outcome is locked; inspect Activity before clearing local console data.");
+        error.hardwareIndexOutcomeUnknown = true;
+        throw error;
+      }
+      acceptedByDriver = true;
+      const run = normalizeHardwareIndexRun({
+        ...submission,
+        runId: accepted.runId,
+        phase: "accepted",
+        acceptedAt: new Date().toISOString(),
+      });
+      if (!run) {
+        const error = new Error("The accepted MineIron run could not be recorded safely. Check Activity before trying again.");
+        error.hardwareIndexOutcomeUnknown = true;
+        throw error;
+      }
+      const acceptedRunSaved = persistHardwareIndexRun(run);
+      if (!acceptedRunSaved) {
+        toast("Keep this tab open", `Run ${shortText(run.runId)} was accepted, but its recovery id could not be saved. Tracking will continue in this tab.`, "warning", 9000);
+      }
+      rememberRun(capturedConnection.id, run.runId);
+      if (isCurrentWorkspace(capturedConnection, capturedWorkspaceGeneration) && hardwareIndexRunMatchesCurrentWorkspace(run)) {
+        mergeRun({ ...accepted, action: HARDWARE_INDEX_ACTION, result: null, error: null, progress: [] });
+      }
+      state.hardwareIndex.status = "idle";
+      state.hardwareIndex.progress = null;
+      await trackHardwareIndexRun(run);
+    } catch (error) {
+      const outcomeUnknown = requestStarted && (acceptedByDriver || error?.status === 0 || error.hardwareIndexOutcomeUnknown);
+      if (outcomeUnknown) {
+        persistHardwareIndexRun(normalizeHardwareIndexRun({ ...submission, phase: "outcome-unknown" }) || submission);
+      } else if (!state.config.clientWorkIndexRuns[submission.driverUrl]?.runId) {
+        clearHardwareIndexRun(submission.driverUrl);
+      }
+      state.hardwareIndex.status = "error";
+      state.hardwareIndex.error = outcomeUnknown
+        ? `${error.message} No second benchmark can be started from this console while the persisted outcome lock remains.`
+        : error.message;
+      state.hardwareIndex.progress = null;
+      patchHardwareIndex();
+      toast("MineIron benchmark was not tracked", state.hardwareIndex.error, "error", 9000);
+    }
+  }
   function techTreeClassId(value, explicitHash = "") {
     const qualified = value?.class?.pluginName ? value.class : value;
     const hash = explicitHash || value?.hash || value?.classHash || "unhashed";
@@ -5232,9 +5247,8 @@
     if (!summary.count) return emptyLabel;
     if (summary.requiresCwi) return "Run CWI";
     if (!summary.knownCount) return "Time unknown";
-    if (!summary.directWorkCount && !summary.complete) return "Time unknown";
     const duration = formatProofDuration(summary.knownMilliseconds);
-    return summary.complete ? `${summary.directWorkCount ? "~" : ""}${duration}` : `>= ${duration}`;
+    return summary.complete ? `~${duration}` : `>= ${duration}`;
   }
 
   function plannerTimingSummary(stepIds, timingByStep) {
@@ -5242,6 +5256,8 @@
     let knownMilliseconds = 0;
     let knownCount = 0;
     let directWorkCount = 0;
+    let observedCount = 0;
+    let averageCount = 0;
     let complete = true;
     let requiresCwi = false;
     for (const id of ids) {
@@ -5255,10 +5271,12 @@
         knownCount += 1;
       }
       if (timing.hasKnownWork) directWorkCount += 1;
+      if (timing.estimateKind === "observed") observedCount += 1;
+      if (timing.estimateKind === "average") averageCount += 1;
       if (!timing.complete || timing.totalMilliseconds == null) complete = false;
       requiresCwi ||= timing.requiresCwi;
     }
-    return { count: ids.length, knownMilliseconds, knownCount, directWorkCount, complete, requiresCwi };
+    return { count: ids.length, knownMilliseconds, knownCount, directWorkCount, observedCount, averageCount, complete, requiresCwi };
   }
 
   function plannerWorkloadSummary(stepIds, timingByStep) {
@@ -5292,14 +5310,15 @@
     if (!timing) return "Time unknown";
     if (timing.requiresCwi) return "Run CWI";
     if (timing.totalMilliseconds == null) return "Time unknown";
-    return `${timing.complete ? (timing.hasKnownWork ? "~" : "") : ">= "}${formatProofDuration(timing.totalMilliseconds)}`;
+    return timing.estimateKind === "observed"
+      ? `${formatProofDuration(timing.totalMilliseconds)} observed`
+      : `~${formatProofDuration(timing.totalMilliseconds)} avg`;
   }
 
   function plannerDirectTimingBreakdown(timing) {
     if (!timing?.workload) return "PoW unknown / VDF unknown";
-    const pow = actionProofComponentTimingLabel(timing.workload.pow, timing.powMilliseconds, timing);
-    const vdf = actionProofComponentTimingLabel(timing.workload.vdf, timing.vdfMilliseconds, timing);
-    return `PoW ${pow} / VDF ${vdf}`;
+    const source = timing.estimateKind === "observed" ? "MineIron observed" : timing.hasCwi ? "CWI average" : "No CWI";
+    return `PoW ${timing.workload.pow.level} / VDF ${timing.workload.vdf.level} / ${source}`;
   }
 
   function buildPlannerDisplayTree(result, timingByStep, catalog) {
@@ -5692,6 +5711,7 @@
     }
     const totalTiming = plannerTimingSummary(result.steps.map((step) => step.id), timingByStep);
     const totalWorkload = plannerWorkloadSummary(result.steps.map((step) => step.id), timingByStep);
+    const cwi = currentHardwareIndex();
     const hasExecutablePlan = result.status === "planned" || result.status === "satisfied";
     const totalLabel = hasExecutablePlan ? plannerTimingLabel(totalTiming) : "No plan";
     const totalBasis = !hasExecutablePlan
@@ -5699,14 +5719,8 @@
       : !totalTiming.count
         ? "Already available / no actions"
         : totalTiming.requiresCwi
-          ? "Run CWI to time readable gates"
-          : !totalTiming.knownCount
-            ? "Direct proof work unreadable"
-            : !totalTiming.directWorkCount
-              ? totalTiming.complete ? "No direct PoW/VDF gates" : "Direct proof metadata unreadable"
-              : totalTiming.complete
-                ? "CWI-grounded direct gates"
-                : "Known direct work only";
+          ? "Run CWI to apply the MineIron lifecycle average"
+          : `${totalTiming.count} action${totalTiming.count === 1 ? "" : "s"} × ${formatProofDuration(cwi?.durationMs)} MineIron lifecycle`;
     const tree = buildPlannerDisplayTree(result, timingByStep, context.catalog);
     const stateLabel = {
       satisfied: "Already on hand",
@@ -5715,18 +5729,17 @@
       "search-limit": "Search limit",
       "invalid-goal": "Invalid goal",
     }[result.status] || result.status;
-    const cwi = currentHardwareIndex();
     const cwiControl = !cwi && totalTiming.requiresCwi
-      ? gameButton(
-          state.hardwareIndex.status === "running" ? "Cancel CWI" : "Run CWI",
-          "run-hardware-index",
-          { tone: "primary" },
-        )
+      ? state.hardwareIndex.status === "running"
+        ? '<button class="game-button primary" type="button" disabled>CWI running</button>'
+        : gameButton("Run CWI", "run-hardware-index", { tone: "primary" })
       : "";
     const groundingNote = cwi
-      ? `${cwi.confidence} confidence / ${formatHardwareFactor(cwi.referenceFactor)} reference / ${formatDate(cwi.measuredAt)}`
+      ? `Observed MineIron ${formatProofDuration(cwi.durationMs)} / ${formatDate(cwi.measuredAt)}`
       : totalTiming.requiresCwi
-        ? "Required to time readable gates"
+        ? state.hardwareIndex.status === "running"
+          ? `Following a real MineIron lifecycle on ${state.hardwareIndex.activeRun?.connectionName || "another Driver"}`
+          : "Required for a selected-Driver per-action baseline"
         : totalTiming.directWorkCount
           ? "Timing coverage incomplete"
           : "No readable timed gates";
@@ -5787,14 +5800,14 @@
         <div class="planner-summary-item"><span>Goal state</span><strong>${escapeHtml(stateLabel)}</strong><small>${escapeHtml(result.goal.label)} / ${escapeHtml(shortText(result.goal.hash, 6, 4))} / ${escapeHtml(goalRule)}</small></div>
         <div class="planner-summary-item"><span>Total proof work</span><strong aria-live="polite" aria-atomic="true">${escapeHtml(totalLabel)}</strong><small>${escapeHtml(totalBasis)}<br />${escapeHtml(plannerWorkloadLabel(totalWorkload))}</small></div>
         <div class="planner-summary-item"><span>Action set</span><strong>${result.totals.actionCount}</strong><small>${escapeHtml(actionSetBasis)}</small></div>
-        <div class="planner-summary-item"><span>Grounding</span><strong>${cwi ? `${HARDWARE_INDEX_LABEL} ${cwi.score.toLocaleString()}` : "No CWI"}</strong><small>${escapeHtml(groundingNote)}</small>${cwiControl}</div>
+        <div class="planner-summary-item"><span>Grounding</span><strong>${cwi ? `${HARDWARE_INDEX_LABEL} ${formatProofDuration(cwi.durationMs)}` : "No CWI"}</strong><small>${escapeHtml(groundingNote)}</small>${cwiControl}</div>
       </div>
       ${inventorySatisfiedNote}
       <div class="planner-flow-key" aria-label="Plan relationship legend"><span><i class="planner-key-input" aria-hidden="true"></i>USE / consumed input</span><span><i class="planner-key-output" aria-hidden="true"></i>MAKE / created output</span><span><i class="planner-key-update" aria-hidden="true"></i>UPDATE / paired turnover</span>${inventoryKey}${hasMissingBranches ? '<span><i class="planner-key-missing" aria-hidden="true"></i>MISSING / unresolved prerequisite</span>' : ""}<span>${escapeHtml(treeGuide)}</span></div>
       ${plannerTreeSvg(tree, timingByStep, context.cartridge.name)}
       ${plannerStepListMarkup(context, timingByStep)}
       ${diagnosticMarkup.length || warningMarkup.length ? `<div class="terminal-note warning planner-diagnostics"><strong>Plan limits</strong><ul>${[...diagnosticMarkup, ...warningMarkup].slice(0, 8).join("")}</ul></div>` : ""}
-      <div class="terminal-note planner-truth-note">When CWI is available, durations are rough browser-equivalent proof-work estimates grounded in this machine's search and sequential rates. They cover only readable direct PoW/VDF gates, not Driver queueing, base proving, network, commit, relay, finality, hidden work, or post-mutation field state. Bounded shortest search is used first; any valid goal-directed fallback is labeled and may not be minimal. UPDATE arcs mark paired same-class turnover, not verified object identity or field results. MISSING lines summarize diagnostics rather than direct Petri arcs. Refresh or replan after every real action.</div>`;
+      <div class="terminal-note planner-truth-note">CWI records one real MineIron action on the selected Driver from request start through proof generation, chain commit, and verified live output. The planner's total is action count × that observed duration. MineIron with the measured action hash is observed; every other step is a CWI average, not an action-specific prediction. PoW/VDF labels describe readable gate severity only and do not add fabricated component seconds. Bounded shortest search is used first; any valid goal-directed fallback is labeled and may not be minimal. UPDATE arcs mark paired same-class turnover, not verified object identity or field results. Refresh or replan after every real action.</div>`;
   }
 
   function plannerGoalOptionsMarkup(context) {
@@ -6500,50 +6513,44 @@
       </div>`;
   }
 
-  function actionProofComponentTimingLabel(value, milliseconds, timing) {
-    if (value.complete && value.callCount === 0) return "0 sec";
-    if (milliseconds != null) return `${value.complete ? "~" : ">="}${formatProofDuration(milliseconds)}`;
-    if (timing.requiresCwi && value.knownCount > 0) {
-      return state.hardwareIndex.status === "running" ? "Calibrating..." : "CWI required";
-    }
-    return "Unknown";
+  function actionProofComponentTimingLabel(value) {
+    if (value.complete && value.callCount === 0) return "No direct gate";
+    if (value.complete) return `${value.knownCount} readable`;
+    if (value.knownCount > 0) return `${value.knownCount}/${value.callCount} readable`;
+    return "Metadata unknown";
   }
 
   function actionProofTotalTimingLabel(timing) {
     if (timing.totalMilliseconds != null) {
-      return `${timing.lowerBound ? ">=" : timing.hasKnownWork ? "~" : ""}${formatProofDuration(timing.totalMilliseconds)}`;
+      return timing.estimateKind === "observed"
+        ? `${formatProofDuration(timing.totalMilliseconds)} OBSERVED`
+        : `~${formatProofDuration(timing.totalMilliseconds)} AVG`;
     }
-    if (timing.requiresCwi) return state.hardwareIndex.status === "running" ? "CALIBRATING..." : "CWI REQUIRED";
+    if (timing.requiresCwi) return state.hardwareIndex.status === "running" ? "CWI RUNNING" : "CWI REQUIRED";
     return "UNKNOWN";
   }
 
   function actionProofEstimateSummary(timing) {
-    let stateLabel = "COVERAGE UNKNOWN";
-    let detail = "The public predicate does not expose readable direct proof-work counts.";
-    if (timing.complete && timing.hasKnownWork) {
-      stateLabel = "DIRECT GATES COVERED";
-      detail = timing.hasCwi
-        ? "All readable direct counts are mapped through this browser's normalized CWI component rates."
-        : "Readable direct counts are available. Run CWI to map them to this browser's component rates.";
-    } else if (timing.complete) {
-      stateLabel = "NO DIRECT GATES";
-      detail = "No direct PoW threshold or VDF call was found in the available predicate.";
-    } else if (timing.partial) {
-      stateLabel = "KNOWN WORK / LOWER BOUND";
-      detail = timing.hasCwi
-        ? "The total covers readable direct gates only; at least one direct gate remains invalid or unreadable."
-        : "Some direct work is readable, but CWI is required to time the known lower bound.";
-    }
-    const stateClass = timing.complete ? "is-complete" : timing.partial ? "is-partial" : "is-unknown";
+    const stateLabel = timing.estimateKind === "observed"
+      ? "MINEIRON OBSERVED"
+      : timing.estimateKind === "average"
+        ? "CWI PER-ACTION AVERAGE"
+        : "CALIBRATION REQUIRED";
+    const detail = timing.estimateKind === "observed"
+      ? "This exact MineIron action hash was measured through proof generation, commit, and verified live output."
+      : timing.estimateKind === "average"
+        ? "The measured MineIron lifecycle is reused as a transparent average; it is not specific to this action."
+        : "Run one real MineIron lifecycle on the selected Driver to establish the per-action baseline.";
+    const stateClass = timing.hasCwi ? "is-complete" : "is-unknown";
     return `
       <div class="proof-estimate-summary ${stateClass}">
-        <div><span>CWI-modeled browser equivalent</span><strong>${escapeHtml(actionProofTotalTimingLabel(timing))}</strong></div>
+        <div><span>Selected-Driver lifecycle baseline</span><strong>${escapeHtml(actionProofTotalTimingLabel(timing))}</strong></div>
         <div><span>${escapeHtml(stateLabel)}</span><small>${escapeHtml(detail)}</small></div>
       </div>`;
   }
 
   function actionProofCwiSourceMarkup(timing) {
-    if (!timing.hasCwi || !timing.hasKnownWork) return "";
+    if (!timing.hasCwi) return "";
     const cwi = timing.cwi;
     const liveState = state.hardwareIndex.status === "running"
       ? " / refreshing now"
@@ -6552,8 +6559,8 @@
         : "";
     return `
       <div class="proof-cwi-source">
-        <span><b>${HARDWARE_INDEX_LABEL} ${cwi.score.toLocaleString()}</b> / ${escapeHtml(cwi.confidence)} confidence / ${escapeHtml(formatHardwareFactor(cwi.referenceFactor))} reference${escapeHtml(liveState)}</span>
-        <small>Conservative search ${escapeHtml(formatHardwareRate(cwi.searchRate))} / sequential ${escapeHtml(formatHardwareRate(cwi.sequentialRate))} / ${cwi.sampleCount} sustained rounds / measured ${escapeHtml(formatDate(cwi.measuredAt))}</small>
+        <span><b>${HARDWARE_INDEX_LABEL} ${escapeHtml(formatProofDuration(cwi.durationMs))}</b> / ${escapeHtml(formatMineIronRate(cwi))} MineIron equivalent${escapeHtml(liveState)}</span>
+        <small>${escapeHtml(cwi.driverUrl)} / action ${escapeHtml(shortText(cwi.actionHash, 10, 7))} / measured ${escapeHtml(formatDate(cwi.measuredAt))}</small>
       </div>`;
   }
 
@@ -6561,16 +6568,42 @@
     if (!timing.requiresCwi) return "";
     const running = state.hardwareIndex.status === "running";
     const failed = state.hardwareIndex.status === "error";
-    const title = running ? "Measuring this browser" : failed ? "Client calibration failed" : "Client calibration required";
+    const pending = hardwareIndexPendingForConnection();
+    const resumable = hardwareIndexPendingHasRun(pending);
+    const locked = Boolean(pending && !resumable);
+    const activeRunName = state.hardwareIndex.activeRun?.connectionName || "selected Driver";
+    const runningHere = Boolean(
+      running && state.hardwareIndex.activeRun?.driverUrl === hardwareIndexConnectionKey(activeConnection())
+    );
+    const title = running
+      ? `MineIron running on ${activeRunName}`
+      : locked
+        ? "Submission outcome locked"
+        : failed
+          ? "Driver calibration needs attention"
+          : resumable
+            ? "Accepted MineIron needs tracking"
+            : "Driver calibration required";
     const copy = running
-      ? "Paired search/chain samples are running off the main UI thread for about 1–3 minutes."
-      : failed
-        ? state.hardwareIndex.error || "The browser could not complete CWI."
-        : "Run CWI-2 to measure sustained browser capability and model the readable proof work.";
+      ? runningHere
+        ? "Following the live action through proof, commit, and verified output. It cannot be cancelled here."
+        : `The active test belongs to ${activeRunName}, not this selected Driver. It continues even after switching connections.`
+      : locked
+        ? hardwareIndexPendingLockCopy(pending)
+        : failed
+          ? state.hardwareIndex.error || "The selected Driver could not complete CWI."
+          : resumable
+            ? `Resume retained run ${shortText(pending.runId)}; no new action will be submitted.`
+            : "Run one real craft-rocket::MineIron action. It creates and keeps one live on-chain Iron.";
+    const control = running || locked
+      ? running
+        ? '<button class="game-button" type="button" data-hardware-index-focus aria-disabled="true">In progress</button>'
+        : '<button class="game-button" type="button" data-command="activity" data-hardware-index-focus>Review Activity</button>'
+      : `<button class="game-button" type="button" data-command="run-hardware-index" data-hardware-index-focus>${resumable ? "Resume CWI" : failed ? "Retry CWI" : "Run CWI"}</button>`;
     return `
       <div class="proof-cwi-callout${failed ? " is-error" : ""}">
-        <div><span>Local ${HARDWARE_INDEX_LABEL}</span><strong>${escapeHtml(title)}</strong><small>${escapeHtml(copy)}</small></div>
-        <button class="game-button" type="button" data-command="${running ? "cancel-hardware-index" : "run-hardware-index"}" data-hardware-index-focus>${running ? "Cancel" : failed ? "Retry CWI" : "Run CWI"}</button>
+        <div><span>${running ? "Active benchmark" : "Selected Driver"} / ${HARDWARE_INDEX_LABEL}</span><strong>${escapeHtml(title)}</strong><small>${escapeHtml(copy)}</small></div>
+        ${control}
         ${running ? hardwareIndexProgressMarkup("proof-cwi-track") : ""}
       </div>`;
   }
@@ -6578,30 +6611,30 @@
   function actionProofRequirementsContentMarkup(action) {
     const workload = actionProofWorkload(action);
     const timing = estimateActionProofTiming(action, currentHardwareIndex(), workload);
-    const rating = (kind, value, milliseconds) => `
+    const rating = (kind, value) => `
       <div class="proof-rating proof-rating-${value.level.toLowerCase()}">
         <span>${kind}</span>
         <strong>${escapeHtml(value.level)}</strong>
-        <b class="proof-rating-time">${escapeHtml(actionProofComponentTimingLabel(value, milliseconds, timing))}</b>
+        <b class="proof-rating-time">${escapeHtml(actionProofComponentTimingLabel(value))}</b>
         <small>${escapeHtml(value.detail)}</small>
       </div>`;
     return `
       ${actionProofEstimateSummary(timing)}
       <div class="proof-rating-grid">
-        ${rating("PoW / inferred search", workload.pow, timing.powMilliseconds)}
-        ${rating("VDF / literal chain", workload.vdf, timing.vdfMilliseconds)}
+        ${rating("PoW / inferred search", workload.pow)}
+        ${rating("VDF / literal chain", workload.vdf)}
       </div>
       ${actionProofCwiSourceMarkup(timing)}
       ${actionProofCwiCalloutMarkup(timing)}
-      <p class="action-proof-note">Modeled durations divide known direct search trials and valid literal iterations by normalized CWI search and sequential rates. They are synthetic browser-equivalent compute, not measurements of the selected Driver, DON proof kernels, network, queue, or commit time. Custom or nested calls can leave the result partial or unknown.</p>`;
+      <p class="action-proof-note">PoW and VDF remain severity/workload labels only. CWI does not invent separate component rates: it measures one complete MineIron lifecycle on the selected Driver, then uses that duration as the planner's per-action average. Only the measured MineIron action hash is an observed action-specific time.</p>`;
   }
 
   function actionProofTimingAnnouncement(action) {
     const timing = estimateActionProofTiming(action);
-    if (timing.requiresCwi && state.hardwareIndex.status === "running") return "Client work index calibration is running for this action estimate.";
-    if (timing.requiresCwi) return "Client work index is required for this action's readable proof-work timing.";
-    if (timing.totalMilliseconds == null) return "Direct proof-work timing is unknown.";
-    const qualifier = timing.lowerBound ? "Known-work lower bound" : "Modeled browser-equivalent time";
+    if (timing.requiresCwi && state.hardwareIndex.status === "running") return "A real MineIron client work index run is in progress.";
+    if (timing.requiresCwi) return "Client work index is required for the selected-Driver per-action baseline.";
+    if (timing.totalMilliseconds == null) return "Action timing is unknown.";
+    const qualifier = timing.estimateKind === "observed" ? "Observed MineIron lifecycle" : "CWI per-action average, not action-specific";
     return `${qualifier}: ${formatProofDuration(timing.totalMilliseconds)}.`;
   }
 
@@ -6610,7 +6643,7 @@
     return `
       <section class="game-panel action-proof-panel" data-hardware-index data-hardware-index-view="action-proof" data-action-key="${escapeHtml(key)}" data-cwi-state="${escapeHtml(state.hardwareIndex.status)}" tabindex="-1" aria-labelledby="action-proof-title">
         <span class="sr-only" data-hardware-index-announcement aria-live="polite" aria-atomic="true">${escapeHtml(actionProofTimingAnnouncement(action))}</span>
-        <div class="game-panel-header"><h3 id="action-proof-title">Direct work gates</h3><span>CWI browser model</span></div>
+        <div class="game-panel-header"><h3 id="action-proof-title">Direct work gates</h3><span>CWI Driver baseline</span></div>
         <div class="game-panel-body" data-hardware-index-content>${actionProofRequirementsContentMarkup(action)}</div>
       </section>`;
   }
@@ -7320,9 +7353,9 @@
           ${menuTile("reset-config", "RST", "Reset defaults", "Restore the local Driver profile and clear saved cartridge selections.", { meta: "Caution" })}
         </div>
         <div class="game-panel hardware-index-panel">
-          <div class="game-panel-header"><h2>Client work index</h2><span>Sustained browser test</span></div>
+          <div class="game-panel-header"><h2>Client work index</h2><span>Selected Driver lifecycle</span></div>
           <div class="game-panel-body">
-            <p class="screen-copy hardware-index-intro">Measure sustained search-style and dependent-chain JavaScript performance with five-second lane samples. A stable run finishes in about 70 seconds; runs with noise or sustained-rate drift extend automatically, up to three minutes. Keep this tab visible. The score and its conservative component rates are saved locally for 30 days when browser storage is available.</p>
+            <p class="screen-copy hardware-index-intro">Run one real zero-input <code>craft-rocket::MineIron</code> action on the selected Driver and measure its complete request-to-live lifecycle. The test follows proof generation and chain commit, verifies the single Iron output is live, and keeps that committed object. Its run id is saved immediately so a reload resumes tracking instead of creating another Iron. Completed measurements are stored locally per Driver URL, Driver version, and MineIron action hash for 30 days.</p>
             <div class="hardware-index" id="config-cwi-panel" tabindex="-1" data-hardware-index data-hardware-index-view="full">
               <span class="sr-only" data-hardware-index-announcement aria-live="polite" aria-atomic="true">${escapeHtml(hardwareIndexAnnouncement())}</span>
               <div data-hardware-index-content>${hardwareIndexContentMarkup()}</div>
@@ -7742,9 +7775,6 @@
       case "run-hardware-index":
         await runHardwareIndex();
         break;
-      case "cancel-hardware-index":
-        cancelHardwareIndex();
-        break;
       case "open-config":
         await openConfigFile();
         break;
@@ -7753,9 +7783,11 @@
         break;
       case "reset-config":
         if (globalThis.confirm("Reset all connection profiles and menu selections to the local defaults?")) {
-          const localClientWorkIndex = state.config.clientWorkIndex;
+          const localClientWorkIndexes = state.config.clientWorkIndexes;
+          const localClientWorkIndexRuns = state.config.clientWorkIndexRuns;
           state.config = defaultConfig();
-          state.config.clientWorkIndex = localClientWorkIndex;
+          state.config.clientWorkIndexes = localClientWorkIndexes;
+          state.config.clientWorkIndexRuns = localClientWorkIndexRuns;
           persistConfig();
           resetWorkspace();
           await refreshEverything();
@@ -7958,31 +7990,11 @@
   });
 
   window.addEventListener("storage", (event) => {
-    if (event.key === LEGACY_HARDWARE_INDEX_STORAGE_KEY && event.newValue) {
-      try {
-        const legacyResult = normalizeHardwareIndex(JSON.parse(event.newValue));
-        if (!legacyResult) {
-          localStorage.removeItem(LEGACY_HARDWARE_INDEX_STORAGE_KEY);
-          return;
-        }
-        const saved = synchronizeHardwareIndexFromStorage(legacyResult, state.config);
-        if (saved) {
-          try {
-            localStorage.removeItem(LEGACY_HARDWARE_INDEX_STORAGE_KEY);
-          } catch {
-            // The main local config is already authoritative.
-          }
-        }
-      } catch {
-        // Ignore malformed legacy benchmark updates.
-      }
-      return;
-    }
+    if (event.key === LEGACY_HARDWARE_INDEX_STORAGE_KEY) return;
     if (event.key !== STORAGE_KEY || !event.newValue) return;
     try {
       const incomingConfig = JSON.parse(event.newValue);
-      const incomingResult = normalizeHardwareIndex(incomingConfig?.clientWorkIndex);
-      synchronizeHardwareIndexFromStorage(incomingResult, incomingConfig);
+      synchronizeHardwareIndexFromStorage(incomingConfig, incomingConfig);
     } catch {
       // Ignore malformed or unrelated local config updates from another tab.
     }
@@ -8040,7 +8052,6 @@
 
   async function start() {
     await restoreLinkedConfigHandle();
-    if (legacyHardwareIndexMigrationPending) persistConfig(false);
     updateUiSoundUi();
     updateMusicUi();
     void initializeMusic();

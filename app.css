@@ -857,6 +857,7 @@ button {
 .hud-button:disabled,
 .breadcrumb-button:disabled,
 .game-button:disabled,
+.game-button[aria-disabled="true"],
 .menu-tile[aria-disabled="true"],
 .cartridge-card[aria-disabled="true"],
 .connection-card[aria-disabled="true"] {
