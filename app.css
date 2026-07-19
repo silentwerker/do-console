@@ -1373,12 +1373,17 @@ button {
 }
 
 .connection-grid,
-.cartridge-grid,
-.action-grid,
-.object-grid {
+.cartridge-grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 15px;
+}
+
+.action-grid,
+.object-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(148px, 1fr));
+  gap: 10px;
 }
 
 .connection-card,
@@ -1488,6 +1493,107 @@ button.object-card {
 .object-card .card-orb {
   background: var(--coral);
   box-shadow: 3px 3px 0 var(--coral-dark);
+}
+
+.action-card.compact-card,
+.object-card.compact-card {
+  display: grid;
+  min-height: 112px;
+  grid-template-rows: auto minmax(2.4em, auto) auto;
+  align-content: start;
+  gap: 9px;
+  padding: 11px;
+}
+
+.object-card.compact-card {
+  min-height: 102px;
+}
+
+.compact-card-top,
+.compact-card-meta {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 7px;
+}
+
+.compact-card .card-orb {
+  width: 38px;
+  height: 32px;
+  flex: 0 0 auto;
+  margin: 0;
+  box-shadow: 2px 2px 0 var(--amber-dark);
+  font-size: 12px;
+}
+
+.object-card.compact-card .card-orb {
+  box-shadow: 2px 2px 0 var(--coral-dark);
+}
+
+.card-status {
+  max-width: 84px;
+  padding: 3px 5px;
+  overflow: hidden;
+  border: 1px solid var(--handheld-ink);
+  background: var(--neutral-bg);
+  box-shadow: 2px 2px 0 var(--hard-shadow);
+  color: var(--lcd-text);
+  font-size: 9px;
+  font-weight: 900;
+  letter-spacing: 0.05em;
+  text-overflow: ellipsis;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.card-status.is-ready,
+.card-status.is-live {
+  background: var(--teal);
+  box-shadow: 2px 2px 0 var(--teal-dark);
+  color: var(--accent-ink);
+}
+
+.card-status.is-needs,
+.card-status.is-pending,
+.card-status.is-unknown {
+  background: var(--amber);
+  box-shadow: 2px 2px 0 var(--amber-dark);
+  color: var(--accent-ink);
+}
+
+.card-status.is-nullified {
+  background: var(--coral);
+  box-shadow: 2px 2px 0 var(--coral-dark);
+  color: var(--accent-ink);
+}
+
+.compact-card .card-title {
+  display: -webkit-box;
+  min-width: 0;
+  overflow: hidden;
+  font-size: 11px;
+  line-height: 1.2;
+  max-height: 2.4em;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+}
+
+.compact-card-meta {
+  align-self: end;
+  padding-top: 7px;
+  border-top: 2px dotted var(--lcd-line);
+  color: var(--secondary-copy);
+  font-size: 8px;
+  font-weight: 900;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.compact-card-meta .compact-card-arrow {
+  color: var(--amber);
+  font-size: 10px;
 }
 
 .card-title {
@@ -2077,6 +2183,37 @@ button.object-card {
     5px 5px 0 var(--hard-shadow);
 }
 
+.tech-tree-fullscreen-button {
+  position: absolute;
+  top: 9px;
+  right: 9px;
+  z-index: 4;
+  display: grid;
+  width: 36px;
+  height: 36px;
+  place-items: center;
+  padding: 0;
+  border: 2px solid var(--lcd-line);
+  border-radius: 0;
+  background: var(--lcd-raised);
+  box-shadow: 3px 3px 0 var(--hard-shadow);
+  color: var(--amber);
+  cursor: pointer;
+}
+
+.tech-tree-fullscreen-button:hover,
+.tech-tree-fullscreen-button:focus-visible,
+.tech-tree-fullscreen-button[aria-pressed="true"] {
+  border-color: var(--amber);
+  background: linear-gradient(var(--accent-hatch), var(--accent-hatch)), var(--lcd-raised);
+  outline: 2px solid var(--amber);
+  outline-offset: 2px;
+}
+
+.tech-tree-fullscreen-button svg {
+  pointer-events: none;
+}
+
 #tech-tree-svg {
   display: block;
   width: 100%;
@@ -2157,6 +2294,40 @@ button.object-card {
   text-anchor: middle;
 }
 
+#tech-tree-svg.has-relationship-focus .tech-tree-component {
+  opacity: 0.18;
+  filter: grayscale(1);
+}
+
+#tech-tree-svg.has-relationship-focus .tech-tree-node,
+#tech-tree-svg.has-relationship-focus .tech-tree-edge {
+  transition: opacity 130ms linear, filter 130ms linear;
+}
+
+#tech-tree-svg.has-relationship-focus .tech-tree-node.is-dimmed {
+  opacity: 0.14;
+  filter: grayscale(1);
+}
+
+#tech-tree-svg.has-relationship-focus .tech-tree-edge.is-dimmed {
+  opacity: 0.07;
+  filter: grayscale(1);
+}
+
+#tech-tree-svg.has-relationship-focus .tech-tree-node.is-related,
+#tech-tree-svg.has-relationship-focus .tech-tree-edge.is-related {
+  opacity: 1;
+  filter: none;
+}
+
+#tech-tree-svg.has-relationship-focus .tech-tree-edge.is-direct path {
+  stroke-width: 3.5;
+}
+
+#tech-tree-svg.has-relationship-focus .tech-tree-node.is-direct .tech-tree-node-frame {
+  stroke-width: 3;
+}
+
 .tech-tree-node {
   cursor: pointer;
   outline: none;
@@ -2198,6 +2369,41 @@ button.object-card {
 .tech-tree-node:focus .tech-tree-node-frame {
   stroke: var(--amber);
   stroke-width: 5;
+}
+
+.tech-tree-canvas:fullscreen,
+.tech-tree-canvas:-webkit-full-screen,
+.tech-tree-canvas.is-pseudo-fullscreen {
+  width: 100vw;
+  height: 100vh;
+  border: 0;
+  background:
+    linear-gradient(var(--screen-grid) 1px, transparent 1px),
+    linear-gradient(90deg, var(--screen-grid) 1px, transparent 1px),
+    var(--lcd-deep);
+  background-size: 20px 20px;
+  box-shadow: none;
+}
+
+.tech-tree-canvas:fullscreen,
+.tech-tree-canvas:-webkit-full-screen {
+  max-width: none;
+  max-height: none;
+}
+
+.tech-tree-canvas:fullscreen::backdrop {
+  background: var(--handheld-plastic);
+}
+
+.tech-tree-canvas.is-pseudo-fullscreen {
+  position: fixed;
+  inset: 0;
+  z-index: 10000;
+}
+
+html.has-tech-tree-fullscreen,
+html.has-tech-tree-fullscreen body {
+  overflow: hidden;
 }
 
 .tech-tree-token-well {
@@ -2367,6 +2573,53 @@ button.object-card {
 
 .tech-tree-truth-note {
   margin-top: 15px;
+}
+
+.action-tech-tree-panel {
+  margin-top: 18px;
+}
+
+.action-tech-tree-panel .game-panel-header span {
+  color: var(--amber);
+  font-size: 7px;
+  font-weight: 900;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.action-tech-tree-panel .game-panel-body {
+  padding: 10px;
+}
+
+.action-tech-tree-viewport {
+  max-width: 100%;
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  scrollbar-color: var(--lcd-line) var(--lcd-shadow);
+  scrollbar-width: thin;
+}
+
+.action-tech-tree-viewport:focus-visible {
+  outline: 2px solid var(--amber);
+  outline-offset: 2px;
+}
+
+.action-tech-tree-portal {
+  display: block;
+  width: auto;
+  min-width: 100%;
+  height: auto;
+  min-height: 140px;
+  overflow: visible;
+  border: 2px solid var(--lcd-line);
+  background:
+    linear-gradient(var(--screen-grid) 1px, transparent 1px),
+    linear-gradient(90deg, var(--screen-grid) 1px, transparent 1px),
+    var(--lcd-deep);
+  background-size: 16px 16px;
+  box-shadow:
+    inset 3px 3px 0 var(--screen-inset-dark),
+    inset -2px -2px 0 var(--screen-inset-light);
 }
 
 .drawer-header-actions {
@@ -2804,9 +3057,7 @@ body.drawer-open {
 
 @media (max-width: 1050px) {
   .connection-grid,
-  .cartridge-grid,
-  .action-grid,
-  .object-grid {
+  .cartridge-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
@@ -2986,8 +3237,6 @@ body.drawer-open {
   .console-menu-grid,
   .connection-grid,
   .cartridge-grid,
-  .action-grid,
-  .object-grid,
   .game-form-grid,
   .panel-grid {
     grid-template-columns: minmax(0, 1fr);

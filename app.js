@@ -203,6 +203,8 @@
       model: null,
       layout: null,
       drag: null,
+      fullscreenFallback: false,
+      fullscreenRequestPending: false,
     },
     linkedConfigHandle: null,
     linkedConfigName: null,
@@ -896,6 +898,7 @@
   }
 
   function resetWorkspace() {
+    cleanupTechTreeFullscreen();
     state.workspaceGeneration += 1;
     state.workspace = emptyWorkspace();
     state.events = [];
@@ -1157,6 +1160,7 @@
   }
 
   function render() {
+    if (state.screen !== "tree") cleanupTechTreeFullscreen();
     updateHeader();
     const focusToken = captureFocus(main);
     const shouldAutofocus = Boolean(focusToken) || !document.activeElement || document.activeElement === document.body || document.activeElement === main;
@@ -1186,6 +1190,7 @@
       config: renderConfig,
     };
     main.innerHTML = renderers[state.screen]();
+    if (state.screen !== "tree" || !byId("tech-tree-canvas")) cleanupTechTreeFullscreen();
     main.dataset.screen = state.screen;
     requestAnimationFrame(() => {
       if (state.screen === "tree") mountTechTree();
@@ -1425,6 +1430,10 @@
     return `transition:${qualifiedKey(action?.action)}@${action?.hash || "unhashed"}`;
   }
 
+  function techTreeEdgeId(source, target, role) {
+    return `edge:${role}:${encodeURIComponent(source)}>${encodeURIComponent(target)}`;
+  }
+
   function techTreeNodeLabelLines(value, maxLength = 18) {
     const words = String(value || "Unnamed")
       .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
@@ -1501,7 +1510,7 @@
       const key = `${source}\u0000${target}\u0000${role}`;
       let edge = edgeMap.get(key);
       if (!edge) {
-        edge = { id: `edge:${edgeMap.size}`, source, target, role, count: 0, slotIndexes: [] };
+        edge = { id: techTreeEdgeId(source, target, role), source, target, role, count: 0, slotIndexes: [] };
         edgeMap.set(key, edge);
       }
       edge.count += 1;
@@ -1815,6 +1824,81 @@
     return `${kind}, ${node.label}, ${techTreeNodeStatus(node)}`;
   }
 
+  function techTreeLineage(model, nodeId) {
+    if (!model?.nodeById.has(nodeId)) return null;
+    const incoming = new Map(model.nodes.map((node) => [node.id, []]));
+    const outgoing = new Map(model.nodes.map((node) => [node.id, []]));
+    for (const edge of model.edges) {
+      outgoing.get(edge.source)?.push(edge);
+      incoming.get(edge.target)?.push(edge);
+    }
+
+    const nodeIds = new Set([nodeId]);
+    const edgeIds = new Set();
+    const directNodeIds = new Set();
+    const directEdgeIds = new Set();
+    for (const edge of [...(incoming.get(nodeId) || []), ...(outgoing.get(nodeId) || [])]) {
+      directEdgeIds.add(edge.id);
+      directNodeIds.add(edge.source === nodeId ? edge.target : edge.source);
+    }
+
+    const walk = (adjacency, endpoint) => {
+      const visited = new Set([nodeId]);
+      const queue = [nodeId];
+      for (let cursor = 0; cursor < queue.length; cursor += 1) {
+        const current = queue[cursor];
+        for (const edge of adjacency.get(current) || []) {
+          edgeIds.add(edge.id);
+          const next = edge[endpoint];
+          nodeIds.add(next);
+          if (visited.has(next)) continue;
+          visited.add(next);
+          queue.push(next);
+        }
+      }
+    };
+    walk(outgoing, "target");
+    walk(incoming, "source");
+    return { nodeIds, edgeIds, directNodeIds, directEdgeIds };
+  }
+
+  function applyTechTreeRelationshipFocus(model = state.techTree.model) {
+    const svg = byId("tech-tree-svg");
+    if (!svg || !model) return;
+    const selectedId = model.nodeById.has(state.techTree.selectedNodeId)
+      ? state.techTree.selectedNodeId
+      : "";
+    const lineage = selectedId ? techTreeLineage(model, selectedId) : null;
+    svg.classList.toggle("has-relationship-focus", Boolean(lineage));
+
+    svg.querySelectorAll("[data-tree-node-id]").forEach((element) => {
+      const id = element.dataset.treeNodeId;
+      const selected = id === selectedId;
+      const related = Boolean(lineage?.nodeIds.has(id));
+      element.classList.toggle("is-selected", selected);
+      element.classList.toggle("is-direct", Boolean(lineage?.directNodeIds.has(id)));
+      element.classList.toggle("is-related", related);
+      element.classList.toggle("is-dimmed", Boolean(lineage) && !related);
+      element.setAttribute("aria-pressed", String(selected));
+    });
+
+    svg.querySelectorAll("[data-tree-edge-id]").forEach((element) => {
+      const id = element.dataset.treeEdgeId;
+      const related = Boolean(lineage?.edgeIds.has(id));
+      element.classList.toggle("is-direct", Boolean(lineage?.directEdgeIds.has(id)));
+      element.classList.toggle("is-related", related);
+      element.classList.toggle("is-dimmed", Boolean(lineage) && !related);
+    });
+  }
+
+  function clearTechTreeRelationshipFocus() {
+    if (!state.techTree.selectedNodeId) return false;
+    state.techTree.selectedNodeId = "";
+    applyTechTreeRelationshipFocus();
+    updateTechTreeDetails();
+    return true;
+  }
+
   function techTreeEdgeGeometry(edge, positions) {
     const source = positions.get(edge.source);
     const target = positions.get(edge.target);
@@ -1866,7 +1950,7 @@
       const geometry = techTreeEdgeGeometry(edge, layout.positions);
       if (!geometry) continue;
       parts.push(`
-        <g class="tech-tree-edge tech-tree-edge-${edge.role}" aria-hidden="true">
+        <g class="tech-tree-edge tech-tree-edge-${edge.role}" data-tree-edge-id="${escapeHtml(edge.id)}" data-tree-source="${escapeHtml(edge.source)}" data-tree-target="${escapeHtml(edge.target)}" data-tree-role="${edge.role}" aria-hidden="true">
           <path d="${geometry.path}" marker-end="url(#tree-arrow-${edge.role})"></path>
           ${edge.count > 1 ? `<g class="tech-tree-edge-count" transform="translate(${geometry.labelX} ${geometry.labelY})"><rect x="-13" y="-9" width="26" height="17"></rect><text y="4">x${edge.count}</text></g>` : ""}
         </g>`);
@@ -1897,7 +1981,7 @@
         ? `<rect class="tech-tree-node-frame" width="${position.width}" height="${position.height}"></rect><rect class="tech-tree-token-well" x="8" y="10" width="23" height="23"></rect><text class="tech-tree-node-emoji" x="19.5" y="27" text-anchor="middle">${escapeHtml(node.emoji || "\ud83d\udce6")}</text>`
         : `<path class="tech-tree-node-frame" d="M 8 0 H ${position.width - 8} L ${position.width} 8 V ${position.height - 8} L ${position.width - 8} ${position.height} H 8 L 0 ${position.height - 8} V 8 Z"></path>`;
       parts.push(`
-        <g class="${classes}" transform="${transform}" data-tree-node-id="${escapeHtml(node.id)}" data-tree-kind="${node.kind}" role="button" tabindex="0" aria-label="${escapeHtml(techTreeNodeAria(node))}">
+        <g class="${classes}" transform="${transform}" data-tree-node-id="${escapeHtml(node.id)}" data-tree-kind="${node.kind}" role="button" tabindex="0" aria-pressed="${selected}" aria-label="${escapeHtml(techTreeNodeAria(node))}">
           <title>${escapeHtml(`${node.label}: ${status}`)}</title>
           ${shape}
           <text class="tech-tree-node-label" x="${anchorX}" y="${lineStart}" text-anchor="${textAnchor}">
@@ -1935,6 +2019,11 @@
   }
 
   function techTreeDetailsMarkup(model) {
+    if (!model.nodes.length) {
+      return `
+        <div class="tech-tree-detail-heading"><div><span class="tech-tree-detail-kind">Graph inspector</span><h2>No graph nodes</h2></div></div>
+        <p class="tech-tree-detail-copy">This cartridge does not currently expose any public class states or action transitions.</p>`;
+    }
     const selected = model.nodeById.get(state.techTree.selectedNodeId) || null;
     const allNodeById = new Map(model.allNodes.map((node) => [node.id, node]));
     const focusObject = model.focusObject;
@@ -1954,7 +2043,7 @@
       }
       return `
         <div class="tech-tree-detail-heading"><div><span class="tech-tree-detail-kind">Graph inspector</span><h2>Select a node</h2></div></div>
-        <p class="tech-tree-detail-copy">Choose a class state or action transition to inspect its tokens, requirements, and branches.</p>`;
+        <p class="tech-tree-detail-copy">Choose a class state or action transition to isolate its upstream and downstream lineage. Choose it again to clear the trace.</p>`;
     }
 
     if (selected.kind === "transition") {
@@ -2053,17 +2142,142 @@
             <span><i class="legend-ready" aria-hidden="true"></i>Locally ready</span>
             <span class="tech-tree-counts"><b data-tree-place-count>0</b> states / <b data-tree-action-count>0</b> transitions / <b data-tree-network-count>0</b> networks</span>
           </div>
-          <div class="tech-tree-canvas">
+          <div id="tech-tree-canvas" class="tech-tree-canvas">
+            <button class="tech-tree-fullscreen-button" type="button" data-command="tree-fullscreen" aria-label="Enter graph fullscreen" title="Enter graph fullscreen" aria-pressed="false">
+              <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true" focusable="false"><path d="M14 4h6v6 M20 4l-7 7 M10 20H4v-6 M4 20l7-7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square" stroke-linejoin="miter"></path></svg>
+            </button>
             <svg id="tech-tree-svg" role="group" aria-labelledby="tech-tree-svg-title tech-tree-svg-description" preserveAspectRatio="xMidYMid meet">
               <title id="tech-tree-svg-title">${escapeHtml(cartridge.name)} action dependency graph</title>
               <desc id="tech-tree-svg-description">Class states connect to action transitions through required input and produced output arcs.</desc>
             </svg>
-            <span class="tech-tree-map-help" aria-hidden="true">Drag to pan / wheel to zoom / arrows move node focus</span>
+            <span class="tech-tree-map-help" aria-hidden="true">Click: trace / again: clear / drag: pan / wheel: zoom</span>
           </div>
           <div id="tech-tree-details" class="tech-tree-details" aria-live="polite"></div>
           <div class="terminal-note tech-tree-truth-note">This map uses the Driver's public, flattened action signatures. Object branches are possible transitions, not disclosed private provenance or hidden sub-action internals.</div>
         </div>
       </section>`;
+  }
+
+  function techTreeFullscreenElement() {
+    return document.fullscreenElement || document.webkitFullscreenElement || null;
+  }
+
+  function syncTechTreeFullscreenUi() {
+    const canvas = byId("tech-tree-canvas");
+    const nativeActive = Boolean(canvas && techTreeFullscreenElement() === canvas);
+    if (nativeActive) state.techTree.fullscreenFallback = false;
+    const fallbackActive = Boolean(canvas && state.techTree.fullscreenFallback && !nativeActive);
+    const active = nativeActive || fallbackActive;
+    canvas?.classList.toggle("is-pseudo-fullscreen", fallbackActive);
+    document.documentElement.classList.toggle("has-tech-tree-fullscreen", active);
+    const button = canvas?.querySelector("[data-command='tree-fullscreen']");
+    if (button) {
+      const label = active ? "Exit graph fullscreen" : "Enter graph fullscreen";
+      button.setAttribute("aria-label", label);
+      button.setAttribute("title", label);
+      button.setAttribute("aria-pressed", String(active));
+    }
+  }
+
+  function enableTechTreeFullscreenFallback() {
+    if (state.screen !== "tree" || !byId("tech-tree-canvas")) return;
+    state.techTree.fullscreenRequestPending = false;
+    state.techTree.fullscreenFallback = true;
+    syncTechTreeFullscreenUi();
+  }
+
+  async function toggleTechTreeFullscreen() {
+    const canvas = byId("tech-tree-canvas");
+    if (!canvas) return;
+    const nativeElement = techTreeFullscreenElement();
+    if (nativeElement === canvas) {
+      state.techTree.fullscreenRequestPending = false;
+      const exit = document.exitFullscreen || document.webkitExitFullscreen;
+      try {
+        const result = exit?.call(document);
+        if (result?.then) await result;
+      } catch {
+        // The fullscreenchange event remains authoritative if exit rejects.
+      }
+      syncTechTreeFullscreenUi();
+      return;
+    }
+    if (state.techTree.fullscreenFallback) {
+      state.techTree.fullscreenFallback = false;
+      syncTechTreeFullscreenUi();
+      return;
+    }
+
+    const request = canvas.requestFullscreen || canvas.webkitRequestFullscreen;
+    if (!request) {
+      enableTechTreeFullscreenFallback();
+      return;
+    }
+    state.techTree.fullscreenRequestPending = true;
+    try {
+      const result = request.call(canvas);
+      if (result?.then) {
+        await result;
+        state.techTree.fullscreenRequestPending = false;
+        if (techTreeFullscreenElement() !== canvas) enableTechTreeFullscreenFallback();
+        else syncTechTreeFullscreenUi();
+      } else {
+        window.setTimeout(() => {
+          if (!state.techTree.fullscreenRequestPending) return;
+          if (techTreeFullscreenElement() === byId("tech-tree-canvas")) {
+            state.techTree.fullscreenRequestPending = false;
+            syncTechTreeFullscreenUi();
+          } else {
+            enableTechTreeFullscreenFallback();
+          }
+        }, 500);
+      }
+    } catch {
+      enableTechTreeFullscreenFallback();
+    }
+  }
+
+  function cleanupTechTreeFullscreen() {
+    state.techTree.fullscreenFallback = false;
+    state.techTree.fullscreenRequestPending = false;
+    state.techTree.drag = null;
+    byId("tech-tree-canvas")?.classList.remove("is-pseudo-fullscreen");
+    document.documentElement.classList.remove("has-tech-tree-fullscreen");
+    const nativeElement = techTreeFullscreenElement();
+    if (nativeElement?.id === "tech-tree-canvas") {
+      const exit = document.exitFullscreen || document.webkitExitFullscreen;
+      try {
+        const result = exit?.call(document);
+        if (result?.catch) result.catch(() => {});
+      } catch {
+        // Removing the fullscreen element also asks the browser to exit.
+      }
+    }
+  }
+
+  function handleTechTreeFullscreenChange() {
+    state.techTree.fullscreenRequestPending = false;
+    syncTechTreeFullscreenUi();
+  }
+
+  function handleTechTreeFullscreenError() {
+    if (state.techTree.fullscreenRequestPending) enableTechTreeFullscreenFallback();
+  }
+
+  function trapTechTreeFullscreenFocus(event) {
+    if (!state.techTree.fullscreenFallback || event.key !== "Tab") return false;
+    const canvas = byId("tech-tree-canvas");
+    if (!canvas) return false;
+    const focusable = [...canvas.querySelectorAll("button:not([disabled]), [tabindex]:not([tabindex='-1'])")]
+      .filter((element) => element.getAttribute("aria-disabled") !== "true");
+    if (!focusable.length) return false;
+    const current = focusable.indexOf(document.activeElement);
+    if (current < 0 || (!event.shiftKey && current === focusable.length - 1) || (event.shiftKey && current === 0)) {
+      event.preventDefault();
+      focusable[event.shiftKey ? focusable.length - 1 : 0].focus({ preventScroll: true });
+      return true;
+    }
+    return false;
   }
 
   function fittedTechTreeView(layout) {
@@ -2106,23 +2320,27 @@
     const root = byId("tech-tree-root");
     if (!svg || !root || state.screen !== "tree") return;
     const model = buildTechTreeModel();
-    if (!model || !model.nodes.length) {
-      svg.innerHTML = '<text class="tech-tree-empty" x="20" y="40">No classes or actions are available for this cartridge.</text>';
-      return;
-    }
+    if (!model) return;
     const layout = layoutTechTree(model);
     state.techTree.model = model;
     state.techTree.layout = layout;
-    if (!model.nodeById.has(state.techTree.selectedNodeId)) {
-      state.techTree.selectedNodeId = model.focusPlaceId || "";
+    if (state.techTree.selectedNodeId && !model.nodeById.has(state.techTree.selectedNodeId)) {
+      state.techTree.selectedNodeId = "";
     }
     if (state.techTree.viewKey !== model.fingerprint || !state.techTree.viewBox) {
       state.techTree.viewKey = model.fingerprint;
       state.techTree.viewBox = fittedTechTreeView(layout);
     }
     root.dataset.treeFingerprint = model.fingerprint;
-    svg.innerHTML = drawTechTreeSvg(model, layout);
+    const accessibleMarkup = `
+      <title id="tech-tree-svg-title">${escapeHtml(model.cartridge.name)} action dependency graph</title>
+      <desc id="tech-tree-svg-description">Class states connect to action transitions through required input and produced output arcs. Select a node to emphasize its upstream and downstream relationships; select it again to clear the emphasis.</desc>`;
+    svg.innerHTML = accessibleMarkup + (model.nodes.length
+      ? drawTechTreeSvg(model, layout)
+      : '<text class="tech-tree-empty" x="20" y="40">No classes or actions are available for this cartridge.</text>');
     applyTechTreeViewBox();
+    applyTechTreeRelationshipFocus(model);
+    syncTechTreeFullscreenUi();
     updateTechTreeCounts(model, layout);
     updateTechTreeDetails(model);
   }
@@ -2158,14 +2376,12 @@
   function selectTechTreeNode(id, focus = false) {
     const model = state.techTree.model;
     if (!model?.nodeById.has(id)) return;
-    state.techTree.selectedNodeId = id;
-    main.querySelectorAll("[data-tree-node-id]").forEach((element) => {
-      element.classList.toggle("is-selected", element.dataset.treeNodeId === id);
-    });
+    state.techTree.selectedNodeId = state.techTree.selectedNodeId === id ? "" : id;
+    applyTechTreeRelationshipFocus(model);
     updateTechTreeDetails(model);
-    if (focus) {
+    if (focus && state.techTree.selectedNodeId) {
       [...main.querySelectorAll("[data-tree-node-id]")]
-        .find((element) => element.dataset.treeNodeId === id)
+        .find((element) => element.dataset.treeNodeId === state.techTree.selectedNodeId)
         ?.focus({ preventScroll: true });
     }
   }
@@ -2276,17 +2492,21 @@
       return;
     }
     state.techTree.model = model;
-    if (!model.nodeById.has(state.techTree.selectedNodeId)) state.techTree.selectedNodeId = model.focusPlaceId || "";
+    if (state.techTree.selectedNodeId && !model.nodeById.has(state.techTree.selectedNodeId)) {
+      state.techTree.selectedNodeId = "";
+    }
     main.querySelectorAll("[data-tree-node-id]").forEach((element) => {
       const node = model.nodeById.get(element.dataset.treeNodeId);
       if (!node) return;
       element.classList.toggle("is-ready", node.kind === "transition" && node.ready);
       element.classList.toggle("has-live", node.kind === "place" && Boolean(node.counts.live));
-      element.classList.toggle("is-selected", node.id === state.techTree.selectedNodeId);
       element.setAttribute("aria-label", techTreeNodeAria(node));
       const status = element.querySelector("[data-tree-node-status]");
       if (status) status.textContent = techTreeNodeStatus(node);
+      const title = element.querySelector("title");
+      if (title) title.textContent = `${node.label}: ${techTreeNodeStatus(node)}`;
     });
+    applyTechTreeRelationshipFocus(model);
     updateTechTreeCounts(model, state.techTree.layout);
     updateTechTreeDetails(model);
   }
@@ -2303,19 +2523,24 @@
       return true;
     });
     const visible = filtered.slice(0, state.actionLimit);
-    const cards = visible.map((action) => {
+    const cards = visible.map((action, index) => {
       const ready = actionReady(action);
-      const inputs = (action.totalInputs || []).map((item) => `<span class="chip">${escapeHtml(item.class?.name || "?")}</span>`).join("") || '<span class="chip">No inputs</span>';
-      const outputs = (action.totalOutputs || []).map((item) => `<span class="chip">${escapeHtml(item.class?.name || "?")}</span>`).join("") || '<span class="chip">No outputs</span>';
+      const inputCount = (action.totalInputs || []).length;
+      const outputCount = (action.totalOutputs || []).length;
+      const name = action.action?.name || "Unnamed action";
+      const ariaLabel = `${name}. ${ready ? "Ready" : "Needs items"}. ${inputCount} input${inputCount === 1 ? "" : "s"}, ${outputCount} output${outputCount === 1 ? "" : "s"}. Open action setup.`;
+      const descriptionId = `action-card-${index}-description`;
+      const inputNames = techTreeGroupedRefs(action.totalInputs || []).map(({ ref, count }) => `${ref.class?.name || "unknown"}${count > 1 ? ` x${count}` : ""}`).join(", ") || "none";
+      const outputNames = techTreeGroupedRefs(action.totalOutputs || []).map(({ ref, count }) => `${ref.class?.name || "unknown"}${count > 1 ? ` x${count}` : ""}`).join(", ") || "none";
       return `
-        <button class="action-card menu-focusable" type="button" data-command="setup-action" data-id="${escapeHtml(qualifiedKey(action.action))}">
-          <span class="card-orb" aria-hidden="true">${escapeHtml(action.emoji || "ACT")}</span>
-          <span class="active-marker">${ready ? "Ready" : "Needs items"}</span>
-          <span class="card-title">${escapeHtml(action.action?.name || "Unnamed action")}</span>
-          <span class="card-copy">${escapeHtml(action.description || "No description")}</span>
-          <span class="io-preview"><span class="io-label">In</span><span class="chip-list">${inputs}</span></span>
-          <span class="io-preview"><span class="io-label">Out</span><span class="chip-list">${outputs}</span></span>
-          <span class="card-footer-line"><span>${escapeHtml(action.action?.pluginName || "")}</span><span>${ready ? "Set up" : "Inspect"}</span></span>
+        <button class="action-card compact-card menu-focusable" type="button" data-command="setup-action" data-id="${escapeHtml(qualifiedKey(action.action))}" aria-label="${escapeHtml(ariaLabel)}" aria-describedby="${descriptionId}" title="${escapeHtml(action.description || ariaLabel)}">
+          <span class="compact-card-top">
+            <span class="card-orb" aria-hidden="true">${escapeHtml(action.emoji || "ACT")}</span>
+            <span class="card-status ${ready ? "is-ready" : "is-needs"}">${ready ? "Ready" : "Needs"}</span>
+          </span>
+          <span class="card-title">${escapeHtml(name)}</span>
+          <span class="compact-card-meta" aria-hidden="true"><span>${inputCount} in</span><span class="compact-card-arrow">→</span><span>${outputCount} out</span></span>
+          <span id="${descriptionId}" class="sr-only">${escapeHtml(`${action.description || "No description"} Inputs: ${inputNames}. Outputs: ${outputNames}.`)}</span>
         </button>`;
     }).join("");
     return `${state.workspace.errors.actions
@@ -2397,6 +2622,172 @@
     return compatibleObjects(required, used).filter((object) => !report || available.has(object.fileName));
   }
 
+  function renderActionTechTreePortal(action, runState = {}) {
+    const placeMap = new Map();
+    const addPlaces = (refs, role) => {
+      for (const { ref, count } of techTreeGroupedRefs(refs)) {
+        const key = `${qualifiedKey(ref.class)}@${ref.hash || ""}`;
+        const place = placeMap.get(key) || { key, ref, inputCount: 0, outputCount: 0 };
+        place[`${role}Count`] += count;
+        placeMap.set(key, place);
+      }
+    };
+    addPlaces(action.totalInputs || [], "input");
+    addPlaces(action.totalOutputs || [], "output");
+    const comparePlaces = (left, right) =>
+      (left.ref.class?.name || "").localeCompare(right.ref.class?.name || "") || left.key.localeCompare(right.key);
+    const places = [...placeMap.values()].sort(comparePlaces);
+    const inputs = places.filter((place) => place.inputCount && !place.outputCount);
+    const outputs = places.filter((place) => place.outputCount && !place.inputCount);
+    const shared = places.filter((place) => place.inputCount && place.outputCount);
+    const placeWidth = 126;
+    const placeHeight = 46;
+    const transitionWidth = 130;
+    const transitionHeight = 56;
+    const sharedGap = 18;
+    const width = Math.max(520, shared.length * placeWidth + (shared.length + 1) * sharedGap);
+    const inputX = 8;
+    const transitionX = (width - transitionWidth) / 2;
+    const outputX = width - placeWidth - 8;
+    const sideRows = Math.max(inputs.length, outputs.length, 1);
+    const sideHeight = Math.max(150, 24 + (sideRows - 1) * 56 + placeHeight);
+    const sharedStartY = sideHeight + 20;
+    const height = sideHeight + (shared.length ? 20 + placeHeight + 12 : 0);
+    const transitionY = (sideHeight - transitionHeight) / 2;
+    const markerScope = newId("action-tree").replace(/[^a-zA-Z0-9_-]/g, "");
+    const inputMarkerId = `${markerScope}-input`;
+    const outputMarkerId = `${markerScope}-output`;
+    const titleId = `${markerScope}-title`;
+    const descriptionId = `${markerScope}-description`;
+
+    const rowY = (index, count) => {
+      if (count <= 1) return (sideHeight - placeHeight) / 2;
+      const available = sideHeight - placeHeight - 24;
+      return 12 + (available * index) / (count - 1);
+    };
+    const sharedPosition = (index) => {
+      const gap = (width - shared.length * placeWidth) / (shared.length + 1);
+      return {
+        x: gap + index * (placeWidth + gap),
+        y: sharedStartY,
+      };
+    };
+    const placeMarkup = (place, x, y) => {
+      const live = compatibleObjects(place.ref).length;
+      const lines = techTreeNodeLabelLines(place.ref.class?.name || "Unknown", 14);
+      const labelX = 35;
+      const lineStart = lines.length > 1 ? 17 : 23;
+      let status = "";
+      if (place.inputCount && place.outputCount) {
+        status = `I${place.inputCount} / O${place.outputCount}${live ? ` / ${live} LIVE` : ""}`;
+      } else if (place.inputCount) {
+        status = `INPUT x${place.inputCount}${live ? ` / ${live} LIVE` : ""}`;
+      } else {
+        status = `OUTPUT x${place.outputCount}${live ? ` / ${live} LIVE` : ""}`;
+      }
+      return `
+        <g class="tech-tree-node-place${live ? " has-live" : ""}" transform="translate(${x} ${y})" aria-hidden="true">
+          <rect class="tech-tree-node-frame" width="${placeWidth}" height="${placeHeight}"></rect>
+          <rect class="tech-tree-token-well" x="7" y="9" width="22" height="22"></rect>
+          <text class="tech-tree-node-emoji" x="18" y="25" text-anchor="middle">${escapeHtml(place.ref.class?.name?.slice(0, 1) || "?")}</text>
+          <text class="tech-tree-node-label" x="${labelX}" y="${lineStart}">${lines.map((line, index) => `<tspan x="${labelX}" dy="${index ? 11 : 0}">${escapeHtml(line)}</tspan>`).join("")}</text>
+          <text class="tech-tree-node-status" x="${labelX}" y="39">${escapeHtml(status)}</text>
+        </g>`;
+    };
+    const edgeMarkup = (sourceX, sourceY, targetX, targetY, role, count) => {
+      const control = Math.max(28, Math.abs(targetX - sourceX) * 0.45);
+      const markerId = role === "input" ? inputMarkerId : outputMarkerId;
+      const labelX = (sourceX + targetX) / 2;
+      const labelY = (sourceY + targetY) / 2;
+      return `
+        <g class="tech-tree-edge tech-tree-edge-${role}" aria-hidden="true">
+          <path d="M ${sourceX} ${sourceY} C ${sourceX + control} ${sourceY}, ${targetX - control} ${targetY}, ${targetX} ${targetY}" marker-end="url(#${markerId})"></path>
+          ${count > 1 ? `<g class="tech-tree-edge-count" transform="translate(${labelX} ${labelY})"><rect x="-13" y="-9" width="26" height="17"></rect><text y="4">x${count}</text></g>` : ""}
+        </g>`;
+    };
+    const sharedEdgeMarkup = (place, x, y, role) => {
+      const markerId = role === "input" ? inputMarkerId : outputMarkerId;
+      const count = role === "input" ? place.inputCount : place.outputCount;
+      const transitionCenterX = transitionX + transitionWidth / 2;
+      const transitionBottomY = transitionY + transitionHeight;
+      const placeCenterX = x + placeWidth / 2;
+      const placeTopY = y;
+      const sourceX = role === "input" ? placeCenterX : transitionCenterX;
+      const sourceY = role === "input" ? placeTopY : transitionBottomY;
+      const targetX = role === "input" ? transitionCenterX : placeCenterX;
+      const targetY = role === "input" ? transitionBottomY : placeTopY;
+      const busY = sideHeight + 8;
+      const lane = role === "input" ? -8 : 8;
+      const labelX = (sourceX + targetX) / 2 + lane;
+      const labelY = busY + (role === "input" ? -7 : 9);
+      return `
+        <g class="tech-tree-edge tech-tree-edge-${role}" aria-hidden="true">
+          <path d="M ${sourceX} ${sourceY} C ${sourceX + lane} ${busY}, ${targetX + lane} ${busY}, ${targetX} ${targetY}" marker-end="url(#${markerId})"></path>
+          ${count > 1 ? `<g class="tech-tree-edge-count" transform="translate(${labelX} ${labelY})"><rect x="-13" y="-9" width="26" height="17"></rect><text y="4">x${count}</text></g>` : ""}
+        </g>`;
+    };
+
+    const parts = [`
+      <svg class="action-tech-tree-portal" viewBox="0 0 ${width} ${height}" width="${width}" height="${height}" role="img" aria-labelledby="${titleId} ${descriptionId}" preserveAspectRatio="xMidYMid meet">
+        <title id="${titleId}">${escapeHtml(action.action?.name || "Action")} direct action relationships</title>
+        <desc id="${descriptionId}">Only this action transition and its directly adjacent required and produced class states are shown. Inputs are on the left, outputs are on the right, and states used on both sides appear once beneath the transition with two arcs.</desc>
+        <defs>
+          <marker id="${inputMarkerId}" class="tech-tree-marker tech-tree-marker-input" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z"></path></marker>
+          <marker id="${outputMarkerId}" class="tech-tree-marker tech-tree-marker-output" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z"></path></marker>
+        </defs>`];
+
+    inputs.forEach((place, index) => {
+      const y = rowY(index, inputs.length);
+      parts.push(edgeMarkup(inputX + placeWidth, y + placeHeight / 2, transitionX, transitionY + transitionHeight / 2, "input", place.inputCount));
+    });
+    outputs.forEach((place, index) => {
+      const y = rowY(index, outputs.length);
+      parts.push(edgeMarkup(transitionX + transitionWidth, transitionY + transitionHeight / 2, outputX, y + placeHeight / 2, "output", place.outputCount));
+    });
+    shared.forEach((place, index) => {
+      const position = sharedPosition(index);
+      parts.push(sharedEdgeMarkup(place, position.x, position.y, "input"));
+      parts.push(sharedEdgeMarkup(place, position.x, position.y, "output"));
+    });
+
+    inputs.forEach((place, index) => parts.push(placeMarkup(place, inputX, rowY(index, inputs.length))));
+    outputs.forEach((place, index) => parts.push(placeMarkup(place, outputX, rowY(index, outputs.length))));
+    shared.forEach((place, index) => {
+      const position = sharedPosition(index);
+      parts.push(placeMarkup(place, position.x, position.y));
+    });
+    if (!(action.totalInputs || []).length) parts.push(`<text class="tech-tree-empty" x="${inputX + placeWidth / 2}" y="${sideHeight / 2}" text-anchor="middle">NO INPUTS</text>`);
+    if (!(action.totalOutputs || []).length) parts.push(`<text class="tech-tree-empty" x="${outputX + placeWidth / 2}" y="${sideHeight / 2}" text-anchor="middle">NO OUTPUTS</text>`);
+
+    const transitionLines = techTreeNodeLabelLines(action.action?.name || "Action", 16);
+    const transitionLineStart = transitionLines.length > 1 ? 19 : 25;
+    const tokensAvailable = actionReady(action);
+    const transitionStatus = runState.loading
+      ? "CHECKING"
+      : runState.error
+        ? "CHECK FAILED"
+        : runState.canRun
+          ? "READY TO RUN"
+          : runState.feasible === false
+            ? "NOT FEASIBLE"
+            : tokensAvailable
+              ? "TOKENS AVAILABLE"
+              : "NEEDS TOKENS";
+    parts.push(`
+      <g class="tech-tree-node-transition${runState.canRun ? " is-ready" : ""}" transform="translate(${transitionX} ${transitionY})" aria-hidden="true">
+        <path class="tech-tree-node-frame" d="M 8 0 H ${transitionWidth - 8} L ${transitionWidth} 8 V ${transitionHeight - 8} L ${transitionWidth - 8} ${transitionHeight} H 8 L 0 ${transitionHeight - 8} V 8 Z"></path>
+        <text class="tech-tree-node-label" x="${transitionWidth / 2}" y="${transitionLineStart}" text-anchor="middle">${transitionLines.map((line, index) => `<tspan x="${transitionWidth / 2}" dy="${index ? 12 : 0}">${escapeHtml(line)}</tspan>`).join("")}</text>
+        <text class="tech-tree-node-status" x="${transitionWidth / 2}" y="${transitionHeight - 7}" text-anchor="middle">${transitionStatus}</text>
+      </g>
+      </svg>`);
+
+    return `
+      <div class="game-panel action-tech-tree-panel">
+        <div class="game-panel-header"><h3>Action tech-tree portal</h3><span>Direct relationships only</span></div>
+        <div class="game-panel-body"><div class="action-tech-tree-viewport" tabindex="0" role="region" aria-label="Scrollable direct action relationship graph">${parts.join("")}</div></div>
+      </div>`;
+  }
+
   function renderActionDrawer(action, model) {
     const used = new Set(model.selections.filter(Boolean));
     const slots = (action.totalInputs || []).map((required, index) => {
@@ -2436,6 +2827,7 @@
             <button class="game-button game-button-primary" type="submit"${canRun ? "" : " disabled"}>Run action</button>
           </div>
         </form>
+        ${renderActionTechTreePortal(action, { canRun, loading: model.loading, error: Boolean(model.error), feasible: model.report?.feasible })}
       </div>`;
   }
 
@@ -2502,14 +2894,23 @@
       return !query || object.class?.name?.toLowerCase().includes(query) || object.fileName?.toLowerCase().includes(query) || object.contentHash?.toLowerCase().includes(query);
     });
     const visible = filtered.slice(0, state.objectLimit);
-    const cards = visible.map((object) => `
-      <button class="object-card menu-focusable" type="button" data-command="view-object" data-id="${escapeHtml(object.fileName)}">
-        <span class="card-orb" aria-hidden="true">${escapeHtml(object.emoji || "OBJ")}</span>
-        <span class="active-marker">${escapeHtml(object.status || "unknown")}</span>
-        <span class="card-title">${escapeHtml(object.class?.name || "Unknown object")}</span>
-        <span class="card-copy mono">${escapeHtml(shortText(object.contentHash, 10, 7))}</span>
-        <span class="card-footer-line"><span>${escapeHtml(object.class?.pluginName || "")}</span><span>${escapeHtml(object.status || "unknown")}</span></span>
-      </button>`).join("");
+    const cards = visible.map((object) => {
+      const status = String(object.status || "unknown").toLowerCase();
+      const statusKey = new Set(["live", "pending", "nullified", "unknown"]).has(status) ? status : "unknown";
+      const name = object.class?.name || "Unknown object";
+      const shortHash = shortText(object.contentHash, 7, 5);
+      const accessibleHash = shortText(object.contentHash, 10, 7);
+      const ariaLabel = `${name}. ${statusKey}. Object ${accessibleHash}. Open object details.`;
+      return `
+        <button class="object-card compact-card menu-focusable" type="button" data-command="view-object" data-id="${escapeHtml(object.fileName)}" aria-label="${escapeHtml(ariaLabel)}" title="${escapeHtml(object.fileName || ariaLabel)}">
+          <span class="compact-card-top">
+            <span class="card-orb" aria-hidden="true">${escapeHtml(object.emoji || "OBJ")}</span>
+            <span class="card-status is-${statusKey}">${escapeHtml(statusKey)}</span>
+          </span>
+          <span class="card-title">${escapeHtml(name)}</span>
+          <span class="compact-card-meta mono" aria-hidden="true"><span>${escapeHtml(shortHash)}</span><span>Open</span></span>
+        </button>`;
+    }).join("");
     return `${state.workspace.errors.objects
       ? errorPanel("Objects unavailable", state.workspace.errors.objects)
       : visible.length
@@ -3215,11 +3616,13 @@
         break;
       case "tree":
         state.techTree.mode = "all";
+        state.techTree.objectFileName = "";
         state.techTree.selectedNodeId = "";
         navigate("tree");
         break;
       case "tree-mode":
         state.techTree.mode = element.dataset.value === "object" ? "object" : "all";
+        if (state.techTree.mode === "all") state.techTree.objectFileName = "";
         state.techTree.selectedNodeId = "";
         state.techTree.viewKey = "";
         render();
@@ -3232,6 +3635,9 @@
         break;
       case "tree-zoom-out":
         zoomTechTree(1.28);
+        break;
+      case "tree-fullscreen":
+        await toggleTechTreeFullscreen();
         break;
       case "filter-actions":
         state.actionFilter = element.dataset.value || "all";
@@ -3378,6 +3784,17 @@
   });
 
   main.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && techTreeFullscreenElement()?.id === "tech-tree-canvas") {
+      return;
+    }
+    if (event.key === "Escape" && state.techTree.fullscreenFallback) {
+      event.preventDefault();
+      event.stopPropagation();
+      state.techTree.fullscreenFallback = false;
+      state.techTree.fullscreenRequestPending = false;
+      syncTechTreeFullscreenUi();
+      return;
+    }
     const treeNode = event.target.closest?.("[data-tree-node-id]");
     if (!treeNode) return;
     if (event.key === "Enter" || event.key === " ") {
@@ -3395,9 +3812,7 @@
     if (event.key === "Escape" && state.techTree.selectedNodeId) {
       event.preventDefault();
       event.stopPropagation();
-      state.techTree.selectedNodeId = "";
-      main.querySelectorAll("[data-tree-node-id]").forEach((node) => node.classList.remove("is-selected"));
-      updateTechTreeDetails();
+      clearTechTreeRelationshipFocus();
     }
   });
 
@@ -3470,9 +3885,18 @@
   });
 
   window.addEventListener("keydown", (event) => {
+    if (trapTechTreeFullscreenFocus(event)) return;
     const editing = event.target.matches("input, textarea, select, [contenteditable='true']");
     if (event.key === "Escape") {
+      if (techTreeFullscreenElement()?.id === "tech-tree-canvas") return;
       event.preventDefault();
+      if (state.techTree.fullscreenFallback) {
+        state.techTree.fullscreenFallback = false;
+        state.techTree.fullscreenRequestPending = false;
+        syncTechTreeFullscreenUi();
+        return;
+      }
+      if (!state.drawer && state.screen === "tree" && clearTechTreeRelationshipFocus()) return;
       navigateBack();
       return;
     }
@@ -3489,6 +3913,11 @@
       moveMenuFocus(-1);
     }
   });
+
+  document.addEventListener("fullscreenchange", handleTechTreeFullscreenChange);
+  document.addEventListener("webkitfullscreenchange", handleTechTreeFullscreenChange);
+  document.addEventListener("fullscreenerror", handleTechTreeFullscreenError);
+  document.addEventListener("webkitfullscreenerror", handleTechTreeFullscreenError);
 
   document.addEventListener("visibilitychange", () => {
     if (!document.hidden) void probeAllConnections();
