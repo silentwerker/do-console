@@ -1827,9 +1827,7 @@
   function techTreeLineage(model, nodeId) {
     if (!model?.nodeById.has(nodeId)) return null;
     const incoming = new Map(model.nodes.map((node) => [node.id, []]));
-    const outgoing = new Map(model.nodes.map((node) => [node.id, []]));
     for (const edge of model.edges) {
-      outgoing.get(edge.source)?.push(edge);
       incoming.get(edge.target)?.push(edge);
     }
 
@@ -1837,28 +1835,23 @@
     const edgeIds = new Set();
     const directNodeIds = new Set();
     const directEdgeIds = new Set();
-    for (const edge of [...(incoming.get(nodeId) || []), ...(outgoing.get(nodeId) || [])]) {
+    for (const edge of incoming.get(nodeId) || []) {
       directEdgeIds.add(edge.id);
-      directNodeIds.add(edge.source === nodeId ? edge.target : edge.source);
+      directNodeIds.add(edge.source);
     }
 
-    const walk = (adjacency, endpoint) => {
-      const visited = new Set([nodeId]);
-      const queue = [nodeId];
-      for (let cursor = 0; cursor < queue.length; cursor += 1) {
-        const current = queue[cursor];
-        for (const edge of adjacency.get(current) || []) {
-          edgeIds.add(edge.id);
-          const next = edge[endpoint];
-          nodeIds.add(next);
-          if (visited.has(next)) continue;
-          visited.add(next);
-          queue.push(next);
-        }
+    const visited = new Set([nodeId]);
+    const queue = [nodeId];
+    for (let cursor = 0; cursor < queue.length; cursor += 1) {
+      const current = queue[cursor];
+      for (const edge of incoming.get(current) || []) {
+        edgeIds.add(edge.id);
+        nodeIds.add(edge.source);
+        if (visited.has(edge.source)) continue;
+        visited.add(edge.source);
+        queue.push(edge.source);
       }
-    };
-    walk(outgoing, "target");
-    walk(incoming, "source");
+    }
     return { nodeIds, edgeIds, directNodeIds, directEdgeIds };
   }
 
@@ -2043,7 +2036,7 @@
       }
       return `
         <div class="tech-tree-detail-heading"><div><span class="tech-tree-detail-kind">Graph inspector</span><h2>Select a node</h2></div></div>
-        <p class="tech-tree-detail-copy">Choose a class state or action transition to isolate its upstream and downstream lineage. Choose it again to clear the trace.</p>`;
+        <p class="tech-tree-detail-copy">Choose a class state or action transition to isolate only the prerequisite steps that can lead to it. Choose it again to clear the trace.</p>`;
     }
 
     if (selected.kind === "transition") {
@@ -2150,7 +2143,7 @@
               <title id="tech-tree-svg-title">${escapeHtml(cartridge.name)} action dependency graph</title>
               <desc id="tech-tree-svg-description">Class states connect to action transitions through required input and produced output arcs.</desc>
             </svg>
-            <span class="tech-tree-map-help" aria-hidden="true">Click: trace / again: clear / drag: pan / wheel: zoom</span>
+            <span class="tech-tree-map-help" aria-hidden="true">Click: trace prerequisites / again: clear / drag: pan / wheel: zoom</span>
           </div>
           <div id="tech-tree-details" class="tech-tree-details" aria-live="polite"></div>
           <div class="terminal-note tech-tree-truth-note">This map uses the Driver's public, flattened action signatures. Object branches are possible transitions, not disclosed private provenance or hidden sub-action internals.</div>
@@ -2334,7 +2327,7 @@
     root.dataset.treeFingerprint = model.fingerprint;
     const accessibleMarkup = `
       <title id="tech-tree-svg-title">${escapeHtml(model.cartridge.name)} action dependency graph</title>
-      <desc id="tech-tree-svg-description">Class states connect to action transitions through required input and produced output arcs. Select a node to emphasize its upstream and downstream relationships; select it again to clear the emphasis.</desc>`;
+      <desc id="tech-tree-svg-description">Class states connect to action transitions through required input and produced output arcs. Select a node to emphasize only the prerequisite steps that can lead to it; select it again to clear the emphasis.</desc>`;
     svg.innerHTML = accessibleMarkup + (model.nodes.length
       ? drawTechTreeSvg(model, layout)
       : '<text class="tech-tree-empty" x="20" y="40">No classes or actions are available for this cartridge.</text>');
