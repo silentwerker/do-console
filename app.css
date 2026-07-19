@@ -1274,6 +1274,106 @@ button {
   color: var(--coral);
 }
 
+.home-cwi-prompt {
+  position: relative;
+  min-width: 0;
+  overflow: hidden;
+  border: 2px solid var(--lcd-line);
+  background:
+    repeating-linear-gradient(0deg, transparent 0 5px, var(--screen-grid) 5px 6px),
+    var(--lcd-deep);
+  box-shadow:
+    inset 5px 0 0 var(--amber),
+    3px 3px 0 var(--hard-shadow);
+}
+
+.home-cwi-content {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: 38px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px 12px;
+  padding: 10px 12px 10px 16px;
+}
+
+.home-cwi-mark {
+  display: grid;
+  width: 38px;
+  height: 36px;
+  place-items: center;
+  border: 1px solid var(--amber-dark);
+  background: var(--lcd-raised);
+  box-shadow: 2px 2px 0 var(--amber-dark);
+  color: var(--amber);
+  font-size: 8px;
+  font-weight: 900;
+  letter-spacing: 0.08em;
+}
+
+.home-cwi-copy {
+  min-width: 0;
+}
+
+.home-cwi-kicker {
+  display: block;
+  margin-bottom: 2px;
+  color: var(--amber);
+  font-size: 8px;
+  font-weight: 900;
+  letter-spacing: 0.11em;
+  text-transform: uppercase;
+}
+
+.home-cwi-copy h2,
+.home-cwi-copy p {
+  margin: 0;
+}
+
+.home-cwi-copy h2 {
+  color: var(--lcd-text);
+  font-size: 12px;
+  letter-spacing: 0.06em;
+  line-height: 1.2;
+  text-transform: uppercase;
+}
+
+.home-cwi-copy p {
+  margin-top: 3px;
+  color: var(--lcd-muted);
+  font-size: 9px;
+  line-height: 1.45;
+}
+
+.home-cwi-content > .game-button {
+  min-width: 126px;
+}
+
+.home-cwi-track {
+  height: 7px;
+  margin-top: 7px;
+}
+
+.home-cwi-prompt[data-cwi-state="ready"] {
+  box-shadow:
+    inset 5px 0 0 var(--teal),
+    3px 3px 0 var(--hard-shadow);
+}
+
+.home-cwi-prompt[data-cwi-state="ready"] .home-cwi-mark {
+  border-color: var(--teal-dark);
+  box-shadow: 2px 2px 0 var(--teal-dark);
+  color: var(--teal);
+}
+
+.home-cwi-prompt[data-cwi-state="error"] .home-cwi-copy p {
+  color: var(--coral);
+}
+
+[data-hardware-index]:focus-visible {
+  outline: 2px solid var(--amber);
+  outline-offset: 3px;
+}
+
 .theme-option {
   --theme-swatch: var(--teal);
   width: 22px;
@@ -3613,6 +3713,22 @@ body.drawer-open {
       4px 4px 0 var(--hard-shadow);
   }
 
+  .home-cwi-content {
+    grid-template-columns: 34px minmax(0, 1fr);
+    gap: 9px 10px;
+    padding: 10px 10px 10px 14px;
+  }
+
+  .home-cwi-mark {
+    width: 34px;
+    height: 34px;
+  }
+
+  .home-cwi-content > .game-button {
+    width: 100%;
+    grid-column: 1 / -1;
+  }
+
   .screen-heading,
   .game-toolbar {
     align-items: stretch;
@@ -3865,6 +3981,7 @@ body.drawer-open {
   .action-card,
   .object-card,
   .game-panel,
+  .home-cwi-prompt,
   .drawer,
   .toast {
     box-shadow: none;

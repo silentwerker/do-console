@@ -10,12 +10,14 @@
   const STORAGE_KEY = "don.lightConsole.config.v1";
   const HARDWARE_INDEX_VERSION = 1;
   const HARDWARE_INDEX_BENCHMARK_ID = "browser-mix-v1";
-  const HARDWARE_INDEX_STORAGE_KEY = "don.lightConsole.clientWorkIndex.v1";
+  const HARDWARE_INDEX_SCOPE = "browser-runtime-single-worker-synthetic";
+  const LEGACY_HARDWARE_INDEX_STORAGE_KEY = "don.lightConsole.clientWorkIndex.v1";
   const HARDWARE_INDEX_SEARCH_REFERENCE = 100_000_000;
   const HARDWARE_INDEX_SEQUENTIAL_REFERENCE = 1_000_000;
   const HANDLE_DB = "don-light-console";
   const HANDLE_STORE = "handles";
   const HANDLE_KEY = "config";
+  let legacyHardwareIndexMigrationPending = false;
   const TERMINAL_RUNS = new Set(["succeeded", "failed"]);
   const DEFAULT_SYNCHRONIZER = "https://synchronizer.don.pateldhvani.com";
   const DEFAULT_RELAYER = "https://relayer.don.pateldhvani.com";
@@ -89,6 +91,7 @@
       connections: [defaultConnection()],
       activeCartridgeByConnection: {},
       recentRunIdsByConnection: {},
+      clientWorkIndex: null,
       ui: { lastScreen: "home", theme: "desk-classic", soundsMuted: false, music: { lastTrack: "" } },
     };
   }
@@ -153,6 +156,7 @@
               ]),
             )
           : {},
+      clientWorkIndex: normalizeHardwareIndex(source.clientWorkIndex),
       ui: {
         lastScreen: String(source.ui?.lastScreen || "home"),
         theme: THEME_IDS.has(source.ui?.theme) ? source.ui.theme : "desk-classic",
@@ -168,19 +172,26 @@
     try {
       const raw = localStorage.getItem(STORAGE_KEY);
       if (raw) {
-        return normalizeConfig(JSON.parse(raw));
+        const source = JSON.parse(raw);
+        const config = normalizeConfig(source);
+        adoptLegacyHardwareIndex(config);
+        return config;
       }
-      return defaultConfig();
+      const config = defaultConfig();
+      adoptLegacyHardwareIndex(config);
+      return config;
     } catch (error) {
       console.warn("Could not load saved console config", error);
-      return defaultConfig();
+      const config = defaultConfig();
+      adoptLegacyHardwareIndex(config);
+      return config;
     }
   }
 
   function normalizeHardwareIndex(value) {
     if (!value || value.version !== HARDWARE_INDEX_VERSION || value.benchmarkId !== HARDWARE_INDEX_BENCHMARK_ID) return null;
-    const searchRate = Number(value.searchRate);
-    const sequentialRate = Number(value.sequentialRate);
+    const reportedSearchRate = Number(value.searchRate);
+    const reportedSequentialRate = Number(value.sequentialRate);
     const durationMs = Number(value.durationMs);
     const measuredAt = String(value.measuredAt || "");
     const normalizeSamples = (samples) => Array.isArray(samples)
@@ -189,17 +200,22 @@
     const searchSamples = normalizeSamples(value.searchSamples);
     const sequentialSamples = normalizeSamples(value.sequentialSamples);
     if (
-      !Number.isFinite(searchRate) || searchRate <= 0 ||
-      !Number.isFinite(sequentialRate) || sequentialRate <= 0 ||
+      !Number.isFinite(reportedSearchRate) || reportedSearchRate <= 0 ||
+      !Number.isFinite(reportedSequentialRate) || reportedSequentialRate <= 0 ||
       !Number.isFinite(durationMs) || durationMs <= 0 ||
       searchSamples.length !== 3 || sequentialSamples.length !== 3 ||
       Number.isNaN(new Date(measuredAt).valueOf())
     ) return null;
+    const median = (samples) => [...samples].sort((left, right) => left - right)[1];
+    const searchRate = median(searchSamples);
+    const sequentialRate = median(sequentialSamples);
     const score = hardwareIndexScore(searchRate, sequentialRate);
     if (!Number.isFinite(score)) return null;
     return {
       version: HARDWARE_INDEX_VERSION,
       benchmarkId: HARDWARE_INDEX_BENCHMARK_ID,
+      scope: HARDWARE_INDEX_SCOPE,
+      workerCount: 1,
       score,
       searchRate,
       sequentialRate,
@@ -211,28 +227,126 @@
     };
   }
 
-  function loadHardwareIndex() {
+  function loadLegacyHardwareIndex() {
     try {
-      return normalizeHardwareIndex(JSON.parse(localStorage.getItem(HARDWARE_INDEX_STORAGE_KEY) || "null"));
+      return normalizeHardwareIndex(JSON.parse(localStorage.getItem(LEGACY_HARDWARE_INDEX_STORAGE_KEY) || "null"));
     } catch {
       return null;
     }
   }
 
-  function persistHardwareIndex(result) {
+  function adoptLegacyHardwareIndex(config) {
+    const legacyResult = loadLegacyHardwareIndex();
+    if (legacyResult) {
+      config.clientWorkIndex = newestHardwareIndex(config.clientWorkIndex, legacyResult);
+      legacyHardwareIndexMigrationPending = true;
+    }
+  }
+
+  function hardwareIndexTimestamp(result) {
+    const timestamp = new Date(result?.measuredAt || "").valueOf();
+    return Number.isFinite(timestamp) ? timestamp : -Infinity;
+  }
+
+  function hardwareIndexFingerprint(result) {
+    const normalized = normalizeHardwareIndex(result);
+    return normalized ? JSON.stringify(normalized) : "";
+  }
+
+  function compareHardwareIndexes(left, right) {
+    const timestampDifference = hardwareIndexTimestamp(left) - hardwareIndexTimestamp(right);
+    if (timestampDifference) return timestampDifference;
+    const leftFingerprint = hardwareIndexFingerprint(left);
+    const rightFingerprint = hardwareIndexFingerprint(right);
+    return leftFingerprint === rightFingerprint ? 0 : leftFingerprint > rightFingerprint ? 1 : -1;
+  }
+
+  function sameHardwareIndex(left, right) {
+    return hardwareIndexFingerprint(left) === hardwareIndexFingerprint(right);
+  }
+
+  function newestHardwareIndex(...results) {
+    return results.reduce((latest, value) => {
+      const candidate = normalizeHardwareIndex(value);
+      return candidate && compareHardwareIndexes(candidate, latest) > 0 ? candidate : latest;
+    }, null);
+  }
+
+  function loadStoredHardwareIndex() {
     try {
-      localStorage.setItem(HARDWARE_INDEX_STORAGE_KEY, JSON.stringify(result));
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (!raw) return null;
+      return normalizeHardwareIndex(JSON.parse(raw)?.clientWorkIndex);
+    } catch {
+      return null;
+    }
+  }
+
+  function repairStoredHardwareIndex(configSource, result) {
+    try {
+      const source = configSource && typeof configSource === "object" && !Array.isArray(configSource)
+        ? configSource
+        : state.config;
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({ ...source, clientWorkIndex: result }));
       return true;
     } catch {
-      // The result remains available for this tab if browser storage is unavailable.
       return false;
     }
   }
 
-  const savedHardwareIndex = loadHardwareIndex();
+  function loadStoredConfigSnapshot(fallbackConfig) {
+    const fallback = fallbackConfig && typeof fallbackConfig === "object" && !Array.isArray(fallbackConfig)
+      ? fallbackConfig
+      : state.config;
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (!raw) return { config: fallback, result: null };
+      const parsed = JSON.parse(raw);
+      const validConfig = parsed && typeof parsed === "object" && !Array.isArray(parsed);
+      const config = validConfig ? parsed : fallback;
+      return { config, result: validConfig ? normalizeHardwareIndex(parsed.clientWorkIndex) : null };
+    } catch {
+      return { config: fallback, result: null };
+    }
+  }
+
+  function synchronizeHardwareIndexFromStorage(candidateResult, fallbackConfig) {
+    const currentResult = normalizeHardwareIndex(state.hardwareIndex.result);
+    const snapshot = loadStoredConfigSnapshot(fallbackConfig);
+    const result = newestHardwareIndex(currentResult, candidateResult, snapshot.result);
+    if (!result) return false;
+
+    const resultChanged = !sameHardwareIndex(result, currentResult);
+    const wasPersistent = state.hardwareIndex.persistent;
+    const alreadyStored = sameHardwareIndex(snapshot.result, result);
+    const persistent = alreadyStored || repairStoredHardwareIndex(snapshot.config, result);
+    const homePromptVisible = resultChanged && Boolean(document.querySelector('[data-hardware-index-view="home"]'));
+
+    state.config.clientWorkIndex = result;
+    state.hardwareIndex.result = result;
+    state.hardwareIndex.persistent = persistent;
+    if (resultChanged && state.hardwareIndex.status !== "running") {
+      state.hardwareIndex.status = "ready";
+      state.hardwareIndex.error = "";
+    }
+    patchCurrentConfigPreview();
+    if (homePromptVisible) {
+      toast("Client work index updated", `CWI-1 ${result.score.toLocaleString()} / ${persistent ? "saved in browser config" : "this tab only"}`, "success");
+    }
+    if (resultChanged || persistent !== wasPersistent) patchHardwareIndex();
+    return persistent;
+  }
+
+  function persistHardwareIndex(result) {
+    state.config.clientWorkIndex = result;
+    return persistConfig(false, false);
+  }
+
+  const initialConfig = loadConfig();
+  const savedHardwareIndex = initialConfig.clientWorkIndex;
 
   const state = {
-    config: loadConfig(),
+    config: initialConfig,
     screen: "home",
     statuses: new Map(),
     workspace: emptyWorkspace(),
@@ -451,21 +565,61 @@
     };
   }
 
-  function persistConfig(writeLinkedFile = true) {
+  function patchCurrentConfigPreview() {
+    document.querySelectorAll("[data-current-config]").forEach((preview) => {
+      preview.textContent = JSON.stringify(state.config, null, 2);
+    });
+  }
+
+  function persistConfig(writeLinkedFile = true, patchHardwareIndexUi = true) {
+    const previousResult = state.hardwareIndex?.result || null;
+    const previousPersistent = Boolean(state.hardwareIndex?.persistent);
     state.config = normalizeConfig(state.config);
+    const storedResult = loadStoredHardwareIndex();
+    const mergedResult = newestHardwareIndex(
+      state.config.clientWorkIndex,
+      state.hardwareIndex?.result,
+      storedResult,
+    );
+    state.config.clientWorkIndex = mergedResult;
+    if (state.hardwareIndex && compareHardwareIndexes(mergedResult, previousResult) > 0) {
+      state.hardwareIndex.result = mergedResult;
+      if (state.hardwareIndex.status !== "running") {
+        state.hardwareIndex.status = "ready";
+        state.hardwareIndex.error = "";
+      }
+    }
     applyTheme(state.config.ui.theme);
     updateMusicUi();
     updateUiSoundUi();
+    let saved = true;
     try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(state.config));
     } catch (error) {
+      saved = false;
       toast("Config was not saved", error.message, "error");
     }
+    if (saved) {
+      if (state.hardwareIndex?.result && mergedResult) state.hardwareIndex.persistent = true;
+      try {
+        localStorage.removeItem(LEGACY_HARDWARE_INDEX_STORAGE_KEY);
+        legacyHardwareIndexMigrationPending = false;
+      } catch {
+        // A leftover legacy record is harmless because the config field takes precedence.
+      }
+    }
     if (writeLinkedFile && state.linkedConfigHandle) scheduleLinkedConfigWrite();
+    patchCurrentConfigPreview();
+    const resultChanged = !sameHardwareIndex(state.hardwareIndex?.result, previousResult);
+    const persistenceChanged = Boolean(state.hardwareIndex?.persistent) !== previousPersistent;
+    if (patchHardwareIndexUi && (resultChanged || persistenceChanged)) patchHardwareIndex();
+    return saved;
   }
 
   function configText() {
-    return `${JSON.stringify(state.config, null, 2)}\n`;
+    const portableConfig = { ...state.config };
+    delete portableConfig.clientWorkIndex;
+    return `${JSON.stringify(portableConfig, null, 2)}\n`;
   }
 
   function openHandleDatabase() {
@@ -708,7 +862,9 @@
   }
 
   async function applyImportedConfig(text, handle = null) {
+    const localClientWorkIndex = state.config.clientWorkIndex;
     const parsed = normalizeConfig(JSON.parse(text));
+    parsed.clientWorkIndex = localClientWorkIndex;
     state.config = parsed;
     applyTheme(parsed.ui.theme);
     if (handle) await rememberConfigHandle(handle);
@@ -1285,15 +1441,16 @@
     return `
       <section class="game-screen" aria-labelledby="home-title">
         ${screenHeading("Console", "Main Menu", subtitle)}
-        <nav class="home-menu home-menu-simple" aria-label="Main menu">
-          <div class="home-menu-list">
+        <div class="home-menu home-menu-simple">
+          <nav class="home-menu-list" aria-label="Main menu">
             ${menuTile("cartridges", "PLAY", "Play Cartridge", cartridge
               ? `Choose ${cartridge.name} to play, switch cartridges, or load a new .pexe file.`
               : "Choose an installed cartridge or load a new .pexe file.", { className: "menu-tile-primary", meta: cartridge ? "Ready" : "Select" })}
             ${menuTile("connections", "NET", "Connections", "Choose, add, edit, remove, or configure Driver connections.", { className: "menu-tile-network", meta: `${state.config.connections.length} saved` })}
             ${menuTile("config", "CFG", "Menu Config", "Open, save, reset, or link portable console settings.", { className: "menu-tile-settings", meta: state.linkedConfigName ? "Linked" : "Browser" })}
-          </div>
           </nav>
+          ${!state.hardwareIndex.result || state.hardwareIndex.status === "running" ? homeHardwareIndexRegionMarkup() : ""}
+        </div>
         ${!online && status.error ? `<div class="terminal-note error">${escapeHtml(status.error)}</div>` : ""}
       </section>`;
   }
@@ -1889,6 +2046,56 @@
     return `${Math.round(value).toLocaleString()}/s`;
   }
 
+  function homeHardwareIndexContentMarkup() {
+    const benchmark = state.hardwareIndex;
+    const result = benchmark.result;
+    const running = benchmark.status === "running";
+    const failed = benchmark.status === "error" && !result;
+    const title = running
+      ? "Checking this browser"
+      : result
+        ? benchmark.persistent ? `CWI-1 ${result.score.toLocaleString()} stored` : `CWI-1 ${result.score.toLocaleString()} ready`
+        : failed
+          ? "Client check unavailable"
+          : "Client index not set";
+    const copy = running
+      ? "Six quick samples are running off the main UI thread. Keep this tab visible."
+      : result
+        ? benchmark.persistent
+          ? `Saved in this browser config / ${result.stability} samples. Open Menu Config for the component rates.`
+          : "Browser storage was unavailable. This result is available for this tab only."
+        : failed
+          ? benchmark.error
+          : "Optional one-second browser check. No Driver request or action-time estimate.";
+    let button;
+    if (running) {
+      button = '<button class="game-button menu-focusable" type="button" data-command="run-hardware-index" data-hardware-index-focus aria-label="Client work index check running" aria-describedby="home-cwi-help" disabled>Testing...</button>';
+    } else if (result) {
+      button = '<button class="game-button menu-focusable" type="button" data-command="config" data-hardware-index-focus aria-label="Open client work index details">View details</button>';
+    } else {
+      const buttonText = failed ? "Retry" : "Run check";
+      const buttonLabel = failed ? "Retry client work index check" : "Run client work index check";
+      button = `<button class="game-button menu-focusable" type="button" data-command="run-hardware-index" data-hardware-index-focus aria-label="${buttonLabel}" aria-describedby="home-cwi-help">${buttonText}</button>`;
+    }
+    return `
+      <span class="home-cwi-mark" aria-hidden="true">CWI</span>
+      <div class="home-cwi-copy">
+        <span class="home-cwi-kicker">Local calibration</span>
+        <h2 id="home-cwi-title">${escapeHtml(title)}</h2>
+        <p id="home-cwi-help">${escapeHtml(copy)}</p>
+        ${running ? '<div class="run-request-track home-cwi-track" role="progressbar" aria-label="Running client work index"><span></span></div>' : ""}
+      </div>
+      ${button}`;
+  }
+
+  function homeHardwareIndexRegionMarkup() {
+    return `
+      <section class="home-cwi-prompt" id="home-cwi-prompt" tabindex="-1" data-hardware-index data-hardware-index-view="home" data-cwi-state="${state.hardwareIndex.status}" aria-labelledby="home-cwi-title">
+        <span class="sr-only" data-hardware-index-announcement aria-live="polite" aria-atomic="true">${escapeHtml(hardwareIndexAnnouncement())}</span>
+        <div class="home-cwi-content" data-hardware-index-content aria-busy="${state.hardwareIndex.status === "running"}">${homeHardwareIndexContentMarkup()}</div>
+      </section>`;
+  }
+
   function hardwareIndexContentMarkup() {
     const benchmark = state.hardwareIndex;
     const result = benchmark.result;
@@ -1905,7 +2112,7 @@
       const sequentialIndex = Math.max(1, Math.round(100 * (result.sequentialRate / HARDWARE_INDEX_SEQUENTIAL_REFERENCE)));
       const resultNote = benchmark.status === "error"
         ? `Last ${benchmark.persistent ? "saved" : "tab-only"} result retained / re-run failed: ${benchmark.error}`
-        : `Single worker / ${result.stability} samples / ${benchmark.persistent ? "saved locally" : "this tab only"} / tested ${formatDate(result.measuredAt)}`;
+        : `Single worker / ${result.stability} samples / ${benchmark.persistent ? "saved in browser config" : "this tab only"} / tested ${formatDate(result.measuredAt)}`;
       readout = `
         <div class="hardware-index-score"><span>Client work index / synthetic</span><strong>CWI-1 ${result.score.toLocaleString()}</strong><small class="hardware-index-result-note${benchmark.status === "error" ? " is-error" : ""}">${escapeHtml(resultNote)}</small></div>
         <dl class="hardware-index-metrics">
@@ -1921,7 +2128,7 @@
     return `
       <div class="hardware-index-heading">
         ${readout}
-        <button class="game-button" type="button" data-command="run-hardware-index" aria-label="${buttonAriaLabel}"${running ? " disabled" : ""}>${buttonLabel}</button>
+        <button class="game-button" type="button" data-command="run-hardware-index" data-hardware-index-focus aria-label="${buttonAriaLabel}"${running ? " disabled" : ""}>${buttonLabel}</button>
       </div>
       <p class="hardware-index-note">CWI-1 100 is a fixed v1 reference: 100M independent mixes/sec plus 1M dependent BigInt steps/sec. Higher is faster only for this synthetic browser test—not a percentile or hardware grade. It does not run a Driver request, DON proof, PoW, or VDF, and it cannot predict action time.</p>`;
   }
@@ -1932,7 +2139,7 @@
     if (benchmark.status === "running") return "Client work index test started. Keep this tab visible.";
     if (benchmark.status === "error" && result) return `Client work index re-run failed. CWI-1 ${result.score.toLocaleString()} retained. ${benchmark.error}`;
     if (benchmark.status === "error") return `Client work index failed. ${benchmark.error}`;
-    if (result) return `Client work index ready. CWI-1 ${result.score.toLocaleString()}. ${result.stability} samples. ${benchmark.persistent ? "Saved locally." : "Available for this tab only."}`;
+    if (result) return `Client work index ready. CWI-1 ${result.score.toLocaleString()}. ${result.stability} samples. ${benchmark.persistent ? "Saved in browser config." : "Available for this tab only."}`;
     return "";
   }
 
@@ -1940,6 +2147,7 @@
     const focusReturnPending = state.hardwareIndex.restoreFocus && state.hardwareIndex.status !== "running";
     const focusedElement = document.activeElement;
     const focusedInIndex = focusedElement?.closest?.("[data-hardware-index]");
+    const focusedControlWillBeReplaced = Boolean(focusedInIndex && focusedElement !== focusedInIndex);
     const focusRunningStatus = state.hardwareIndex.restoreFocus && state.hardwareIndex.status === "running" && focusedInIndex;
     const restoreFocus = focusReturnPending && (
       !focusedElement ||
@@ -1948,22 +2156,38 @@
       !focusedElement.isConnected ||
       focusedInIndex
     );
+    let removedFocusedHome = false;
     document.querySelectorAll("[data-hardware-index]").forEach((region) => {
+      if (
+        region.dataset.hardwareIndexView === "home" &&
+        state.hardwareIndex.result &&
+        state.hardwareIndex.status !== "running"
+      ) {
+        removedFocusedHome ||= focusedInIndex === region;
+        region.remove();
+        return;
+      }
       const content = region.querySelector("[data-hardware-index-content]");
       const announcement = region.querySelector("[data-hardware-index-announcement]");
-      if (content) content.innerHTML = hardwareIndexContentMarkup();
+      if (content) content.innerHTML = region.dataset.hardwareIndexView === "home"
+        ? homeHardwareIndexContentMarkup()
+        : hardwareIndexContentMarkup();
       if (announcement) announcement.textContent = hardwareIndexAnnouncement();
       if (content) content.setAttribute("aria-busy", String(state.hardwareIndex.status === "running"));
+      region.dataset.cwiState = state.hardwareIndex.status;
     });
     if (focusRunningStatus) {
-      document.querySelector("[data-hardware-index-announcement]")?.focus({ preventScroll: true });
+      focusedInIndex.focus({ preventScroll: true });
     }
     if (focusReturnPending) {
       state.hardwareIndex.restoreFocus = false;
     }
-    if (restoreFocus) {
+    const restorePatchedControl = focusedControlWillBeReplaced && !removedFocusedHome && state.hardwareIndex.status !== "running";
+    if (restoreFocus || removedFocusedHome || restorePatchedControl) {
       requestAnimationFrame(() => {
-        const button = document.querySelector('[data-hardware-index] [data-command="run-hardware-index"]');
+        const button = removedFocusedHome
+          ? document.querySelector(".home-menu-list .menu-focusable")
+          : document.querySelector("[data-hardware-index] [data-hardware-index-focus]");
         if (button && !button.disabled) button.focus({ preventScroll: true });
       });
     }
@@ -2060,11 +2284,13 @@
         stability: hardwareIndexStability(searchSamples, sequentialSamples),
       });
       if (!result) throw new Error("The benchmark result could not be normalized.");
+      const ranFromHome = Boolean(document.querySelector('[data-hardware-index-view="home"]'));
       state.hardwareIndex.status = "ready";
       state.hardwareIndex.result = result;
       state.hardwareIndex.persistent = persistHardwareIndex(result);
-      if (!document.querySelector("[data-hardware-index]")) {
-        toast("Client work index ready", `CWI-1 ${result.score.toLocaleString()} / ${state.hardwareIndex.persistent ? "saved locally" : "this tab only"}`, "success");
+      const savedResult = state.hardwareIndex.result || result;
+      if (ranFromHome || !document.querySelector("[data-hardware-index]")) {
+        toast("Client work index ready", `CWI-1 ${savedResult.score.toLocaleString()} / ${state.hardwareIndex.persistent ? "saved in browser config" : "this tab only"}`, "success");
       }
     } catch (error) {
       if (token !== state.hardwareIndex.runToken) return;
@@ -4271,19 +4497,19 @@
         <div class="game-panel hardware-index-panel">
           <div class="game-panel-header"><h2>Client work index</h2><span>Quick browser test</span></div>
           <div class="game-panel-body">
-            <p class="screen-copy hardware-index-intro">Run two brief single-worker loops to get a rough search-style and sequential-work index for this browser. The test takes about one second and needs this tab to stay visible.</p>
-            <div class="hardware-index" data-hardware-index>
-              <span class="sr-only" data-hardware-index-announcement tabindex="-1" aria-live="polite" aria-atomic="true">${escapeHtml(hardwareIndexAnnouncement())}</span>
+            <p class="screen-copy hardware-index-intro">Run two brief single-worker loops to get a rough search-style and sequential-work index for this browser. The test takes about one second and needs this tab to stay visible. When browser storage is available, its result is saved in the local config.</p>
+            <div class="hardware-index" id="config-cwi-panel" tabindex="-1" data-hardware-index data-hardware-index-view="full">
+              <span class="sr-only" data-hardware-index-announcement aria-live="polite" aria-atomic="true">${escapeHtml(hardwareIndexAnnouncement())}</span>
               <div data-hardware-index-content aria-busy="${state.hardwareIndex.status === "running"}">${hardwareIndexContentMarkup()}</div>
             </div>
           </div>
         </div>
         <div class="game-panel">
           <div class="game-panel-header"><h2>Current configuration</h2><span>version ${CONFIG_VERSION}</span></div>
-          <div class="game-panel-body"><pre class="code-block">${safeJson(state.config)}</pre></div>
+          <div class="game-panel-body"><pre class="code-block" data-current-config>${safeJson(state.config)}</pre></div>
         </div>
         <div class="terminal-note warning">
-          Browser sandbox rule: HTML cannot write arbitrary files silently. Choose a destination in the Save dialog once; Chromium-based browsers can then keep that selected config file updated while permission remains granted. Other browsers download the JSON and always retain an automatic localStorage copy.
+          Browser sandbox rule: HTML cannot write arbitrary files silently. Choose a destination in the Save dialog once; Chromium-based browsers can then keep that selected config file updated while permission remains granted. Other browsers download the JSON and retain an automatic localStorage copy when storage is available. The client work index stays in this browser's local config when possible and is not copied into portable config files.
         </div>
       </section>`;
   }
@@ -4674,7 +4900,9 @@
         break;
       case "reset-config":
         if (globalThis.confirm("Reset all connection profiles and menu selections to the local defaults?")) {
+          const localClientWorkIndex = state.config.clientWorkIndex;
           state.config = defaultConfig();
+          state.config.clientWorkIndex = localClientWorkIndex;
           persistConfig();
           resetWorkspace();
           await refreshEverything();
@@ -4850,6 +5078,33 @@
     render();
   });
 
+  window.addEventListener("storage", (event) => {
+    if (event.key === LEGACY_HARDWARE_INDEX_STORAGE_KEY && event.newValue) {
+      try {
+        const legacyResult = normalizeHardwareIndex(JSON.parse(event.newValue));
+        const saved = synchronizeHardwareIndexFromStorage(legacyResult, state.config);
+        if (saved) {
+          try {
+            localStorage.removeItem(LEGACY_HARDWARE_INDEX_STORAGE_KEY);
+          } catch {
+            // The main local config is already authoritative.
+          }
+        }
+      } catch {
+        // Ignore malformed legacy benchmark updates.
+      }
+      return;
+    }
+    if (event.key !== STORAGE_KEY || !event.newValue) return;
+    try {
+      const incomingConfig = JSON.parse(event.newValue);
+      const incomingResult = normalizeHardwareIndex(incomingConfig?.clientWorkIndex);
+      synchronizeHardwareIndexFromStorage(incomingResult, incomingConfig);
+    } catch {
+      // Ignore malformed or unrelated local config updates from another tab.
+    }
+  });
+
   window.addEventListener("keydown", (event) => {
     if (trapTechTreeFullscreenFocus(event)) return;
     const editing = event.target.matches("input, textarea, select, [contenteditable='true']");
@@ -4891,6 +5146,7 @@
 
   async function start() {
     await restoreLinkedConfigHandle();
+    if (legacyHardwareIndexMigrationPending) persistConfig(false);
     updateUiSoundUi();
     updateMusicUi();
     void initializeMusic();
