@@ -882,6 +882,7 @@ button {
   position: relative;
   z-index: 1;
   width: auto;
+  min-width: 0;
   min-height: 0;
   padding: clamp(22px, 3.5vh, 42px) clamp(16px, 3.5vw, 46px) 38px;
   margin: 14px 22px 12px;
@@ -977,6 +978,8 @@ button {
 .game-screen,
 .game-screen-wide {
   width: min(100%, 1120px);
+  min-width: 0;
+  max-width: 100%;
   margin: 0 auto;
   animation: screen-step 150ms steps(2, end);
 }
@@ -2290,11 +2293,31 @@ button.object-card {
   color: var(--amber);
 }
 
+.tech-tree-legend .legend-output::after {
+  top: -3px;
+  right: -1px;
+  width: 7px;
+  height: 7px;
+  border: 0;
+  background: currentColor;
+  transform: rotate(45deg);
+}
+
 .tech-tree-legend .legend-opaque {
   height: 0;
   border-top: 2px dashed var(--lcd-muted);
   background: transparent;
   color: var(--lcd-muted);
+}
+
+.tech-tree-legend .legend-opaque::after {
+  top: -4px;
+  right: -1px;
+  width: 7px;
+  height: 7px;
+  border: 1px solid currentColor;
+  background: var(--lcd-raised);
+  transform: rotate(45deg);
 }
 
 .tech-tree-counts {
@@ -2394,22 +2417,35 @@ button.object-card {
   letter-spacing: 0.08em;
 }
 
-.tech-tree-edge path {
+.tech-tree-edge-halo,
+.tech-tree-edge-line {
   fill: none;
-  stroke-width: 2;
   vector-effect: non-scaling-stroke;
 }
 
-.tech-tree-edge-input path {
+.tech-tree-edge-halo {
+  stroke: var(--lcd-deep);
+  stroke-width: 7;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  opacity: 0.94;
+}
+
+.tech-tree-edge-line {
+  stroke-width: 2.25;
+  stroke-linecap: square;
+}
+
+.tech-tree-edge-input .tech-tree-edge-line {
   stroke: var(--teal);
 }
 
-.tech-tree-edge-output path {
+.tech-tree-edge-output .tech-tree-edge-line {
   stroke: var(--amber);
 }
 
-.tech-tree-edge-opaque-input path,
-.tech-tree-edge-opaque-output path {
+.tech-tree-edge-opaque-input .tech-tree-edge-line,
+.tech-tree-edge-opaque-output .tech-tree-edge-line {
   stroke: var(--lcd-muted);
   stroke-dasharray: 6 5;
   opacity: 0.82;
@@ -2424,21 +2460,38 @@ button.object-card {
 }
 
 .tech-tree-marker-opaque path {
-  fill: var(--lcd-muted);
+  fill: var(--lcd-deep);
+  stroke: var(--lcd-muted);
+  stroke-width: 1.5;
 }
 
-.tech-tree-edge-count rect {
+.tech-tree-edge-label rect {
   fill: var(--lcd-deep);
   stroke: var(--lcd-line);
   stroke-width: 1;
+  vector-effect: non-scaling-stroke;
 }
 
-.tech-tree-edge-count text {
+.tech-tree-edge-label text {
   fill: var(--lcd-text);
   font-family: inherit;
-  font-size: 8px;
+  font-size: 7px;
   font-weight: 900;
+  letter-spacing: 0.035em;
   text-anchor: middle;
+}
+
+.tech-tree-edge-label-input text {
+  fill: var(--teal);
+}
+
+.tech-tree-edge-label-output text {
+  fill: var(--amber);
+}
+
+.tech-tree-edge-label-opaque-input text,
+.tech-tree-edge-label-opaque-output text {
+  fill: var(--lcd-muted);
 }
 
 #tech-tree-svg.has-relationship-focus .tech-tree-component {
@@ -2467,8 +2520,12 @@ button.object-card {
   filter: none;
 }
 
-#tech-tree-svg.has-relationship-focus .tech-tree-edge.is-direct path {
+#tech-tree-svg.has-relationship-focus .tech-tree-edge.is-direct .tech-tree-edge-line {
   stroke-width: 3.5;
+}
+
+#tech-tree-svg.has-relationship-focus .tech-tree-edge.is-direct .tech-tree-edge-halo {
+  stroke-width: 8;
 }
 
 #tech-tree-svg.has-relationship-focus .tech-tree-node.is-direct .tech-tree-node-frame {
@@ -2744,10 +2801,12 @@ html.has-tech-tree-fullscreen body {
 }
 
 .action-tech-tree-viewport {
+  width: 100%;
+  min-width: 0;
   max-width: 100%;
   overflow-x: auto;
   overscroll-behavior-x: contain;
-  scrollbar-color: var(--lcd-line) var(--lcd-shadow);
+  scrollbar-color: var(--lcd-line) var(--lcd-deep);
   scrollbar-width: thin;
 }
 
@@ -2772,6 +2831,32 @@ html.has-tech-tree-fullscreen body {
   box-shadow:
     inset 3px 3px 0 var(--screen-inset-dark),
     inset -2px -2px 0 var(--screen-inset-light);
+}
+
+.action-tech-tree-column-label {
+  fill: var(--lcd-muted);
+  font-family: inherit;
+  font-size: 7px;
+  font-weight: 900;
+  letter-spacing: 0.08em;
+}
+
+.action-tech-tree-column-label.is-input {
+  fill: var(--teal);
+}
+
+.action-tech-tree-column-label.is-output {
+  fill: var(--amber);
+}
+
+.action-tech-tree-column-label.is-action,
+.action-tech-tree-column-label.is-shared {
+  fill: var(--lcd-text);
+}
+
+.action-tech-tree-portal .tech-tree-node-status {
+  font-size: 7px;
+  letter-spacing: 0.025em;
 }
 
 .action-proof-panel {
@@ -2832,6 +2917,78 @@ html.has-tech-tree-fullscreen body {
   letter-spacing: 0.06em;
 }
 
+.proof-rating-time {
+  color: var(--amber);
+  font-size: 11px;
+  font-style: normal;
+  letter-spacing: 0.04em;
+  line-height: 1.2;
+}
+
+.proof-estimate-summary {
+  display: grid;
+  grid-template-columns: minmax(150px, 0.72fr) minmax(0, 1.28fr);
+  gap: 2px;
+  margin-bottom: 10px;
+  border: 2px solid var(--lcd-line);
+  background: var(--lcd-line);
+  box-shadow: 3px 3px 0 var(--hard-shadow);
+}
+
+.proof-estimate-summary > div {
+  display: grid;
+  min-width: 0;
+  align-content: center;
+  gap: 4px;
+  padding: 10px 12px;
+  background: var(--lcd-raised);
+}
+
+.proof-estimate-summary > div:first-child {
+  border-left: 6px solid var(--lcd-muted);
+  background: var(--lcd-deep);
+}
+
+.proof-estimate-summary.is-complete > div:first-child {
+  border-left-color: var(--teal);
+}
+
+.proof-estimate-summary.is-partial > div:first-child {
+  border-left-color: var(--amber);
+}
+
+.proof-estimate-summary.is-unknown > div:first-child {
+  border-left-color: var(--coral);
+}
+
+.proof-estimate-summary span,
+.proof-cwi-source span,
+.proof-cwi-callout span {
+  color: var(--lcd-muted);
+  font-size: 7px;
+  font-weight: 900;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.proof-estimate-summary strong {
+  overflow: hidden;
+  color: var(--lcd-text);
+  font-size: clamp(16px, 3vw, 23px);
+  letter-spacing: 0.05em;
+  line-height: 1.05;
+  text-overflow: ellipsis;
+}
+
+.proof-estimate-summary small,
+.proof-cwi-source small,
+.proof-cwi-callout small {
+  color: var(--lcd-muted);
+  font-size: 8px;
+  font-weight: 900;
+  line-height: 1.45;
+}
+
 .proof-rating-easy::before,
 .proof-rating-short::before {
   background: var(--teal);
@@ -2850,6 +3007,67 @@ html.has-tech-tree-fullscreen body {
 .proof-rating-extreme::before {
   background: var(--coral);
   box-shadow: 4px 0 0 var(--amber);
+}
+
+.proof-cwi-source {
+  display: grid;
+  gap: 4px;
+  padding: 9px 11px;
+  margin-top: 10px;
+  border: 1px solid var(--teal-dark);
+  background: var(--success-soft);
+}
+
+.proof-cwi-source span {
+  color: var(--teal-dark);
+}
+
+.proof-cwi-source b {
+  color: var(--teal);
+  font-size: 9px;
+}
+
+.proof-cwi-callout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 9px 12px;
+  padding: 10px 11px;
+  margin-top: 10px;
+  border: 2px solid var(--amber);
+  background: var(--warning-soft);
+  box-shadow: 3px 3px 0 var(--hard-shadow);
+}
+
+.proof-cwi-callout > div:first-child {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.proof-cwi-callout strong {
+  color: var(--lcd-text);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.proof-cwi-callout > .game-button {
+  min-width: 105px;
+}
+
+.proof-cwi-callout.is-error {
+  border-color: var(--coral);
+}
+
+.proof-cwi-callout.is-error strong,
+.proof-cwi-callout.is-error small {
+  color: var(--coral);
+}
+
+.proof-cwi-track {
+  grid-column: 1 / -1;
+  height: 7px;
 }
 
 .action-proof-note {
@@ -3561,6 +3779,508 @@ body.drawer-open {
   }
 }
 
+.planner-screen {
+  width: min(100%, 1180px);
+  min-width: 0;
+  max-width: 100%;
+}
+
+.planner-screen > [data-planner-result] {
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.planner-toolbar {
+  display: grid;
+  grid-template-columns: minmax(260px, 1fr) auto;
+  align-items: end;
+  gap: 10px 18px;
+  padding: 10px;
+  margin-bottom: 13px;
+  border: 2px solid var(--lcd-line);
+  background: var(--toolbar-bg);
+  box-shadow: 4px 4px 0 var(--hard-shadow);
+}
+
+.planner-toolbar label {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 9px;
+}
+
+.planner-toolbar label > span,
+.planner-toolbar > span {
+  color: var(--amber);
+  font-size: 8px;
+  font-weight: 900;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.planner-toolbar .game-select {
+  width: 100%;
+  min-width: 0;
+}
+
+.planner-summary {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.planner-summary-item {
+  display: grid;
+  min-width: 0;
+  align-content: start;
+  gap: 5px;
+  padding: 10px;
+  border: 2px solid var(--lcd-line);
+  background: var(--lcd-raised);
+  box-shadow: 3px 3px 0 var(--hard-shadow);
+}
+
+.planner-summary-item > span,
+.planner-summary-item > small {
+  color: var(--lcd-muted);
+  font-size: 7px;
+  font-weight: 900;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.planner-summary-item > strong {
+  overflow-wrap: anywhere;
+  color: var(--lcd-text);
+  font-size: 14px;
+  letter-spacing: 0.03em;
+}
+
+.planner-summary-item .game-button {
+  width: 100%;
+  min-height: 32px;
+  margin-top: 3px;
+  padding-block: 5px;
+}
+
+.planner-flow-key {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  padding: 8px 11px;
+  border: 2px solid var(--lcd-line);
+  border-bottom: 0;
+  background: var(--lcd-raised);
+  color: var(--lcd-muted);
+  font-size: 8px;
+  font-weight: 900;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.planner-flow-key > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.planner-flow-key > span:last-child {
+  margin-left: auto;
+  color: var(--lcd-text);
+}
+
+.planner-flow-key i {
+  position: relative;
+  display: inline-block;
+  width: 20px;
+  height: 3px;
+  background: currentcolor;
+}
+
+.planner-flow-key i::after {
+  position: absolute;
+  top: -3px;
+  right: -1px;
+  width: 7px;
+  height: 7px;
+  border: 1px solid currentcolor;
+  background: var(--lcd-raised);
+  content: "";
+  transform: rotate(45deg);
+}
+
+.planner-flow-key .planner-key-input {
+  color: var(--teal);
+}
+
+.planner-flow-key .planner-key-output {
+  color: var(--amber);
+}
+
+.planner-flow-key .planner-key-update {
+  background: repeating-linear-gradient(90deg, currentcolor 0 4px, transparent 4px 7px);
+  color: var(--coral);
+}
+
+.planner-flow-key .planner-key-missing {
+  background: repeating-linear-gradient(90deg, var(--lcd-muted) 0 2px, transparent 2px 6px);
+  color: var(--lcd-muted);
+}
+
+.planner-flow-key .planner-key-output::after {
+  background: currentcolor;
+}
+
+.planner-flow-key .planner-key-input::after {
+  width: 0;
+  height: 0;
+  border: 0;
+  border-top: 4px solid transparent;
+  border-bottom: 4px solid transparent;
+  border-left: 7px solid currentcolor;
+  background: transparent;
+  transform: none;
+}
+
+.planner-flow-key .planner-key-update::after {
+  width: 7px;
+  height: 7px;
+  border: 2px solid currentcolor;
+  background: var(--lcd-raised);
+  transform: none;
+}
+
+.planner-flow-key .planner-key-missing::after {
+  width: 7px;
+  height: 7px;
+  border: 2px solid currentcolor;
+  border-radius: 50%;
+  background: var(--lcd-raised);
+  transform: none;
+}
+
+.planner-tree-viewport {
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  border: 3px solid var(--lcd-line);
+  background:
+    linear-gradient(var(--screen-grid) 1px, transparent 1px),
+    linear-gradient(90deg, var(--screen-grid) 1px, transparent 1px),
+    var(--lcd-deep);
+  background-size: 20px 20px;
+  box-shadow:
+    inset 4px 4px 0 var(--screen-inset-dark),
+    inset -3px -3px 0 var(--screen-inset-light),
+    5px 5px 0 var(--hard-shadow);
+  scrollbar-color: var(--lcd-line) var(--lcd-deep);
+  scrollbar-width: thin;
+}
+
+.planner-tree-viewport:focus-visible {
+  outline: 2px solid var(--amber);
+  outline-offset: 2px;
+}
+
+.planner-tree-svg {
+  display: block;
+  min-width: 100%;
+  color: var(--lcd-text);
+}
+
+.planner-edge-line,
+.planner-edge-halo {
+  fill: none;
+  stroke-linecap: square;
+  stroke-linejoin: miter;
+  vector-effect: non-scaling-stroke;
+}
+
+.planner-edge-halo {
+  stroke: var(--lcd-deep);
+  stroke-width: 7;
+}
+
+.planner-edge-line {
+  stroke-width: 2.5;
+}
+
+.planner-edge-input .planner-edge-line {
+  stroke: var(--teal);
+}
+
+.planner-edge-output .planner-edge-line {
+  stroke: var(--amber);
+}
+
+.planner-edge-update-input .planner-edge-line,
+.planner-edge-update-output .planner-edge-line {
+  stroke: var(--coral);
+  stroke-dasharray: 4 3;
+}
+
+.planner-edge-missing .planner-edge-line {
+  stroke: var(--lcd-muted);
+  stroke-dasharray: 2 5;
+}
+
+.planner-marker-input path {
+  fill: var(--teal);
+}
+
+.planner-marker-output path {
+  fill: var(--amber);
+}
+
+.planner-marker-update path {
+  fill: var(--lcd-deep);
+  stroke: var(--coral);
+  stroke-width: 2;
+}
+
+.planner-marker-missing circle {
+  fill: var(--lcd-deep);
+  stroke: var(--lcd-muted);
+  stroke-width: 2;
+}
+
+.planner-edge-label rect {
+  fill: var(--lcd-deep);
+  stroke: var(--lcd-line);
+  stroke-width: 1;
+}
+
+.planner-edge-label text {
+  fill: var(--lcd-text);
+  font-family: inherit;
+  font-size: 7px;
+  font-weight: 900;
+  text-anchor: middle;
+}
+
+.planner-node-frame,
+.planner-object-tab {
+  fill: var(--lcd);
+  stroke: var(--lcd-line);
+  stroke-width: 2;
+  vector-effect: non-scaling-stroke;
+}
+
+.planner-node-action .planner-node-frame {
+  fill: var(--lcd-raised);
+  stroke: var(--amber);
+}
+
+.planner-node.is-target .planner-node-frame,
+.planner-node.is-target .planner-object-tab {
+  stroke: var(--coral);
+  stroke-width: 4;
+}
+
+.planner-node.is-inventory .planner-node-frame,
+.planner-node.is-inventory .planner-object-tab {
+  fill: var(--success-soft);
+  stroke: var(--teal);
+  stroke-width: 3;
+}
+
+.planner-node.is-shared .planner-node-frame,
+.planner-node.is-shared .planner-object-tab {
+  stroke-dasharray: 5 3;
+}
+
+.planner-node.is-blocked .planner-node-frame,
+.planner-node.is-search-limit .planner-node-frame,
+.planner-node.is-cycle .planner-node-frame {
+  fill: var(--danger-soft);
+  stroke: var(--coral);
+}
+
+.planner-node-label,
+.planner-node-status {
+  fill: var(--lcd-text);
+  font-family: inherit;
+  pointer-events: none;
+  text-anchor: middle;
+}
+
+.planner-node-label {
+  font-size: 9px;
+  font-weight: 900;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+.planner-node-status {
+  fill: var(--lcd-muted);
+  font-size: 6.5px;
+  font-weight: 900;
+  letter-spacing: 0.04em;
+}
+
+.planner-node.is-inventory .planner-node-status {
+  fill: var(--teal);
+}
+
+.planner-node.is-target .planner-node-status,
+.planner-node-action .planner-node-status {
+  fill: var(--amber);
+}
+
+.planner-step-panel {
+  margin-top: 17px;
+}
+
+.planner-step-panel .game-panel-header > span {
+  color: var(--amber);
+  font-size: 7px;
+  font-weight: 900;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.planner-step-list {
+  display: grid;
+}
+
+.planner-step-row {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: 44px minmax(0, 1fr) minmax(110px, auto);
+  align-items: center;
+  gap: 10px;
+  padding: 11px 12px;
+  border: 0;
+  border-bottom: 1px solid var(--lcd-line);
+  background: transparent;
+  color: var(--lcd-text);
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+}
+
+.planner-step-row:last-child {
+  border-bottom: 0;
+}
+
+.planner-step-row:hover,
+.planner-step-row:focus-visible {
+  background: var(--accent-hatch);
+  outline: 2px solid var(--amber);
+  outline-offset: -2px;
+}
+
+.planner-step-number {
+  display: grid;
+  width: 38px;
+  height: 34px;
+  place-items: center;
+  border: 2px solid var(--amber);
+  background: var(--lcd-deep);
+  color: var(--amber);
+  font-size: 11px;
+  font-weight: 900;
+}
+
+.planner-step-copy,
+.planner-step-time {
+  display: grid;
+  min-width: 0;
+  gap: 4px;
+}
+
+.planner-step-copy strong,
+.planner-step-time strong {
+  overflow-wrap: anywhere;
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.planner-step-copy small,
+.planner-step-time small {
+  color: var(--lcd-muted);
+  font-size: 7px;
+  font-weight: 900;
+  line-height: 1.5;
+  text-transform: uppercase;
+}
+
+.planner-step-time {
+  justify-items: end;
+  text-align: right;
+}
+
+.planner-step-time strong {
+  color: var(--teal);
+}
+
+.planner-diagnostics ul {
+  margin: 8px 0 0;
+  padding-left: 18px;
+}
+
+.planner-diagnostics li + li {
+  margin-top: 5px;
+}
+
+.planner-diagnostics li > span,
+.planner-diagnostics li > small {
+  display: block;
+}
+
+.planner-diagnostics li > small {
+  margin-top: 3px;
+  overflow-wrap: anywhere;
+  color: var(--lcd-muted);
+}
+
+.planner-truth-note {
+  margin-top: 15px;
+}
+
+@media (max-width: 900px) {
+  .planner-summary {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 700px) {
+  .planner-toolbar,
+  .planner-toolbar label {
+    grid-template-columns: minmax(0, 1fr);
+    align-items: stretch;
+  }
+
+  .planner-flow-key > span:last-child {
+    width: 100%;
+    margin-left: 0;
+  }
+
+  .planner-step-row {
+    grid-template-columns: 40px minmax(0, 1fr);
+  }
+
+  .planner-step-time {
+    grid-column: 2;
+    justify-items: start;
+    text-align: left;
+  }
+}
+
+@media (max-width: 420px) {
+  .planner-summary {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
 @media (min-width: 821px) and (min-height: 621px) {
   body {
     display: grid;
@@ -3875,8 +4595,14 @@ body.drawer-open {
 }
 
 @media (max-width: 420px) {
-  .proof-rating-grid {
+  .proof-rating-grid,
+  .proof-estimate-summary,
+  .proof-cwi-callout {
     grid-template-columns: minmax(0, 1fr);
+  }
+
+  .proof-cwi-callout > .game-button {
+    width: 100%;
   }
 
   .run-meter-copy {
@@ -3990,5 +4716,59 @@ body.drawer-open {
   .game-stage,
   .game-stage::before {
     background-image: none;
+  }
+
+  .tech-tree-edge-halo {
+    stroke: Canvas;
+  }
+
+  .tech-tree-edge-label rect {
+    fill: Canvas;
+    stroke: CanvasText;
+  }
+
+  .tech-tree-marker-opaque path {
+    fill: Canvas;
+    stroke: CanvasText;
+  }
+
+  .planner-edge-halo {
+    stroke: Canvas;
+  }
+
+  .planner-edge-input .planner-edge-line,
+  .planner-edge-output .planner-edge-line,
+  .planner-edge-update-input .planner-edge-line,
+  .planner-edge-update-output .planner-edge-line,
+  .planner-edge-missing .planner-edge-line {
+    stroke: CanvasText;
+  }
+
+  .planner-edge-label rect,
+  .planner-node-frame,
+  .planner-object-tab {
+    fill: Canvas;
+    stroke: CanvasText;
+  }
+
+  .planner-edge-label text,
+  .planner-node-label,
+  .planner-node-status {
+    fill: CanvasText;
+  }
+
+  .planner-marker-input path,
+  .planner-marker-output path {
+    fill: CanvasText;
+  }
+
+  .planner-marker-update path {
+    fill: Canvas;
+    stroke: CanvasText;
+  }
+
+  .planner-marker-missing circle {
+    fill: Canvas;
+    stroke: CanvasText;
   }
 }

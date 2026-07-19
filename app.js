@@ -390,6 +390,10 @@
       fullscreenFallback: false,
       fullscreenRequestPending: false,
     },
+    planner: {
+      goalClassId: "",
+      result: null,
+    },
     linkedConfigHandle: null,
     linkedConfigName: null,
     configWriteTimer: null,
@@ -1088,8 +1092,15 @@
     );
     results.forEach((result, index) => {
       const key = entries[index][0];
-      if (result.status === "fulfilled") state.workspace[key] = result.value;
-      else state.workspace.errors[key] = result.reason?.message || "Request failed.";
+      const expectsArray = key === "actions" || key === "objects" || key === "classes";
+      if (result.status === "fulfilled" && (!expectsArray || Array.isArray(result.value))) {
+        state.workspace[key] = result.value;
+        delete state.workspace.errors[key];
+      } else {
+        state.workspace.errors[key] = result.status === "fulfilled"
+          ? `The ${key} response is incompatible.`
+          : result.reason?.message || "Request failed.";
+      }
     });
     state.workspace.actions = Array.isArray(state.workspace.actions) ? state.workspace.actions : [];
     state.workspace.objects = Array.isArray(state.workspace.objects) ? state.workspace.objects : [];
@@ -1140,6 +1151,8 @@
     state.techTree.viewKey = "";
     state.techTree.selectedNodeId = "";
     state.techTree.objectFileName = "";
+    state.planner.goalClassId = "";
+    state.planner.result = null;
   }
 
   async function refreshEverything() {
@@ -1238,9 +1251,17 @@
       driverRequest(connection, "/classes", { timeout: 15000 }),
     ]);
     if (!isCurrentWorkspace(connection, generation)) return false;
-    if (actions.status === "fulfilled" && Array.isArray(actions.value)) state.workspace.actions = actions.value;
-    if (objects.status === "fulfilled" && Array.isArray(objects.value)) state.workspace.objects = objects.value;
-    if (classes.status === "fulfilled" && Array.isArray(classes.value)) state.workspace.classes = classes.value;
+    const results = { actions, objects, classes };
+    for (const [key, result] of Object.entries(results)) {
+      if (result.status === "fulfilled" && Array.isArray(result.value)) {
+        state.workspace[key] = result.value;
+        delete state.workspace.errors[key];
+      } else {
+        state.workspace.errors[key] = result.status === "fulfilled"
+          ? `The ${key} response is incompatible.`
+          : result.reason?.message || "Request failed.";
+      }
+    }
     const catalogAuthoritative =
       actions.status === "fulfilled" &&
       Array.isArray(actions.value) &&
@@ -1351,9 +1372,8 @@
       </div>`;
   }
 
-  function captureFocus(container) {
-    const element = document.activeElement;
-    if (!element || !container || typeof container.contains !== "function" || !container.contains(element)) return null;
+  function focusTokenForElement(element) {
+    if (!element) return null;
     return {
       id: element.id || "",
       command: element.dataset?.command || "",
@@ -1362,6 +1382,12 @@
       actionInput: element.dataset?.actionInput || "",
       name: element.name || "",
     };
+  }
+
+  function captureFocus(container) {
+    const element = document.activeElement;
+    if (!element || !container || typeof container.contains !== "function" || !container.contains(element)) return null;
+    return focusTokenForElement(element);
   }
 
   function findCapturedFocus(container, token) {
@@ -1396,6 +1422,7 @@
       "connection-edit",
       "cartridges",
       "actions",
+      "planner",
       "tree",
       "objects",
       "activity",
@@ -1409,6 +1436,7 @@
       "connection-edit": renderConnectionEdit,
       cartridges: renderCartridges,
       actions: renderActions,
+      planner: renderPlanner,
       tree: renderTechTree,
       objects: renderObjects,
       activity: renderActivity,
@@ -1420,6 +1448,7 @@
     main.dataset.screen = state.screen;
     requestAnimationFrame(() => {
       if (state.screen === "tree") mountTechTree();
+      if (state.screen === "planner") centerPlannerTarget(main.querySelector(".planner-tree-viewport"));
       const captured = findCapturedFocus(main, focusToken);
       if (captured) {
         captured.focus({ preventScroll: true });
@@ -1662,6 +1691,970 @@
     return grouped;
   }
 
+  // Planner domain core. This block is intentionally pure: it reads catalog data,
+  // models exact class-version tokens, and returns data for a caller to render.
+  const PLANNER_DEFAULT_MAX_STEPS = 128;
+  const PLANNER_DEFAULT_MAX_EXPANDED_STATES = 30000;
+  const PLANNER_MAX_QUANTITY = 1000000;
+
+  function plannerCompareText(left, right) {
+    const a = String(left || "");
+    const b = String(right || "");
+    return a < b ? -1 : a > b ? 1 : 0;
+  }
+
+  function plannerUniqueStrings(values) {
+    return [...new Set((values || []).filter(Boolean))];
+  }
+
+  function plannerValidClassRef(ref) {
+    return Boolean(ref?.class?.pluginName && ref?.class?.name && String(ref?.hash || "").trim());
+  }
+
+  function plannerActionId(action) {
+    return `${qualifiedKey(action?.action)}@${action?.hash || ""}`;
+  }
+
+  function plannerGroupedSlots(slots) {
+    const grouped = new Map();
+    for (const slot of slots) {
+      const current = grouped.get(slot.classId) || {
+        classId: slot.classId,
+        ref: slot.ref,
+        count: 0,
+        slotIndexes: [],
+      };
+      current.count += 1;
+      current.slotIndexes.push(slot.slotIndex);
+      grouped.set(slot.classId, current);
+    }
+    return [...grouped.values()].sort((left, right) => plannerCompareText(left.classId, right.classId));
+  }
+
+  function plannerHasStateGuards(source) {
+    const text = String(source || "");
+    const hasNonTypeDictionaryField = ["DictContains", "DictUpdate"].some((name) =>
+      predicateCalls(text, name).some((call) => {
+        const field = splitPredicateArguments(call.argumentsSource)[1] || "";
+        const literal = field.match(/^\s*["']([^"']+)["']\s*$/)?.[1];
+        return Boolean(literal && literal !== "type");
+      }),
+    );
+    if (hasNonTypeDictionaryField) return true;
+    // SDK action wrappers use ArrayContains(in|out, ...) as slot plumbing. An
+    // array membership test against any other value is an application guard.
+    return predicateCalls(text, "ArrayContains").some((call) => {
+      const container = splitPredicateArguments(call.argumentsSource)[0] || "";
+      return !/^\s*(?:in|out)\s*$/.test(container);
+    });
+  }
+
+  /** Build a deterministic Petri catalog from one cartridge's flattened action totals. */
+  function buildPlannerCatalog(cartridge, workspace = {}) {
+    const cartridgeId = String(cartridge?.id || cartridge?.name || "");
+    const classById = new Map();
+    const catalogWarnings = [];
+
+    const ensureClass = (ref, metadata = {}) => {
+      if (!ref?.class) return null;
+      const id = classRefKey(ref);
+      let item = classById.get(id);
+      if (!item) {
+        item = {
+          id,
+          classId: id,
+          qualified: {
+            pluginName: ref.class.pluginName || "?",
+            name: ref.class.name || "Unknown",
+          },
+          hash: ref.hash || "",
+          label: ref.class.name || "Unknown",
+          emoji: "\ud83d\udce6",
+          description: "Referenced object class",
+          declared: false,
+          external: Boolean(cartridgeId && ref.class.pluginName !== cartridgeId),
+          classSummary: null,
+        };
+        classById.set(id, item);
+      }
+      if (metadata.declared) item.declared = true;
+      if (metadata.emoji) item.emoji = metadata.emoji;
+      if (metadata.description) item.description = metadata.description;
+      if (metadata.classSummary) item.classSummary = metadata.classSummary;
+      return item;
+    };
+
+    for (const item of Array.isArray(cartridge?.classes) ? cartridge.classes : []) {
+      ensureClass({ class: item.class, hash: item.hash }, {
+        declared: true,
+        emoji: item.emoji,
+        description: item.description,
+        classSummary: item,
+      });
+    }
+
+    const rawActions = Array.isArray(cartridge?.actions) ? cartridge.actions : [];
+    for (const action of rawActions) {
+      for (const ref of [...(action.totalInputs || []), ...(action.totalOutputs || [])]) ensureClass(ref);
+    }
+
+    // Workspace class summaries only enrich exact versions already referenced by this PEXE.
+    for (const item of Array.isArray(workspace?.classes) ? workspace.classes : []) {
+      const ref = { class: item.class, hash: item.hash };
+      if (!classById.has(classRefKey(ref))) continue;
+      ensureClass(ref, {
+        declared: item.class?.pluginName === cartridgeId,
+        emoji: item.emoji,
+        description: item.description,
+        classSummary: item,
+      });
+    }
+
+    const actions = [];
+    const seenActionIds = new Set();
+    for (const raw of rawActions) {
+      const id = plannerActionId(raw);
+      if (seenActionIds.has(id)) {
+        catalogWarnings.push(`Duplicate action identity ${id} was ignored.`);
+        continue;
+      }
+      seenActionIds.add(id);
+      const inputSlots = (raw.totalInputs || []).map((ref, slotIndex) => ({
+        classId: classRefKey(ref),
+        slotIndex,
+        ref,
+      }));
+      const outputSlots = (raw.totalOutputs || []).map((ref, slotIndex) => ({
+        classId: classRefKey(ref),
+        slotIndex,
+        ref,
+      }));
+      const inputs = plannerGroupedSlots(inputSlots);
+      const outputs = plannerGroupedSlots(outputSlots);
+      const inputCounts = new Map(inputs.map((item) => [item.classId, item.count]));
+      const outputCounts = new Map(outputs.map((item) => [item.classId, item.count]));
+      const involvedClassIds = [...new Set([...inputCounts.keys(), ...outputCounts.keys()])].sort(plannerCompareText);
+      const delta = involvedClassIds.map((classId) => ({
+        classId,
+        inputCount: inputCounts.get(classId) || 0,
+        outputCount: outputCounts.get(classId) || 0,
+        net: (outputCounts.get(classId) || 0) - (inputCounts.get(classId) || 0),
+      }));
+      const flow = actionDependencyFlow(raw);
+      const warnings = [];
+      if (flow.mutations.length) {
+        warnings.push("Object mutation or identity turnover is present; paired same-class turnover is shown as UPDATE flow, but field-level mutation and identity continuity are not simulated.");
+      }
+      if (!flow.classified || flow.opaqueInputs.length || flow.opaqueOutputs.length) {
+        warnings.push("Some predicate effects are opaque; the planner uses the action's raw flattened input/output totals.");
+      }
+      if (plannerHasStateGuards(raw.predicateSource)) {
+        warnings.push("Predicate state guards are not simulated; this plan proves class-token flow only.");
+      }
+      const invalidRefs = [...(raw.totalInputs || []), ...(raw.totalOutputs || [])].filter((ref) => !plannerValidClassRef(ref));
+      const searchable = Boolean(raw?.action?.pluginName && raw?.action?.name && String(raw?.hash || "").trim()) && !invalidRefs.length;
+      if (!searchable) warnings.push("This action has an incomplete action or class-version identity and is excluded from search.");
+      const sameClassTurnover = delta
+        .filter((item) => item.inputCount && item.outputCount)
+        .map((item) => ({ classId: item.classId, inputs: item.inputCount, outputs: item.outputCount }));
+      const normalized = {
+        id,
+        actionId: id,
+        actionKey: qualifiedKey(raw.action),
+        qualified: {
+          pluginName: raw.action?.pluginName || "?",
+          name: raw.action?.name || "Unnamed action",
+        },
+        hash: raw.hash || "",
+        label: raw.action?.name || "Unnamed action",
+        emoji: raw.emoji || "\u2699",
+        description: raw.description || "",
+        raw,
+        inputSlots,
+        outputSlots,
+        inputs,
+        outputs,
+        inputCounts,
+        outputCounts,
+        delta,
+        positiveNetOutputs: delta.filter((item) => item.net > 0),
+        netConsumes: delta.filter((item) => item.net < 0),
+        sameClassTurnover,
+        flow,
+        searchable,
+        warnings,
+      };
+      actions.push(normalized);
+    }
+    actions.sort((left, right) => plannerCompareText(left.id, right.id));
+
+    const actionById = new Map(actions.map((action) => [action.id, action]));
+    const positiveProducersByClass = new Map();
+    const outputtersByClass = new Map();
+    const consumersByClass = new Map();
+    const appendAction = (index, classId, action) => {
+      if (!index.has(classId)) index.set(classId, []);
+      index.get(classId).push(action);
+    };
+    for (const action of actions) {
+      if (!action.searchable) continue;
+      for (const item of action.positiveNetOutputs) appendAction(positiveProducersByClass, item.classId, action);
+      for (const item of action.outputs) appendAction(outputtersByClass, item.classId, action);
+      for (const item of action.inputs) appendAction(consumersByClass, item.classId, action);
+    }
+    for (const index of [positiveProducersByClass, outputtersByClass, consumersByClass]) {
+      for (const values of index.values()) values.sort((left, right) => plannerCompareText(left.id, right.id));
+    }
+
+    const classes = [...classById.values()].sort((left, right) => plannerCompareText(left.id, right.id));
+    return {
+      version: 1,
+      cartridgeId,
+      classes,
+      classById,
+      actions,
+      actionById,
+      positiveProducersByClass,
+      positiveProducerIdsByClass: new Map(
+        [...positiveProducersByClass].map(([classId, values]) => [classId, values.map((action) => action.id)]),
+      ),
+      outputtersByClass,
+      consumersByClass,
+      warnings: plannerUniqueStrings([
+        ...catalogWarnings,
+        ...actions.flatMap((action) => action.warnings.map((warning) => `${action.label}: ${warning}`)),
+      ]),
+    };
+  }
+
+  /** Normalize all live workspace objects into exact class-version inventory tokens. */
+  function buildPlannerInventory(objects) {
+    const warnings = [];
+    const seen = new Set();
+    const normalized = [];
+    for (const object of Array.isArray(objects) ? objects : []) {
+      if (object?.status !== "live") continue;
+      const ref = { class: object.class, hash: object.classHash };
+      if (!plannerValidClassRef(ref)) {
+        warnings.push(`Skipped live object ${object?.fileName || object?.contentHash || "(unnamed)"}: incomplete class-version identity.`);
+        continue;
+      }
+      const identity = object.contentHash ? `hash:${object.contentHash}` : object.fileName ? `file:${object.fileName}` : "";
+      if (!identity) {
+        warnings.push(`Skipped live ${ref.class.name} object: no content hash or file name.`);
+        continue;
+      }
+      if (seen.has(identity)) {
+        warnings.push(`Ignored duplicate live object identity ${object.contentHash || object.fileName}.`);
+        continue;
+      }
+      seen.add(identity);
+      normalized.push({
+        id: `object:${encodeURIComponent(identity)}`,
+        objectId: `object:${encodeURIComponent(identity)}`,
+        classId: classRefKey(ref),
+        qualified: { pluginName: object.class.pluginName, name: object.class.name },
+        classHash: object.classHash,
+        classLabel: object.class.name,
+        fileName: object.fileName || null,
+        contentHash: object.contentHash || null,
+        emoji: object.emoji || "\ud83d\udce6",
+        object,
+      });
+    }
+    normalized.sort(
+      (left, right) =>
+        plannerCompareText(left.fileName, right.fileName) ||
+        plannerCompareText(left.contentHash, right.contentHash) ||
+        plannerCompareText(left.classId, right.classId),
+    );
+    const byClass = new Map();
+    for (const object of normalized) {
+      if (!byClass.has(object.classId)) byClass.set(object.classId, []);
+      byClass.get(object.classId).push(object);
+    }
+    const counts = new Map([...byClass].map(([classId, values]) => [classId, values.length]));
+    return {
+      version: 1,
+      objects: normalized,
+      byClass,
+      counts,
+      countEntries: [...counts]
+        .map(([classId, count]) => ({ classId, count }))
+        .sort((left, right) => plannerCompareText(left.classId, right.classId)),
+      warnings: plannerUniqueStrings(warnings),
+    };
+  }
+
+  /** Goal classes are stock classes for which at least one action has positive net output. */
+  function plannerGoalOptions(catalog) {
+    if (!catalog?.positiveProducersByClass) return [];
+    return [...catalog.positiveProducersByClass]
+      .filter(([, actions]) => actions.length)
+      .map(([classId, actions]) => {
+        const item = catalog.classById.get(classId);
+        return {
+          classId,
+          qualified: item?.qualified || { pluginName: "?", name: "Unknown" },
+          hash: item?.hash || "",
+          label: item?.label || classId,
+          emoji: item?.emoji || "\ud83d\udce6",
+          description: item?.description || "",
+          declared: Boolean(item?.declared),
+          external: Boolean(item?.external),
+          producerActionIds: actions.map((action) => action.id),
+          producerCount: actions.length,
+        };
+      })
+      .sort(
+        (left, right) =>
+          plannerCompareText(left.label, right.label) ||
+          plannerCompareText(left.qualified.pluginName, right.qualified.pluginName) ||
+          plannerCompareText(left.hash, right.hash),
+      );
+  }
+
+  function plannerRequest(goalClassId) {
+    const value = goalClassId && typeof goalClassId === "object" ? goalClassId : { classId: goalClassId };
+    const quantity = value.quantity === undefined ? 1 : Number(value.quantity);
+    const semantics = value.semantics === "additional" ? "additional" : "target-total";
+    const boundedInteger = (candidate, fallback, maximum, minimum = 0) => {
+      if (candidate === undefined) return fallback;
+      const number = Number(candidate);
+      return Number.isInteger(number) && number >= minimum && number <= maximum ? number : fallback;
+    };
+    return {
+      classId: String(value.classId || ""),
+      quantity,
+      semantics,
+      maxSteps: boundedInteger(value.maxSteps, PLANNER_DEFAULT_MAX_STEPS, 256),
+      maxExpandedStates: boundedInteger(value.maxExpandedStates, PLANNER_DEFAULT_MAX_EXPANDED_STATES, 250000),
+    };
+  }
+
+  function plannerGoalSummary(catalog, inventory, request) {
+    const item = catalog?.classById?.get(request.classId);
+    const initialCount = inventory?.counts?.get(request.classId) || 0;
+    const targetCount = request.semantics === "additional" ? initialCount + request.quantity : request.quantity;
+    return {
+      classId: request.classId,
+      qualified: item?.qualified || { pluginName: "?", name: "Unknown" },
+      hash: item?.hash || "",
+      label: item?.label || request.classId || "Unknown",
+      quantity: request.quantity,
+      semantics: request.semantics,
+      initialCount,
+      targetCount,
+      finalCount: initialCount,
+    };
+  }
+
+  function plannerEmptyResult(catalog, inventory, request, status, diagnostics = [], warnings = []) {
+    const goal = plannerGoalSummary(catalog, inventory, request);
+    return {
+      version: 1,
+      status,
+      strategy: "none",
+      shortestGuaranteed: false,
+      goal,
+      sequence: [],
+      steps: [],
+      tokens: [],
+      goalTokenIds: [],
+      finalGoalTokenIds: [],
+      dependencyEdges: [],
+      totals: {
+        actionCount: 0,
+        expandedStates: 0,
+        visitedStates: 1,
+        maxSteps: request.maxSteps,
+        maxExpandedStates: request.maxExpandedStates,
+      },
+      alternativeProducerActionIds: (catalog?.positiveProducersByClass?.get(request.classId) || []).map((action) => action.id),
+      warnings: plannerUniqueStrings([...(inventory?.warnings || []), ...warnings]),
+      diagnostics,
+    };
+  }
+
+  function plannerRelevantClosure(catalog, goalClassId) {
+    const classIds = new Set([goalClassId]);
+    const actionIds = new Set();
+    const queue = [goalClassId];
+    for (let cursor = 0; cursor < queue.length; cursor += 1) {
+      const classId = queue[cursor];
+      for (const action of catalog.positiveProducersByClass.get(classId) || []) {
+        if (actionIds.has(action.id)) continue;
+        actionIds.add(action.id);
+        for (const input of action.inputs) {
+          if (classIds.has(input.classId)) continue;
+          classIds.add(input.classId);
+          queue.push(input.classId);
+        }
+      }
+    }
+    return {
+      classIds: [...classIds].sort(plannerCompareText),
+      actions: [...actionIds].map((id) => catalog.actionById.get(id)).filter(Boolean).sort((a, b) => plannerCompareText(a.id, b.id)),
+    };
+  }
+
+  function plannerStructuralSupport(closure, inventory) {
+    const supported = new Set(
+      closure.classIds.filter((classId) => (inventory.counts.get(classId) || 0) > 0),
+    );
+    const enabledActionIds = new Set();
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const action of closure.actions) {
+        if (!action.inputs.every((input) => supported.has(input.classId))) continue;
+        enabledActionIds.add(action.id);
+        for (const output of action.positiveNetOutputs) {
+          if (supported.has(output.classId)) continue;
+          supported.add(output.classId);
+          changed = true;
+        }
+      }
+    }
+    return { supported, enabledActionIds };
+  }
+
+  function plannerCycleDiagnostics(closure, inventory, support) {
+    const graph = new Map(closure.classIds.map((classId) => [classId, new Set()]));
+    for (const action of closure.actions) {
+      for (const input of action.inputs) {
+        if (!graph.has(input.classId)) continue;
+        for (const output of action.positiveNetOutputs) {
+          if (graph.has(output.classId)) graph.get(input.classId).add(output.classId);
+        }
+      }
+    }
+    let nextIndex = 0;
+    const indexes = new Map();
+    const lowLinks = new Map();
+    const stack = [];
+    const onStack = new Set();
+    const components = [];
+    const visit = (classId) => {
+      indexes.set(classId, nextIndex);
+      lowLinks.set(classId, nextIndex);
+      nextIndex += 1;
+      stack.push(classId);
+      onStack.add(classId);
+      for (const target of graph.get(classId) || []) {
+        if (!indexes.has(target)) {
+          visit(target);
+          lowLinks.set(classId, Math.min(lowLinks.get(classId), lowLinks.get(target)));
+        } else if (onStack.has(target)) {
+          lowLinks.set(classId, Math.min(lowLinks.get(classId), indexes.get(target)));
+        }
+      }
+      if (lowLinks.get(classId) !== indexes.get(classId)) return;
+      const component = [];
+      let popped;
+      do {
+        popped = stack.pop();
+        onStack.delete(popped);
+        component.push(popped);
+      } while (popped !== classId);
+      components.push(component.sort(plannerCompareText));
+    };
+    for (const classId of closure.classIds) if (!indexes.has(classId)) visit(classId);
+
+    return components
+      .filter((component) => component.length > 1 || graph.get(component[0])?.has(component[0]))
+      .map((component) => {
+        const componentSet = new Set(component);
+        const seeded = component.some((classId) => (inventory.counts.get(classId) || 0) > 0 || support.supported.has(classId));
+        const actionIds = closure.actions
+          .filter(
+            (action) =>
+              action.inputs.some((input) => componentSet.has(input.classId)) &&
+              action.positiveNetOutputs.some((output) => componentSet.has(output.classId)),
+          )
+          .map((action) => action.id);
+        return {
+          code: seeded ? "seeded-cycle" : "unseeded-cycle",
+          message: seeded
+            ? "A cyclic production dependency has a reachable seed; bounded token search decides whether its quantities work."
+            : "A cyclic production dependency has no reachable seed.",
+          classIds: component,
+          actionIds,
+        };
+      });
+  }
+
+  /**
+   * Build a deterministic, validated action sequence by recursively satisfying
+   * exact class-version counts. This is a bounded fallback for goals whose
+   * shortest-path state space is too wide; it never replaces a completed BFS.
+   */
+  function plannerGoalDirectedSequence(catalog, inventory, request) {
+    const classIds = catalog.classes.map((item) => item.classId);
+    const initialState = {
+      marking: new Map(classIds.map((classId) => [classId, inventory.counts.get(classId) || 0])),
+      sequence: [],
+    };
+    const attemptLimit = Math.max(1000, Math.min(100000, request.maxExpandedStates * 2));
+    let attempts = 0;
+    let limitHit = false;
+    const countOf = (state, classId) => state.marking.get(classId) || 0;
+    const producerOrder = (classId) => [...(catalog.positiveProducersByClass.get(classId) || [])].sort((left, right) => {
+      const leftNet = left.positiveNetOutputs.find((item) => item.classId === classId)?.net || 0;
+      const rightNet = right.positiveNetOutputs.find((item) => item.classId === classId)?.net || 0;
+      return rightNet - leftNet || left.inputSlots.length - right.inputSlots.length || plannerCompareText(left.id, right.id);
+    });
+
+    function* ensureAvailable(classId, targetCount, state, activeActionIds = new Set()) {
+      attempts += 1;
+      if (attempts > attemptLimit) {
+        limitHit = true;
+        return;
+      }
+      if (countOf(state, classId) >= targetCount) {
+        yield state;
+        return;
+      }
+      for (const action of producerOrder(classId)) {
+        if (activeActionIds.has(action.id)) continue;
+        const active = new Set(activeActionIds).add(action.id);
+        for (const firedState of enableAndFire(action, state, active)) {
+          const markingChanged = classIds.some((itemClassId) => countOf(firedState, itemClassId) !== countOf(state, itemClassId));
+          if (!markingChanged) continue;
+          for (const completedState of ensureAvailable(classId, targetCount, firedState, activeActionIds)) {
+            yield completedState;
+          }
+          if (limitHit) return;
+        }
+        if (limitHit) return;
+      }
+    }
+
+    function* enableAndFire(action, state, activeActionIds) {
+      attempts += 1;
+      if (attempts > attemptLimit) {
+        limitHit = true;
+        return;
+      }
+      const missingInputs = action.inputs.filter((input) => countOf(state, input.classId) < input.count);
+      if (missingInputs.length) {
+        for (const missing of missingInputs) {
+          for (const suppliedState of ensureAvailable(missing.classId, missing.count, state, activeActionIds)) {
+            yield* enableAndFire(action, suppliedState, activeActionIds);
+            if (limitHit) return;
+          }
+        }
+        return;
+      }
+      if (state.sequence.length >= request.maxSteps) return;
+      const marking = new Map(state.marking);
+      const read = (classId) => marking.get(classId) || 0;
+      for (const input of action.inputs) marking.set(input.classId, read(input.classId) - input.count);
+      for (const output of action.outputs) marking.set(output.classId, read(output.classId) + output.count);
+      yield { marking, sequence: [...state.sequence, action.id] };
+    }
+
+    const targetCount = plannerGoalSummary(catalog, inventory, request).targetCount;
+    const candidate = ensureAvailable(request.classId, targetCount, initialState).next().value || null;
+    return {
+      success: Boolean(candidate),
+      sequence: candidate ? candidate.sequence : [],
+      attempts,
+      limitHit,
+      finalCount: candidate ? countOf(candidate, request.classId) : countOf(initialState, request.classId),
+    };
+  }
+
+  /** Replay a sequence into concrete/symbolic tokens and annotate parent dependencies. */
+  function materializePlannerSequence(catalog, inventory, sequence, goalRequest) {
+    const request = plannerRequest(goalRequest);
+    const goal = plannerGoalSummary(catalog, inventory, request);
+    const tokens = [];
+    const queues = new Map();
+    const steps = [];
+    const dependencyEdges = [];
+    const warnings = [];
+    const queueFor = (classId) => {
+      if (!queues.has(classId)) queues.set(classId, []);
+      return queues.get(classId);
+    };
+    for (const [index, object] of inventory.objects.entries()) {
+      const token = {
+        tokenId: `inventory:${String(index + 1).padStart(4, "0")}:${encodeURIComponent(object.contentHash || object.fileName || object.id)}`,
+        classId: object.classId,
+        classLabel: catalog.classById.get(object.classId)?.label || object.classLabel || object.classId,
+        kind: "inventory",
+        fileName: object.fileName,
+        contentHash: object.contentHash,
+        producedByStepId: null,
+        consumedByStepId: null,
+      };
+      tokens.push(token);
+      queueFor(token.classId).push(token);
+    }
+
+    (sequence || []).forEach((actionId, index) => {
+      const action = catalog.actionById.get(actionId);
+      if (!action) {
+        warnings.push(`Cannot materialize unknown action ${actionId}.`);
+        return;
+      }
+      const stepId = `step:${index + 1}`;
+      const inputs = [];
+      const dependencyStepIds = new Set();
+      for (const slot of action.inputSlots) {
+        const token = queueFor(slot.classId).shift();
+        if (!token) {
+          warnings.push(`${action.label} could not consume input slot ${slot.slotIndex + 1} while materializing the plan.`);
+          continue;
+        }
+        token.consumedByStepId = stepId;
+        if (token.producedByStepId) {
+          dependencyStepIds.add(token.producedByStepId);
+          dependencyEdges.push({
+            id: `dependency:${token.tokenId}>${stepId}`,
+            fromStepId: token.producedByStepId,
+            toStepId: stepId,
+            classId: token.classId,
+            tokenId: token.tokenId,
+          });
+        }
+        inputs.push({
+          tokenId: token.tokenId,
+          classId: token.classId,
+          slotIndex: slot.slotIndex,
+          classLabel: token.classLabel,
+          sourceKind: token.kind === "inventory" ? "inventory" : "step",
+          sourceStepId: token.producedByStepId,
+          fileName: token.fileName,
+          contentHash: token.contentHash,
+        });
+      }
+      const outputs = action.outputSlots.map((slot) => {
+        const token = {
+          tokenId: `${stepId}:out:${slot.slotIndex + 1}`,
+          classId: slot.classId,
+          classLabel: catalog.classById.get(slot.classId)?.label || slot.ref.class?.name || slot.classId,
+          kind: "planned-output",
+          fileName: null,
+          contentHash: null,
+          producedByStepId: stepId,
+          consumedByStepId: null,
+        };
+        tokens.push(token);
+        queueFor(token.classId).push(token);
+        return {
+          tokenId: token.tokenId,
+          classId: token.classId,
+          slotIndex: slot.slotIndex,
+          classLabel: token.classLabel,
+          sourceKind: "step",
+          sourceStepId: stepId,
+          fileName: null,
+          contentHash: null,
+        };
+      });
+      steps.push({
+        id: stepId,
+        index,
+        order: index + 1,
+        actionId: action.id,
+        actionKey: action.actionKey,
+        label: action.label,
+        emoji: action.emoji,
+        inputs,
+        outputs,
+        dependencyStepIds: [...dependencyStepIds].sort(plannerCompareText),
+        warnings: [...action.warnings],
+      });
+    });
+
+    const finalGoalTokens = [...queueFor(request.classId)];
+    const producedGoalTokens = finalGoalTokens.filter((token) => token.producedByStepId);
+    const inventoryGoalTokens = finalGoalTokens.filter((token) => !token.producedByStepId);
+    const preferredGoalTokens = [...producedGoalTokens, ...inventoryGoalTokens];
+    const selectedGoalTokens = request.semantics === "additional"
+      ? preferredGoalTokens.slice(0, Math.max(0, request.quantity))
+      : preferredGoalTokens.slice(0, Math.max(0, goal.targetCount));
+    goal.finalCount = finalGoalTokens.length;
+    return {
+      goal,
+      steps,
+      tokens,
+      goalTokenIds: selectedGoalTokens.map((token) => token.tokenId),
+      finalGoalTokenIds: finalGoalTokens.map((token) => token.tokenId),
+      dependencyEdges,
+      warnings: plannerUniqueStrings([...warnings, ...steps.flatMap((step) => step.warnings)]),
+    };
+  }
+
+  /** Find a valid lexical action sequence, using bounded shortest search first. */
+  function planGoalOutput(catalog, inventory, goalClassId) {
+    const request = plannerRequest(goalClassId);
+    const normalizedInventory = Array.isArray(inventory) ? buildPlannerInventory(inventory) : inventory;
+    if (
+      !catalog?.classById ||
+      !catalog?.actionById ||
+      !catalog?.positiveProducersByClass ||
+      !normalizedInventory?.counts ||
+      !normalizedInventory?.objects ||
+      !request.classId ||
+      !catalog.classById.has(request.classId) ||
+      !Number.isInteger(request.quantity) ||
+      request.quantity < 1 ||
+      request.quantity > PLANNER_MAX_QUANTITY
+    ) {
+      const result = plannerEmptyResult(catalog, normalizedInventory || buildPlannerInventory([]), request, "invalid-goal", [
+        {
+          code: "invalid-goal",
+          message: `Choose an exact goal class version and a whole quantity from 1 to ${PLANNER_MAX_QUANTITY.toLocaleString()}.`,
+          classIds: request.classId ? [request.classId] : [],
+          actionIds: [],
+        },
+      ]);
+      result.totals.visitedStates = 0;
+      return result;
+    }
+
+    const goal = plannerGoalSummary(catalog, normalizedInventory, request);
+    if (goal.initialCount >= goal.targetCount) {
+      const materialized = materializePlannerSequence(catalog, normalizedInventory, [], request);
+      return {
+        version: 1,
+        status: "satisfied",
+        strategy: "inventory",
+        shortestGuaranteed: true,
+        goal: materialized.goal,
+        sequence: [],
+        steps: materialized.steps,
+        tokens: materialized.tokens,
+        goalTokenIds: materialized.goalTokenIds,
+        finalGoalTokenIds: materialized.finalGoalTokenIds,
+        dependencyEdges: materialized.dependencyEdges,
+        totals: {
+          actionCount: 0,
+          expandedStates: 0,
+          visitedStates: 1,
+          maxSteps: request.maxSteps,
+          maxExpandedStates: request.maxExpandedStates,
+        },
+        alternativeProducerActionIds: (catalog.positiveProducersByClass.get(request.classId) || []).map((action) => action.id),
+        warnings: plannerUniqueStrings([...(normalizedInventory.warnings || []), ...materialized.warnings]),
+        diagnostics: [],
+      };
+    }
+
+    const closure = plannerRelevantClosure(catalog, request.classId);
+    const support = plannerStructuralSupport(closure, normalizedInventory);
+    const cycleDiagnostics = plannerCycleDiagnostics(closure, normalizedInventory, support);
+    const relatedWarnings = closure.actions.flatMap((action) => action.warnings.map((warning) => `${action.label}: ${warning}`));
+    const goalProducers = catalog.positiveProducersByClass.get(request.classId) || [];
+    if (!goalProducers.length || !support.supported.has(request.classId)) {
+      const missingClassIds = closure.classIds.filter(
+        (classId) =>
+          (normalizedInventory.counts.get(classId) || 0) === 0 &&
+          !(catalog.positiveProducersByClass.get(classId) || []).length,
+      );
+      const diagnostics = [...cycleDiagnostics];
+      if (!goalProducers.length) {
+        diagnostics.unshift({
+          code: "no-positive-producer",
+          message: "No action has positive net output for this exact class version.",
+          classIds: [request.classId],
+          actionIds: [],
+        });
+      }
+      if (missingClassIds.length) {
+        diagnostics.push({
+          code: "missing-seed",
+          message: "Required class versions have neither live inventory nor a positive-net producer.",
+          classIds: missingClassIds,
+          actionIds: [],
+        });
+      }
+      if (!diagnostics.length) {
+        diagnostics.push({
+          code: "structurally-unreachable",
+          message: "The goal is outside the production support reachable from live inventory and source actions.",
+          classIds: [request.classId],
+          actionIds: closure.actions.map((action) => action.id),
+        });
+      }
+      return plannerEmptyResult(catalog, normalizedInventory, request, "unreachable", diagnostics, relatedWarnings);
+    }
+
+    const classIds = closure.classIds;
+    const classIndex = new Map(classIds.map((classId, index) => [classId, index]));
+    const goalIndex = classIndex.get(request.classId);
+    const maxInputByClass = new Map();
+    for (const action of closure.actions) {
+      for (const input of action.inputs) {
+        maxInputByClass.set(input.classId, Math.max(maxInputByClass.get(input.classId) || 0, input.count));
+      }
+    }
+    // Any <= D-step plan can consume at most D times the largest per-action input
+    // multiplicity, so counts beyond this cap are behaviorally indistinguishable.
+    const caps = classIds.map((classId) => {
+      const retainedGoalCount = classId === request.classId ? goal.targetCount : 0;
+      return retainedGoalCount + request.maxSteps * (maxInputByClass.get(classId) || 0);
+    });
+    const initialMarking = classIds.map((classId, index) =>
+      Math.min(normalizedInventory.counts.get(classId) || 0, caps[index]),
+    );
+    const markingKey = (marking) => marking.join(",");
+    const queue = [{ marking: initialMarking, depth: 0, parent: null, actionId: "" }];
+    const visited = new Set([markingKey(initialMarking)]);
+    const visitedStateBudget = Math.max(1, request.maxExpandedStates);
+    let cursor = 0;
+    let expandedStates = 0;
+    let winningNode = null;
+    let depthLimitHit = false;
+    let expansionLimitHit = false;
+
+    while (cursor < queue.length) {
+      if (expandedStates >= request.maxExpandedStates) {
+        expansionLimitHit = true;
+        break;
+      }
+      const node = queue[cursor];
+      cursor += 1;
+      expandedStates += 1;
+      if (node.marking[goalIndex] >= goal.targetCount) {
+        winningNode = node;
+        break;
+      }
+      if (node.depth >= request.maxSteps) {
+        depthLimitHit = true;
+        continue;
+      }
+      for (const action of closure.actions) {
+        let enabled = true;
+        for (const input of action.inputs) {
+          if (node.marking[classIndex.get(input.classId)] < input.count) {
+            enabled = false;
+            break;
+          }
+        }
+        if (!enabled) continue;
+        const next = node.marking.slice();
+        for (const input of action.inputs) next[classIndex.get(input.classId)] -= input.count;
+        for (const output of action.outputs) {
+          const index = classIndex.get(output.classId);
+          if (index === undefined) continue;
+          next[index] = Math.min(caps[index], next[index] + output.count);
+        }
+        const key = markingKey(next);
+        if (visited.has(key)) continue;
+        if (visited.size >= visitedStateBudget) {
+          expansionLimitHit = true;
+          break;
+        }
+        visited.add(key);
+        queue.push({ marking: next, depth: node.depth + 1, parent: node, actionId: action.id });
+      }
+    }
+
+    if (!winningNode) {
+      const limitingCode = expansionLimitHit ? "state-budget-exhausted" : depthLimitHit ? "step-budget-exhausted" : "bounded-search-exhausted";
+      const searchDiagnostic = {
+        code: "search-limit",
+        message: expansionLimitHit
+          ? `Shortest-path search reached the ${request.maxExpandedStates.toLocaleString()}-state budget.`
+          : depthLimitHit
+            ? `Shortest-path search found no plan within ${request.maxSteps.toLocaleString()} actions.`
+            : "The safely capped shortest-path state space was exhausted.",
+        classIds: [request.classId],
+        actionIds: closure.actions.map((action) => action.id),
+        reason: limitingCode,
+      };
+      const fallback = plannerGoalDirectedSequence(catalog, normalizedInventory, request);
+      if (fallback.success) {
+        const materialized = materializePlannerSequence(catalog, normalizedInventory, fallback.sequence, request);
+        const completeReplay =
+          materialized.steps.length === fallback.sequence.length &&
+          materialized.steps.every((step) => {
+            const action = catalog.actionById.get(step.actionId);
+            return action && step.inputs.length === action.inputSlots.length && step.outputs.length === action.outputSlots.length;
+          });
+        const validFallback =
+          completeReplay &&
+          materialized.goal.finalCount >= materialized.goal.targetCount &&
+          !materialized.warnings.some((warning) => warning.includes("could not consume") || warning.includes("unknown action"));
+        if (validFallback) {
+          return {
+            version: 1,
+            status: "planned",
+            strategy: "goal-directed-fallback",
+            shortestGuaranteed: false,
+            goal: materialized.goal,
+            sequence: fallback.sequence,
+            steps: materialized.steps,
+            tokens: materialized.tokens,
+            goalTokenIds: materialized.goalTokenIds,
+            finalGoalTokenIds: materialized.finalGoalTokenIds,
+            dependencyEdges: materialized.dependencyEdges,
+            totals: {
+              actionCount: fallback.sequence.length,
+              expandedStates,
+              visitedStates: visited.size,
+              fallbackAttempts: fallback.attempts,
+              maxSteps: request.maxSteps,
+              maxExpandedStates: request.maxExpandedStates,
+            },
+            alternativeProducerActionIds: goalProducers.map((action) => action.id),
+            warnings: plannerUniqueStrings([
+              ...(normalizedInventory.warnings || []),
+              ...materialized.warnings,
+              "A valid exact-token goal-directed fallback plan was found after shortest-path search reached its bound; its action count is not guaranteed minimal, and Driver predicate/state checks remain authoritative.",
+            ]),
+            diagnostics: [...cycleDiagnostics, searchDiagnostic],
+          };
+        }
+      }
+      const diagnostics = [...cycleDiagnostics, {
+        ...searchDiagnostic,
+        message: `${searchDiagnostic.message} ${fallback.limitHit ? "Goal-directed fallback reached its branch budget" : "Goal-directed fallback also found no valid sequence"}; reachability remains unknown.`,
+      }];
+      const result = plannerEmptyResult(catalog, normalizedInventory, request, "search-limit", diagnostics, [
+        ...relatedWarnings,
+        "Planner bounds were reached without a result; the goal has not been declared unreachable.",
+      ]);
+      result.totals.expandedStates = expandedStates;
+      result.totals.visitedStates = visited.size;
+      result.totals.fallbackAttempts = fallback.attempts;
+      return result;
+    }
+
+    const sequence = [];
+    for (let node = winningNode; node?.parent; node = node.parent) sequence.push(node.actionId);
+    sequence.reverse();
+    const materialized = materializePlannerSequence(catalog, normalizedInventory, sequence, request);
+    return {
+      version: 1,
+      status: "planned",
+      strategy: "bounded-shortest",
+      shortestGuaranteed: true,
+      goal: materialized.goal,
+      sequence,
+      steps: materialized.steps,
+      tokens: materialized.tokens,
+      goalTokenIds: materialized.goalTokenIds,
+      finalGoalTokenIds: materialized.finalGoalTokenIds,
+      dependencyEdges: materialized.dependencyEdges,
+      totals: {
+        actionCount: sequence.length,
+        expandedStates,
+        visitedStates: visited.size,
+        maxSteps: request.maxSteps,
+        maxExpandedStates: request.maxExpandedStates,
+      },
+      alternativeProducerActionIds: goalProducers.map((action) => action.id),
+      warnings: plannerUniqueStrings([...(normalizedInventory.warnings || []), ...materialized.warnings]),
+      diagnostics: cycleDiagnostics,
+    };
+  }
+  // End planner domain core.
+
   function predicateCalls(source, name) {
     const text = String(source || "");
     const callName = String(name);
@@ -1891,16 +2884,50 @@
     const sourceAvailable = Boolean(source.trim()) && !/AND\(\.\.\.\)/.test(source);
     if (!sourceAvailable) {
       return {
-        pow: { level: "Unknown", detail: "Predicate unavailable" },
-        vdf: { level: "Unknown", detail: "Predicate unavailable" },
+        sourceAvailable: false,
+        complete: false,
+        partial: false,
+        coverage: "unknown",
+        pow: {
+          level: "Unknown",
+          detail: "Predicate unavailable",
+          callCount: null,
+          knownCount: 0,
+          unreadableCount: null,
+          expectedAttempts: 0n,
+          complete: false,
+          coverage: "unknown",
+        },
+        vdf: {
+          level: "Unknown",
+          detail: "Predicate unavailable",
+          callCount: null,
+          knownCount: 0,
+          literalCount: 0,
+          invalidCount: 0,
+          unreadableCount: null,
+          totalIterations: 0n,
+          complete: false,
+          coverage: "unknown",
+        },
       };
     }
 
     const vdfCalls = predicateCalls(source, "Vdf");
     const vdfIterations = vdfCalls.map((call) => splitPredicateArguments(call.argumentsSource)[0]);
     const literalVdfIterations = vdfIterations.filter((value) => /^-?\d+$/.test(value || "")).map((value) => BigInt(value));
-    const vdfTotal = literalVdfIterations.reduce((sum, value) => sum + value, 0n);
     const invalidVdfCount = literalVdfIterations.filter((value) => value < 2n || value >= (1n << 32n)).length;
+    const validVdfIterations = literalVdfIterations.filter((value) => value >= 2n && value < (1n << 32n));
+    const vdfTotal = validVdfIterations.reduce((sum, value) => sum + value, 0n);
+    const unreadableVdfCount = vdfCalls.length - literalVdfIterations.length;
+    const vdfComplete = validVdfIterations.length === vdfCalls.length;
+    const vdfCoverage = !vdfCalls.length
+      ? "none"
+      : vdfComplete
+        ? "complete"
+        : validVdfIterations.length
+          ? "partial"
+          : "unknown";
     const vdfLevel = !vdfCalls.length
       ? "None"
       : invalidVdfCount
@@ -1926,6 +2953,14 @@
       const denominator = targetValue + 1n;
       expectedAttempts += ((1n << 256n) + denominator - 1n) / denominator;
     }
+    const powComplete = readablePowTargets.length === powCalls.length;
+    const powCoverage = !powCalls.length
+      ? "none"
+      : powComplete
+        ? "complete"
+        : readablePowTargets.length
+          ? "partial"
+          : "unknown";
     const powLevel = !powCalls.length
       ? "None"
       : readablePowTargets.length !== powCalls.length
@@ -1940,10 +2975,23 @@
     const expectedAttemptDetail = expectedAttempts <= BigInt(Number.MAX_SAFE_INTEGER)
       ? Math.max(1, Number(expectedAttempts)).toLocaleString()
       : `>${Number.MAX_SAFE_INTEGER.toLocaleString()}`;
+    const complete = powComplete && vdfComplete;
+    const knownCount = readablePowTargets.length + validVdfIterations.length;
+    const callCount = powCalls.length + vdfCalls.length;
 
     return {
+      sourceAvailable: true,
+      complete,
+      partial: !complete && knownCount > 0,
+      coverage: complete ? (callCount ? "complete" : "none") : knownCount ? "partial" : "unknown",
       pow: {
         level: powLevel,
+        callCount: powCalls.length,
+        knownCount: readablePowTargets.length,
+        unreadableCount: powCalls.length - readablePowTargets.length,
+        expectedAttempts,
+        complete: powComplete,
+        coverage: powCoverage,
         detail: !powCalls.length
           ? "No direct LtEq threshold"
           : readablePowTargets.length !== powCalls.length
@@ -1952,6 +3000,14 @@
       },
       vdf: {
         level: vdfLevel,
+        callCount: vdfCalls.length,
+        knownCount: validVdfIterations.length,
+        literalCount: literalVdfIterations.length,
+        invalidCount: invalidVdfCount,
+        unreadableCount: unreadableVdfCount,
+        totalIterations: vdfTotal,
+        complete: vdfComplete,
+        coverage: vdfCoverage,
         detail: !vdfCalls.length
           ? "No direct VDF call"
           : invalidVdfCount
@@ -1961,6 +3017,86 @@
               : `${vdfCalls.length} call${vdfCalls.length === 1 ? "" : "s"} / ${vdfTotal.toLocaleString()} total recursive iterations`,
       },
     };
+  }
+
+  // Stable timing surface for the action drawer and the goal planner. Durations are
+  // synthetic browser-equivalent work derived directly from normalized CWI component
+  // rates; they are not selected-Driver or end-to-end wall-clock estimates.
+  function estimateActionProofTiming(
+    action,
+    cwiResult = state.hardwareIndex.result,
+    workload = actionProofWorkload(action),
+  ) {
+    const cwi = normalizeHardwareIndex(cwiResult);
+    const hasCwi = Boolean(cwi);
+    const powHasKnownWork = workload.pow.expectedAttempts > 0n;
+    const vdfHasKnownWork = workload.vdf.totalIterations > 0n;
+    const hasKnownWork = powHasKnownWork || vdfHasKnownWork;
+    const millisecondsFor = (units, rate) => {
+      if (!hasCwi || units <= 0n) return units === 0n ? 0 : null;
+      const milliseconds = (Number(units) / rate) * 1000;
+      return Number.isNaN(milliseconds) || milliseconds < 0 ? null : milliseconds;
+    };
+    const powMilliseconds = powHasKnownWork
+      ? millisecondsFor(workload.pow.expectedAttempts, cwi?.searchRate)
+      : workload.pow.complete && workload.pow.callCount === 0
+        ? 0
+        : null;
+    const vdfMilliseconds = vdfHasKnownWork
+      ? millisecondsFor(workload.vdf.totalIterations, cwi?.sequentialRate)
+      : workload.vdf.complete && workload.vdf.callCount === 0
+        ? 0
+        : null;
+    const complete = workload.complete;
+    const partial = !complete && hasKnownWork;
+    let totalMilliseconds = null;
+    if (complete && !hasKnownWork) {
+      totalMilliseconds = 0;
+    } else if (hasCwi && hasKnownWork) {
+      totalMilliseconds = (powMilliseconds || 0) + (vdfMilliseconds || 0);
+    }
+    return {
+      workload,
+      cwi,
+      hasCwi,
+      hasKnownWork,
+      requiresCwi: hasKnownWork && !hasCwi,
+      complete,
+      partial,
+      lowerBound: partial && totalMilliseconds != null,
+      coverage: complete ? workload.coverage : partial ? "partial" : "unknown",
+      totalMilliseconds,
+      powMilliseconds,
+      vdfMilliseconds,
+      powLowerBound: !workload.pow.complete && powMilliseconds != null,
+      vdfLowerBound: !workload.vdf.complete && vdfMilliseconds != null,
+    };
+  }
+
+  function compactProofDurationNumber(value) {
+    if (value < 0.01) return "<0.01";
+    if (value < 10) return value.toFixed(2).replace(/\.00$/, "").replace(/(\.\d)0$/, "$1");
+    if (value < 100) return value.toFixed(1).replace(/\.0$/, "");
+    return Math.round(value).toLocaleString();
+  }
+
+  function formatProofDuration(milliseconds) {
+    if (milliseconds == null || Number.isNaN(milliseconds)) return "Unknown";
+    if (!Number.isFinite(milliseconds)) return ">999 years";
+    if (milliseconds <= 0) return "0 ms";
+    if (milliseconds < 0.001) return `${compactProofDurationNumber(milliseconds * 1_000_000)} ns`;
+    if (milliseconds < 1) return `${compactProofDurationNumber(milliseconds * 1000)} us`;
+    if (milliseconds < 1000) return `${compactProofDurationNumber(milliseconds)} ms`;
+    const seconds = milliseconds / 1000;
+    if (seconds < 60) return `${compactProofDurationNumber(seconds)} sec`;
+    const minutes = seconds / 60;
+    if (minutes < 60) return `${compactProofDurationNumber(minutes)} min`;
+    const hours = minutes / 60;
+    if (hours < 24) return `${compactProofDurationNumber(hours)} hr`;
+    const days = hours / 24;
+    if (days < 365.25) return `${compactProofDurationNumber(days)} days`;
+    const years = days / 365.25;
+    return years > 999 ? ">999 years" : `${compactProofDurationNumber(years)} years`;
   }
 
   function hardwareIndexWorkerMain() {
@@ -2066,7 +3202,7 @@
           : "Browser storage was unavailable. This result is available for this tab only."
         : failed
           ? benchmark.error
-          : "Optional one-second browser check. No Driver request or action-time estimate.";
+          : "Optional one-second browser calibration for modeled proof-work timing. No Driver request.";
     let button;
     if (running) {
       button = '<button class="game-button menu-focusable" type="button" data-command="run-hardware-index" data-hardware-index-focus aria-label="Client work index check running" aria-describedby="home-cwi-help" disabled>Testing...</button>';
@@ -2130,7 +3266,7 @@
         ${readout}
         <button class="game-button" type="button" data-command="run-hardware-index" data-hardware-index-focus aria-label="${buttonAriaLabel}"${running ? " disabled" : ""}>${buttonLabel}</button>
       </div>
-      <p class="hardware-index-note">CWI-1 100 is a fixed v1 reference: 100M independent mixes/sec plus 1M dependent BigInt steps/sec. Higher is faster only for this synthetic browser test—not a percentile or hardware grade. It does not run a Driver request, DON proof, PoW, or VDF, and it cannot predict action time.</p>`;
+      <p class="hardware-index-note">CWI-1 100 is a fixed v1 reference: 100M independent mixes/sec plus 1M dependent BigInt steps/sec. The console divides readable direct proof-work counts by these component rates to produce a synthetic browser-equivalent model. CWI does not measure the selected Driver, actual DON proof kernels, network, queue, or commit work, so the model is not Driver or end-to-end wall-clock truth.</p>`;
   }
 
   function hardwareIndexAnnouncement() {
@@ -2158,8 +3294,9 @@
     );
     let removedFocusedHome = false;
     document.querySelectorAll("[data-hardware-index]").forEach((region) => {
+      const view = region.dataset.hardwareIndexView;
       if (
-        region.dataset.hardwareIndexView === "home" &&
+        view === "home" &&
         state.hardwareIndex.result &&
         state.hardwareIndex.status !== "running"
       ) {
@@ -2169,10 +3306,19 @@
       }
       const content = region.querySelector("[data-hardware-index-content]");
       const announcement = region.querySelector("[data-hardware-index-announcement]");
-      if (content) content.innerHTML = region.dataset.hardwareIndexView === "home"
-        ? homeHardwareIndexContentMarkup()
-        : hardwareIndexContentMarkup();
-      if (announcement) announcement.textContent = hardwareIndexAnnouncement();
+      const proofAction = view === "action-proof" ? actionByKey(region.dataset.actionKey || "") : null;
+      if (content) {
+        content.innerHTML = view === "home"
+          ? homeHardwareIndexContentMarkup()
+          : view === "action-proof" && proofAction
+            ? actionProofRequirementsContentMarkup(proofAction)
+            : hardwareIndexContentMarkup();
+      }
+      if (announcement) {
+        announcement.textContent = view === "action-proof" && proofAction
+          ? actionProofTimingAnnouncement(proofAction)
+          : hardwareIndexAnnouncement();
+      }
       if (content) content.setAttribute("aria-busy", String(state.hardwareIndex.status === "running"));
       region.dataset.cwiState = state.hardwareIndex.status;
     });
@@ -2191,6 +3337,7 @@
         if (button && !button.disabled) button.focus({ preventScroll: true });
       });
     }
+    if (state.screen === "planner") patchPlanner({ replan: false });
   }
 
   async function runHardwareIndex() {
@@ -2466,11 +3613,6 @@
         if (edge.source === focusPlaceId && transitions.has(edge.target)) branchTransitions.add(edge.target);
         if (edge.target === focusPlaceId && transitions.has(edge.source)) branchTransitions.add(edge.source);
       }
-      for (const transition of transitions.values()) {
-        if (transition.flow.mutations.some((ref) => techTreeClassId(ref.class, ref.hash) === focusPlaceId)) {
-          branchTransitions.add(transition.id);
-        }
-      }
       for (const transitionId of branchTransitions) {
         included.add(transitionId);
         for (const edge of allEdges) {
@@ -2668,7 +3810,10 @@
       const componentHeight = 66 + maxRows * ROW_STEP;
       const maxRank = Math.max(...ranks, 0);
       const componentWidth = 80 + maxRank * COLUMN_STEP + NODE_WIDTH;
-      graphWidth = Math.max(graphWidth, componentWidth + 38);
+      const hasSameRankEdges = componentEdges.some(
+        (edge) => rankByNode.get(edge.source) === rankByNode.get(edge.target),
+      );
+      graphWidth = Math.max(graphWidth, componentWidth + (hasSameRankEdges ? 90 : 38));
       for (const rank of ranks) {
         const list = columns.get(rank);
         const listHeight = list.length * ROW_STEP;
@@ -2792,34 +3937,143 @@
     return true;
   }
 
-  function techTreeEdgeGeometry(edge, positions) {
+  const TECH_TREE_EDGE_ROLE_ORDER = {
+    input: 0,
+    "opaque-input": 1,
+    "opaque-output": 2,
+    output: 3,
+  };
+
+  function techTreeEdgeSides(edge, positions) {
     const source = positions.get(edge.source);
     const target = positions.get(edge.target);
     if (!source || !target) return null;
     if (source.rank === target.rank) {
-      const sourceX = source.x + source.width;
-      const targetX = target.x + target.width;
-      const sourceY = source.y + source.height / 2;
-      const targetY = target.y + target.height / 2;
-      const bend = Math.max(sourceX, targetX) + 52 + Math.min(40, Math.abs(sourceY - targetY) * 0.12);
+      return { sourceSide: "right", targetSide: "right" };
+    }
+    const forward = target.x >= source.x;
+    return {
+      sourceSide: forward ? "right" : "left",
+      targetSide: forward ? "left" : "right",
+    };
+  }
+
+  function techTreeEdgeRoutes(edges, positions) {
+    const routes = new Map();
+    const ports = new Map();
+    const pairs = new Map();
+    const addPort = (nodeId, side, edge, endpoint, otherPosition) => {
+      const key = `${nodeId}:${side}`;
+      if (!ports.has(key)) ports.set(key, []);
+      ports.get(key).push({
+        edge,
+        endpoint,
+        otherY: otherPosition.y + otherPosition.height / 2,
+      });
+    };
+
+    for (const edge of edges) {
+      const source = positions.get(edge.source);
+      const target = positions.get(edge.target);
+      const sides = techTreeEdgeSides(edge, positions);
+      if (!source || !target || !sides) continue;
+      const route = {
+        ...sides,
+        sourceOffsetY: 0,
+        targetOffsetY: 0,
+        laneOffset: 0,
+      };
+      routes.set(edge.id, route);
+      addPort(edge.source, sides.sourceSide, edge, "source", target);
+      addPort(edge.target, sides.targetSide, edge, "target", source);
+      const pairKey = [edge.source, edge.target].sort().join("\u0000");
+      if (!pairs.has(pairKey)) pairs.set(pairKey, []);
+      pairs.get(pairKey).push(edge);
+    }
+
+    for (const [key, entries] of ports) {
+      const nodeId = key.slice(0, key.lastIndexOf(":"));
+      const node = positions.get(nodeId);
+      if (!node) continue;
+      entries.sort((left, right) =>
+        left.otherY - right.otherY ||
+        (TECH_TREE_EDGE_ROLE_ORDER[left.edge.role] ?? 9) - (TECH_TREE_EDGE_ROLE_ORDER[right.edge.role] ?? 9) ||
+        left.edge.id.localeCompare(right.edge.id),
+      );
+      const usableHeight = Math.max(0, node.height - 20);
+      const spacing = entries.length > 1 ? Math.min(10, usableHeight / (entries.length - 1)) : 0;
+      entries.forEach((entry, index) => {
+        const route = routes.get(entry.edge.id);
+        if (!route) return;
+        route[`${entry.endpoint}OffsetY`] = (index - (entries.length - 1) / 2) * spacing;
+      });
+    }
+
+    for (const pairEdges of pairs.values()) {
+      if (pairEdges.length < 2) continue;
+      pairEdges.sort((left, right) =>
+        (TECH_TREE_EDGE_ROLE_ORDER[left.role] ?? 9) - (TECH_TREE_EDGE_ROLE_ORDER[right.role] ?? 9) ||
+        left.id.localeCompare(right.id),
+      );
+      pairEdges.forEach((edge, index) => {
+        const route = routes.get(edge.id);
+        if (route) route.laneOffset = (index - (pairEdges.length - 1) / 2) * 10;
+      });
+    }
+    return routes;
+  }
+
+  function techTreeEdgeRoleLabel(role) {
+    return ({
+      input: "CONSUME",
+      output: "CREATE",
+      "opaque-input": "INPUT?",
+      "opaque-output": "OUTPUT?",
+    })[role] || "FLOW";
+  }
+
+  function techTreeEdgeLabelMarkup(role, count, x, y) {
+    const label = `${techTreeEdgeRoleLabel(role)} x${Math.max(1, Number(count) || 1)}`;
+    const width = Math.max(42, label.length * 5.2 + 12);
+    return `
+      <g class="tech-tree-edge-label tech-tree-edge-label-${role}" transform="translate(${x} ${y})" aria-hidden="true">
+        <rect x="${-width / 2}" y="-8" width="${width}" height="16"></rect>
+        <text y="3">${escapeHtml(label)}</text>
+      </g>`;
+  }
+
+  function techTreeEdgeGeometry(edge, positions, route = {}) {
+    const source = positions.get(edge.source);
+    const target = positions.get(edge.target);
+    if (!source || !target) return null;
+    const sourceSide = route.sourceSide || "right";
+    const targetSide = route.targetSide || "left";
+    const sourceX = sourceSide === "right" ? source.x + source.width : source.x;
+    const targetX = targetSide === "right" ? target.x + target.width : target.x;
+    const sourceY = source.y + source.height / 2 + (route.sourceOffsetY || 0);
+    const targetY = target.y + target.height / 2 + (route.targetOffsetY || 0);
+    const laneOffset = route.laneOffset || 0;
+    if (source.rank === target.rank) {
+      const rightSide = sourceSide === "right";
+      const outerX = rightSide ? Math.max(sourceX, targetX) : Math.min(sourceX, targetX);
+      const bendDistance = 52 + Math.min(40, Math.abs(sourceY - targetY) * 0.12) + laneOffset;
+      const bend = outerX + (rightSide ? bendDistance : -bendDistance);
       return {
         path: `M ${sourceX} ${sourceY} C ${bend} ${sourceY}, ${bend} ${targetY}, ${targetX} ${targetY}`,
         labelX: bend,
-        labelY: (sourceY + targetY) / 2,
+        labelY: (sourceY + targetY) / 2 + laneOffset,
       };
     }
-    const forward = target.x >= source.x;
-    const sourceX = forward ? source.x + source.width : source.x;
-    const targetX = forward ? target.x : target.x + target.width;
-    const sourceY = source.y + source.height / 2;
-    const targetY = target.y + target.height / 2;
+    const forward = targetX >= sourceX;
     const control = Math.max(44, Math.abs(targetX - sourceX) * 0.46);
     const firstControl = sourceX + (forward ? control : -control);
     const secondControl = targetX + (forward ? -control : control);
+    const firstControlY = sourceY + laneOffset;
+    const secondControlY = targetY + laneOffset;
     return {
-      path: `M ${sourceX} ${sourceY} C ${firstControl} ${sourceY}, ${secondControl} ${targetY}, ${targetX} ${targetY}`,
+      path: `M ${sourceX} ${sourceY} C ${firstControl} ${firstControlY}, ${secondControl} ${secondControlY}, ${targetX} ${targetY}`,
       labelX: (sourceX + targetX) / 2,
-      labelY: (sourceY + targetY) / 2,
+      labelY: (sourceY + targetY) / 2 + laneOffset * 0.75,
     };
   }
 
@@ -2827,9 +4081,9 @@
     const parts = [`
       <defs>
         <marker id="tree-arrow-input" class="tech-tree-marker tech-tree-marker-input" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z"></path></marker>
-        <marker id="tree-arrow-output" class="tech-tree-marker tech-tree-marker-output" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z"></path></marker>
-        <marker id="tree-arrow-opaque-input" class="tech-tree-marker tech-tree-marker-opaque" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z"></path></marker>
-        <marker id="tree-arrow-opaque-output" class="tech-tree-marker tech-tree-marker-opaque" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z"></path></marker>
+        <marker id="tree-arrow-output" class="tech-tree-marker tech-tree-marker-output" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 5 L 5 0 L 10 5 L 5 10 z"></path></marker>
+        <marker id="tree-arrow-opaque-input" class="tech-tree-marker tech-tree-marker-opaque tech-tree-marker-opaque-input" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 1 1 L 9 5 L 1 9 z"></path></marker>
+        <marker id="tree-arrow-opaque-output" class="tech-tree-marker tech-tree-marker-opaque tech-tree-marker-opaque-output" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 1 5 L 5 1 L 9 5 L 5 9 z"></path></marker>
       </defs>`];
 
     for (const box of layout.componentBoxes) {
@@ -2841,13 +4095,15 @@
         </g>`);
     }
 
+    const edgeRoutes = techTreeEdgeRoutes(model.edges, layout.positions);
     for (const edge of model.edges) {
-      const geometry = techTreeEdgeGeometry(edge, layout.positions);
+      const geometry = techTreeEdgeGeometry(edge, layout.positions, edgeRoutes.get(edge.id));
       if (!geometry) continue;
       parts.push(`
         <g class="tech-tree-edge tech-tree-edge-${edge.role}" data-tree-edge-id="${escapeHtml(edge.id)}" data-tree-source="${escapeHtml(edge.source)}" data-tree-target="${escapeHtml(edge.target)}" data-tree-role="${edge.role}" aria-hidden="true">
-          <path d="${geometry.path}" marker-end="url(#tree-arrow-${edge.role})"></path>
-          ${edge.count > 1 ? `<g class="tech-tree-edge-count" transform="translate(${geometry.labelX} ${geometry.labelY})"><rect x="-13" y="-9" width="26" height="17"></rect><text y="4">x${edge.count}</text></g>` : ""}
+          <path class="tech-tree-edge-halo" d="${geometry.path}"></path>
+          <path class="tech-tree-edge-line" d="${geometry.path}" marker-end="url(#tree-arrow-${edge.role})"></path>
+          ${techTreeEdgeLabelMarkup(edge.role, edge.count, geometry.labelX, geometry.labelY)}
         </g>`);
     }
 
@@ -3034,12 +4290,12 @@
           `${cartridge.name} cartridge`,
           "Cartridge Skill Tree",
           "Explore every public class and action signature as a Petri net, including disconnected networks.",
-          `${backButton("Play")}${gameButton("Play", "actions")}${gameButton("Objects", "objects")}`,
+          `${backButton("Play")}${gameButton("Play", "actions")}${gameButton("Goal Planner", "planner")}${gameButton("Objects", "objects")}`,
         )}
         <div class="tech-tree-toolbar">
           <div class="game-toolbar-group" role="group" aria-label="Tree view">
             ${gameButton("Full Net", "tree-mode", { tone: allMode ? "primary" : "", extra: ` data-value="all" aria-pressed="${allMode}"` })}
-            ${gameButton("Object Branches", "tree-mode", { tone: !allMode ? "primary" : "", extra: ` data-value="object" aria-pressed="${!allMode}"${objects.length ? "" : " disabled"}` })}
+            ${gameButton("Object Neighborhood", "tree-mode", { tone: !allMode ? "primary" : "", extra: ` data-value="object" aria-pressed="${!allMode}"${objects.length ? "" : " disabled"}` })}
           </div>
           <label class="tech-tree-object-control" for="tree-object-select"><span>Object lens</span><select id="tree-object-select" class="game-select"${objects.length ? "" : " disabled"}><option value="">${objects.length ? "Choose object" : "No objects"}</option>${options}</select></label>
           <div class="game-toolbar-group tech-tree-view-controls" role="group" aria-label="Graph view controls">
@@ -3064,7 +4320,7 @@
             </button>
             <svg id="tech-tree-svg" role="group" aria-labelledby="tech-tree-svg-title tech-tree-svg-description" preserveAspectRatio="xMidYMid meet">
               <title id="tech-tree-svg-title">${escapeHtml(cartridge.name)} action dependency graph</title>
-              <desc id="tech-tree-svg-description">Class states connect to action transitions through consume, create, and dashed unresolved input or output arcs. Explicit mutations are excluded.</desc>
+              <desc id="tech-tree-svg-description">Class states connect to action transitions through labelled consume and create arcs. Consume arcs use triangle markers, create arcs use diamond markers, and dashed open markers identify unresolved input or output arcs. Explicit mutations are excluded.</desc>
             </svg>
             <span class="tech-tree-map-help" aria-hidden="true">Click: trace prerequisites / again: clear / drag: pan / wheel: zoom</span>
           </div>
@@ -3250,7 +4506,7 @@
     root.dataset.treeFingerprint = model.fingerprint;
     const accessibleMarkup = `
       <title id="tech-tree-svg-title">${escapeHtml(model.cartridge.name)} action dependency graph</title>
-      <desc id="tech-tree-svg-description">Class states connect to action transitions through required input and produced output arcs. Select a node to emphasize only the prerequisite steps that can lead to it; select it again to clear the emphasis.</desc>`;
+      <desc id="tech-tree-svg-description">Class states connect to action transitions through labelled required-input and produced-output arcs. Consume arcs use triangle markers, create arcs use diamond markers, and dashed open markers identify unresolved relationships. Select a node to emphasize only the prerequisite steps that can lead to it; select it again to clear the emphasis.</desc>`;
     svg.innerHTML = accessibleMarkup + (model.nodes.length
       ? drawTechTreeSvg(model, layout)
       : '<text class="tech-tree-empty" x="20" y="40">No classes or actions are available for this cartridge.</text>');
@@ -3484,7 +4740,7 @@
           `${cartridge.name} cartridge`,
           "Play",
           "Choose an action. The Driver performs the authoritative feasibility check before inputs are submitted.",
-          `${backButton()}${gameButton("Switch Cartridge", "cartridges")}${gameButton("Tech Tree", "tree")}${gameButton("Objects", "objects")}${gameButton("Activity", "activity")}`,
+          `${backButton()}${gameButton("Switch Cartridge", "cartridges")}${gameButton("Goal Planner", "planner")}${gameButton("Tech Tree", "tree")}${gameButton("Objects", "objects")}${gameButton("Activity", "activity")}`,
         )}
         <div class="game-toolbar">
           <input id="action-search" class="game-input game-search" type="search" placeholder="Search actions" value="${escapeHtml(state.actionSearch)}" aria-label="Search actions" />
@@ -3492,6 +4748,526 @@
         </div>
         <div data-catalog-region="actions">${actionCatalogMarkup(cartridge)}</div>
       </section>`;
+  }
+
+  function plannerContext(cartridge = selectedCartridge(), settings = {}) {
+    if (!cartridge) return { cartridge: null, catalog: null, inventory: null, options: [], result: null, error: null };
+    const sourceError = state.workspace.errors.actions || state.workspace.errors.objects;
+    if (sourceError) {
+      const source = state.workspace.errors.actions ? "action catalog" : "object inventory";
+      return {
+        cartridge,
+        catalog: null,
+        inventory: null,
+        options: [],
+        result: null,
+        error: `Planner unavailable because the Driver ${source} could not be loaded: ${sourceError}`,
+      };
+    }
+    try {
+      const catalog = buildPlannerCatalog(cartridge, state.workspace);
+      const inventory = buildPlannerInventory(state.workspace.objects);
+      const goalOptions = plannerGoalOptions(catalog);
+      const optionIds = new Set(goalOptions.map((option) => option.classId));
+      if (!optionIds.has(state.planner.goalClassId)) {
+        state.planner.goalClassId = goalOptions[0]?.classId || "";
+      }
+      const cachedResult = settings.reuseResult && state.planner.result?.goal?.classId === state.planner.goalClassId
+        ? state.planner.result
+        : null;
+      const result = cachedResult || (state.planner.goalClassId
+        ? planGoalOutput(catalog, inventory, state.planner.goalClassId)
+        : null);
+      state.planner.result = result;
+      return { cartridge, catalog, inventory, options: goalOptions, result, error: null };
+    } catch (error) {
+      state.planner.result = null;
+      return { cartridge, catalog: null, inventory: null, options: [], result: null, error: error.message };
+    }
+  }
+
+  function plannerActionForStep(step, catalog) {
+    return catalog?.actionById?.get(step.actionId)?.raw || actionByKey(step.actionKey);
+  }
+
+  function plannerStepSlotRole(step, classId, slotIndex, endpoint, catalog) {
+    const action = catalog?.actionById?.get(step.actionId);
+    const turnover = action?.sameClassTurnover?.find((item) => item.classId === classId);
+    if (!turnover) return endpoint;
+    const slots = endpoint === "input" ? action.inputSlots : action.outputSlots;
+    const position = slots.filter((slot) => slot.classId === classId).findIndex((slot) => slot.slotIndex === slotIndex);
+    const pairedCount = Math.min(turnover.inputs, turnover.outputs);
+    return position >= 0 && position < pairedCount ? `update-${endpoint}` : endpoint;
+  }
+
+  function plannerTimingLabel(summary, emptyLabel = "0 ms") {
+    if (!summary.count) return emptyLabel;
+    if (summary.requiresCwi) return "Run CWI";
+    if (!summary.knownCount) return "Time unknown";
+    if (!summary.directWorkCount && !summary.complete) return "Time unknown";
+    const duration = formatProofDuration(summary.knownMilliseconds);
+    return summary.complete ? duration : `>= ${duration}`;
+  }
+
+  function plannerTimingSummary(stepIds, timingByStep) {
+    const ids = [...new Set(stepIds || [])];
+    let knownMilliseconds = 0;
+    let knownCount = 0;
+    let directWorkCount = 0;
+    let complete = true;
+    let requiresCwi = false;
+    for (const id of ids) {
+      const timing = timingByStep.get(id);
+      if (!timing) {
+        complete = false;
+        continue;
+      }
+      if (timing.totalMilliseconds != null) {
+        knownMilliseconds += timing.totalMilliseconds;
+        knownCount += 1;
+      }
+      if (timing.hasKnownWork) directWorkCount += 1;
+      if (!timing.complete || timing.totalMilliseconds == null) complete = false;
+      requiresCwi ||= timing.requiresCwi;
+    }
+    return { count: ids.length, knownMilliseconds, knownCount, directWorkCount, complete, requiresCwi };
+  }
+
+  function plannerDirectTimingLabel(timing) {
+    if (!timing) return "Time unknown";
+    if (timing.requiresCwi) return "Run CWI";
+    if (timing.totalMilliseconds == null) return "Time unknown";
+    return `${timing.complete ? "" : ">= "}${formatProofDuration(timing.totalMilliseconds)}`;
+  }
+
+  function plannerDirectTimingBreakdown(timing) {
+    if (!timing?.workload) return "PoW unknown / VDF unknown";
+    const pow = actionProofComponentTimingLabel(timing.workload.pow, timing.powMilliseconds, timing);
+    const vdf = actionProofComponentTimingLabel(timing.workload.vdf, timing.vdfMilliseconds, timing);
+    return `PoW ${pow} / VDF ${vdf}`;
+  }
+
+  function buildPlannerDisplayTree(result, timingByStep, catalog) {
+    if (!result?.goal) return null;
+    const stepById = new Map(result.steps.map((step) => [step.id, step]));
+    const tokenById = new Map(result.tokens.map((token) => [token.tokenId, token]));
+    const expandedSteps = new Set();
+
+    const blockedRoot = (status) => {
+      const missingClassIds = [...new Set(
+        (result.diagnostics || [])
+          .filter((diagnostic) => diagnostic.code === "missing-seed")
+          .flatMap((diagnostic) => diagnostic.classIds || []),
+      )].filter((classId) => classId !== result.goal.classId);
+      return {
+        id: "goal",
+        kind: "object",
+        label: result.goal.label,
+        state: status,
+        isRoot: true,
+        stepIds: new Set(),
+        children: missingClassIds.slice(0, 12).map((classId) => {
+          const item = catalog?.classById?.get(classId);
+          return {
+            id: `missing:${classId}`,
+            kind: "object",
+            label: item?.label || classId,
+            state: "blocked",
+            diagnostic: true,
+            diagnosticHash: item?.hash || "",
+            inputRole: "missing",
+            stepIds: new Set(),
+            children: [],
+          };
+        }),
+      };
+    };
+
+    const buildToken = (tokenId, path = new Set()) => {
+      const token = tokenById.get(tokenId);
+      if (!token) return {
+        id: `missing:${tokenId}`,
+        kind: "object",
+        label: "Missing component",
+        state: "blocked",
+        stepIds: new Set(),
+        children: [],
+      };
+      const base = {
+        id: `object:${token.tokenId}`,
+        kind: "object",
+        label: token.classLabel || token.classId,
+        token,
+        state: token.kind === "inventory" ? "inventory" : "planned",
+        stepIds: new Set(),
+        children: [],
+      };
+      if (token.kind === "inventory" || !token.producedByStepId) return base;
+      const step = stepById.get(token.producedByStepId);
+      if (!step) return { ...base, state: "blocked" };
+      if (path.has(step.id)) return { ...base, state: "cycle", aliasStep: step };
+      if (expandedSteps.has(step.id)) return { ...base, state: "shared", aliasStep: step };
+      expandedSteps.add(step.id);
+      const nextPath = new Set(path).add(step.id);
+      const inputNodes = step.inputs.map((input) => {
+        const inputNode = buildToken(input.tokenId, nextPath);
+        inputNode.inputRole = plannerStepSlotRole(step, input.classId, input.slotIndex, "input", catalog);
+        return inputNode;
+      });
+      const stepIds = new Set([step.id]);
+      for (const input of inputNodes) for (const id of input.stepIds) stepIds.add(id);
+      const output = step.outputs.find((item) => item.tokenId === token.tokenId);
+      const actionNode = {
+        id: `action:${step.id}`,
+        kind: "action",
+        label: step.label,
+        step,
+        state: "planned",
+        stepIds,
+        outputRole: plannerStepSlotRole(step, token.classId, output?.slotIndex, "output", catalog),
+        children: inputNodes,
+      };
+      return { ...base, stepIds, children: [actionNode] };
+    };
+
+    if (result.status === "unreachable") return blockedRoot("blocked");
+    if (result.status === "search-limit") return blockedRoot("search-limit");
+    if (result.status === "invalid-goal") return blockedRoot("blocked");
+    const goalTokenId = result.goalTokenIds[0];
+    const root = goalTokenId ? buildToken(goalTokenId) : blockedRoot(result.status === "satisfied" ? "inventory" : "blocked");
+    root.isRoot = true;
+    root.label = result.goal.label;
+    root.timing = plannerTimingSummary(root.stepIds, timingByStep);
+    return root;
+  }
+
+  function layoutPlannerDisplayTree(root) {
+    if (!root) return null;
+    const HORIZONTAL_GAP = 28;
+    const LEVEL_GAP = 74;
+    const TOP = 24;
+    const NODE_SIZES = {
+      object: { width: 184, height: 64 },
+      action: { width: 164, height: 58 },
+    };
+    const measure = (node) => {
+      node.size = NODE_SIZES[node.kind];
+      const childWidths = node.children.map(measure);
+      const childrenWidth = childWidths.reduce((sum, width) => sum + width, 0) + Math.max(0, childWidths.length - 1) * HORIZONTAL_GAP;
+      node.span = Math.max(node.size.width, childrenWidth);
+      return node.span;
+    };
+    measure(root);
+    const nodes = [];
+    const edges = [];
+    let maximumDepth = 0;
+    const place = (node, left, depth) => {
+      maximumDepth = Math.max(maximumDepth, depth);
+      node.x = left + (node.span - node.size.width) / 2;
+      node.y = TOP + depth * (64 + LEVEL_GAP);
+      node.depth = depth;
+      nodes.push(node);
+      const childrenWidth = node.children.reduce((sum, child) => sum + child.span, 0) + Math.max(0, node.children.length - 1) * HORIZONTAL_GAP;
+      let childLeft = left + (node.span - childrenWidth) / 2;
+      node.children.forEach((child, index) => {
+        place(child, childLeft, depth + 1);
+        edges.push({
+          id: `${child.id}>${node.id}`,
+          source: child,
+          target: node,
+          role: child.kind === "object" ? child.inputRole || "input" : child.outputRole || "output",
+          targetIndex: index,
+          targetCount: node.children.length,
+        });
+        childLeft += child.span + HORIZONTAL_GAP;
+      });
+    };
+    place(root, 30, 0);
+    const width = Math.max(720, root.span + 60);
+    const deepest = nodes.reduce((value, node) => node.depth >= value.depth ? node : value, nodes[0]);
+    const height = Math.max(190, deepest.y + deepest.size.height + 30);
+    return { root, nodes, edges, width, height, maximumDepth };
+  }
+
+  function plannerNodeStatus(node, timingByStep) {
+    if (node.kind === "action") {
+      return `STEP ${node.step.index + 1} / ${plannerDirectTimingLabel(timingByStep.get(node.step.id))}`;
+    }
+    if (node.state === "inventory") return node.isRoot ? "TARGET / ON HAND" : "ON HAND / 0 WORK";
+    if (node.state === "shared") return `FROM STEP ${(node.aliasStep?.index ?? 0) + 1} / SHARED`;
+    if (node.state === "cycle") return "CYCLE REFERENCE";
+    if (node.state === "search-limit") return "SEARCH LIMIT";
+    if (node.diagnostic) return `MISSING / ${node.diagnosticHash ? shortText(node.diagnosticHash, 5, 3) : "NO SOURCE"}`;
+    if (node.state === "blocked") return "BLOCKED";
+    const summary = node.timing || plannerTimingSummary(node.stepIds, timingByStep);
+    return `${node.isRoot ? "TARGET" : "READY"} / ${plannerTimingLabel(summary)}`;
+  }
+
+  function plannerTreeSvg(root, timingByStep, cartridgeName) {
+    const layout = layoutPlannerDisplayTree(root);
+    if (!layout) return "";
+    const edgeMarkup = layout.edges.map((edge) => {
+      const sourceX = edge.source.x + edge.source.size.width / 2;
+      const sourceY = edge.source.y;
+      const targetX = edge.target.x + edge.target.size.width * ((edge.targetIndex + 1) / (edge.targetCount + 1));
+      const targetY = edge.target.y + edge.target.size.height;
+      const gap = sourceY - targetY;
+      const laneWindow = edge.targetCount > 1 ? Math.min(gap * 0.46, (edge.targetCount - 1) * 10) : 0;
+      const laneOffset = edge.targetCount > 1
+        ? (edge.targetIndex / (edge.targetCount - 1) - 0.5) * laneWindow
+        : 0;
+      const midY = targetY + gap / 2 + laneOffset;
+      const path = `M ${sourceX} ${sourceY} V ${midY} H ${targetX} V ${targetY}`;
+      const label = ({
+        input: "USE",
+        output: "MAKE",
+        "update-input": "UPDATE IN",
+        "update-output": "UPDATE OUT",
+        missing: "MISSING",
+      })[edge.role] || "FLOW";
+      const markerRole = edge.role.startsWith("update-") ? "update" : edge.role;
+      const labelWidth = Math.max(38, label.length * 5.2 + 12);
+      const labelX = sourceX + (targetX - sourceX) * 0.5;
+      return `
+        <g class="planner-edge planner-edge-${edge.role}" aria-hidden="true">
+          <path class="planner-edge-halo" d="${path}"></path>
+          <path class="planner-edge-line" d="${path}" marker-end="url(#planner-arrow-${markerRole})"></path>
+          <g class="planner-edge-label" transform="translate(${labelX} ${midY})"><rect x="${-labelWidth / 2}" y="-7" width="${labelWidth}" height="14"></rect><text y="3">${label}</text></g>
+        </g>`;
+    }).join("");
+    const nodeMarkup = layout.nodes.map((node) => {
+      const classes = ["planner-node", `planner-node-${node.kind}`, `is-${node.state}`];
+      if (node.isRoot) classes.push("is-target");
+      const lines = techTreeNodeLabelLines(node.label, node.kind === "object" ? 20 : 18);
+      const status = plannerNodeStatus(node, timingByStep);
+      const shape = node.kind === "action"
+        ? `<path class="planner-node-frame" d="M ${node.x + 12} ${node.y} H ${node.x + node.size.width - 12} L ${node.x + node.size.width} ${node.y + 12} V ${node.y + node.size.height - 12} L ${node.x + node.size.width - 12} ${node.y + node.size.height} H ${node.x + 12} L ${node.x} ${node.y + node.size.height - 12} V ${node.y + 12} Z"></path>`
+        : `<rect class="planner-node-frame" x="${node.x}" y="${node.y}" width="${node.size.width}" height="${node.size.height}"></rect><rect class="planner-object-tab" x="${node.x + 12}" y="${node.y - 4}" width="34" height="7"></rect>`;
+      const textX = node.x + node.size.width / 2;
+      const firstY = node.y + (lines.length > 1 ? 20 : 25);
+      return `
+        <g class="${classes.join(" ")}" aria-hidden="true">
+          <title>${escapeHtml(`${node.label}: ${status}`)}</title>
+          ${shape}
+          ${lines.map((line, index) => `<text class="planner-node-label" x="${textX}" y="${firstY + index * 12}">${escapeHtml(line)}</text>`).join("")}
+          <text class="planner-node-status" x="${textX}" y="${node.y + node.size.height - 9}">${escapeHtml(status)}</text>
+        </g>`;
+    }).join("");
+    return `
+      <div id="planner-tree-viewport" class="planner-tree-viewport" role="region" aria-label="Scrollable goal dependency tree" tabindex="0" data-target-center-x="${layout.root.x + layout.root.size.width / 2}">
+        <svg class="planner-tree-svg" width="${layout.width}" height="${layout.height}" viewBox="0 0 ${layout.width} ${layout.height}" role="img" aria-labelledby="planner-tree-title planner-tree-description">
+          <title id="planner-tree-title">${escapeHtml(cartridgeName)} goal plan</title>
+          <desc id="planner-tree-description">The target object is at the top. Created objects flow upward from actions; required objects flow upward into the actions that use them. Dashed update arcs mark paired same-class input and output turnover whose post-state is not simulated. Dotted missing lines summarize unresolved prerequisite diagnostics rather than direct Petri arcs.</desc>
+          <defs>
+            <marker id="planner-arrow-input" class="planner-marker-input" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M 0 0 L 10 5 L 0 10 Z"></path></marker>
+            <marker id="planner-arrow-output" class="planner-marker-output" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M 1 5 L 5 1 L 9 5 L 5 9 Z"></path></marker>
+            <marker id="planner-arrow-update" class="planner-marker-update" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M 1 1 H 9 V 9 H 1 Z"></path></marker>
+            <marker id="planner-arrow-missing" class="planner-marker-missing" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><circle cx="5" cy="5" r="3.5"></circle></marker>
+          </defs>
+          ${edgeMarkup}
+          ${nodeMarkup}
+        </svg>
+      </div>`;
+  }
+
+  function plannerStepListMarkup(context, timingByStep) {
+    const steps = context.result?.steps || [];
+    if (!steps.length) return "";
+    return `
+      <section class="game-panel planner-step-panel" aria-labelledby="planner-steps-title">
+        <div class="game-panel-header"><h2 id="planner-steps-title">Action set</h2><span>Execution order</span></div>
+        <div class="planner-step-list">
+          ${steps.map((step) => {
+            const timing = timingByStep.get(step.id);
+            const inputEntries = step.inputs.map((input) => {
+              const role = plannerStepSlotRole(step, input.classId, input.slotIndex, "input", context.catalog);
+              const source = input.sourceKind === "inventory" ? "on hand" : `step ${Number(input.sourceStepId?.split(":")[1]) || "?"}`;
+              return { text: `${input.classLabel} / ${source}`, update: role === "update-input" };
+            });
+            const outputEntries = step.outputs.map((output) => {
+              const role = plannerStepSlotRole(step, output.classId, output.slotIndex, "output", context.catalog);
+              return { text: output.classLabel, update: role === "update-output" };
+            });
+            const inputs = inputEntries.filter((item) => !item.update).map((item) => item.text).join("; ") || "none";
+            const outputs = outputEntries.filter((item) => !item.update).map((item) => item.text).join("; ") || "none";
+            const updateInputs = inputEntries.filter((item) => item.update).map((item) => item.text).join("; ");
+            const updateOutputs = outputEntries.filter((item) => item.update).map((item) => item.text).join("; ");
+            const flowLines = [
+              `Use: ${inputs}`,
+              `Make: ${outputs}`,
+              updateInputs || updateOutputs ? `Update: ${updateInputs || "unknown input"} -> ${updateOutputs || "unknown output"}` : "",
+            ].filter(Boolean).map(escapeHtml).join("<br />");
+            return `
+              <button id="planner-${escapeHtml(step.id)}" class="planner-step-row" type="button" data-command="setup-action" data-id="${escapeHtml(step.actionKey)}">
+                <span class="planner-step-number">${String(step.index + 1).padStart(2, "0")}</span>
+                <span class="planner-step-copy"><strong>${escapeHtml(step.label)}</strong><small>${flowLines}</small></span>
+                <span class="planner-step-time"><strong>${escapeHtml(plannerDirectTimingLabel(timing))}</strong><small>${escapeHtml(plannerDirectTimingBreakdown(timing))}</small></span>
+              </button>`;
+          }).join("")}
+        </div>
+      </section>`;
+  }
+
+  function plannerResultMarkup(context) {
+    if (context.error) return `<div class="terminal-note error" role="alert">${escapeHtml(context.error)}</div>`;
+    const result = context.result;
+    if (!result) return '<div class="game-panel"><div class="game-empty"><h2>No goal outputs</h2><p>This cartridge has no action with a positive net object output.</p></div></div>';
+    const timingByStep = new Map();
+    for (const step of result.steps) {
+      const action = plannerActionForStep(step, context.catalog);
+      timingByStep.set(step.id, action ? estimateActionProofTiming(action) : null);
+    }
+    const totalTiming = plannerTimingSummary(result.steps.map((step) => step.id), timingByStep);
+    const hasExecutablePlan = result.status === "planned" || result.status === "satisfied";
+    const totalLabel = hasExecutablePlan ? plannerTimingLabel(totalTiming) : "No plan";
+    const totalBasis = !hasExecutablePlan
+      ? "No executable action set"
+      : !totalTiming.count
+        ? "Already available / no actions"
+        : totalTiming.requiresCwi
+          ? "Run CWI to time readable gates"
+          : !totalTiming.knownCount
+            ? "Direct proof work unreadable"
+            : !totalTiming.directWorkCount
+              ? totalTiming.complete ? "No direct PoW/VDF gates" : "Direct proof metadata unreadable"
+              : totalTiming.complete
+                ? "CWI-grounded direct gates"
+                : "Known direct work only";
+    const tree = buildPlannerDisplayTree(result, timingByStep, context.catalog);
+    const stateLabel = {
+      satisfied: "Already on hand",
+      planned: "Plan ready",
+      unreachable: "Blocked",
+      "search-limit": "Search limit",
+      "invalid-goal": "Invalid goal",
+    }[result.status] || result.status;
+    const cwi = state.hardwareIndex.result;
+    const cwiControl = !cwi && totalTiming.requiresCwi
+      ? gameButton(state.hardwareIndex.status === "running" ? "CWI running..." : "Run CWI", "run-hardware-index", { tone: "primary", disabled: state.hardwareIndex.status === "running" })
+      : "";
+    const groundingNote = cwi
+      ? `${cwi.stability} / ${formatDate(cwi.measuredAt)}`
+      : totalTiming.requiresCwi
+        ? "Required to time readable gates"
+        : totalTiming.directWorkCount
+          ? "Timing coverage incomplete"
+          : "No readable timed gates";
+    const actionSetBasis = result.strategy === "goal-directed-fallback"
+      ? `${result.totals.expandedStates.toLocaleString()} shortest-search states / valid fallback`
+      : result.strategy === "inventory"
+        ? "No actions required"
+        : `${result.totals.expandedStates.toLocaleString()} states checked`;
+    const hasMissingBranches = tree?.children?.some((child) => child.inputRole === "missing");
+    const diagnosticMarkup = (result.diagnostics || []).map((diagnostic) => {
+      const classIds = [...new Set(diagnostic.classIds || [])];
+      const actionIds = [...new Set(diagnostic.actionIds || [])];
+      const classRefs = classIds.slice(0, 6).map((classId) => {
+        const item = context.catalog?.classById?.get(classId);
+        return item ? `${item.label} / ${shortText(item.hash, 6, 4)}` : classId;
+      });
+      if (classIds.length > classRefs.length) classRefs.push(`+${classIds.length - classRefs.length} more`);
+      const actionRefs = actionIds.slice(0, 6).map((actionId) => context.catalog?.actionById?.get(actionId)?.label || actionId);
+      if (actionIds.length > actionRefs.length) actionRefs.push(`+${actionIds.length - actionRefs.length} more`);
+      const references = [
+        classRefs.length ? `Objects: ${classRefs.join("; ")}` : "",
+        actionRefs.length ? `Actions: ${actionRefs.join("; ")}` : "",
+      ].filter(Boolean).join(" / ");
+      return `<li><span>${escapeHtml(diagnostic.message)}</span>${references ? `<small>${escapeHtml(references)}</small>` : ""}</li>`;
+    });
+    const warningMarkup = [...new Set([
+      ...(result.warnings || []),
+      ...result.steps.flatMap((step) => step.warnings || []),
+    ])].filter(Boolean).map((message) => `<li><span>${escapeHtml(message)}</span></li>`);
+    return `
+      <div class="planner-summary" aria-label="Plan summary">
+        <div class="planner-summary-item"><span>Goal state</span><strong>${escapeHtml(stateLabel)}</strong><small>${escapeHtml(result.goal.label)} / ${escapeHtml(shortText(result.goal.hash, 6, 4))} / need ${result.goal.targetCount}</small></div>
+        <div class="planner-summary-item"><span>Total proof work</span><strong aria-live="polite" aria-atomic="true">${escapeHtml(totalLabel)}</strong><small>${escapeHtml(totalBasis)}</small></div>
+        <div class="planner-summary-item"><span>Action set</span><strong>${result.totals.actionCount}</strong><small>${escapeHtml(actionSetBasis)}</small></div>
+        <div class="planner-summary-item"><span>Grounding</span><strong>${cwi ? `CWI-1 ${cwi.score.toLocaleString()}` : "No CWI"}</strong><small>${escapeHtml(groundingNote)}</small>${cwiControl}</div>
+      </div>
+      <div class="planner-flow-key" aria-label="Plan relationship legend"><span><i class="planner-key-input" aria-hidden="true"></i>USE / consumed input</span><span><i class="planner-key-output" aria-hidden="true"></i>MAKE / created output</span><span><i class="planner-key-update" aria-hidden="true"></i>UPDATE / paired turnover</span>${hasMissingBranches ? '<span><i class="planner-key-missing" aria-hidden="true"></i>MISSING / unresolved prerequisite</span>' : ""}<span>Read down for requirements; arrows flow up toward the target.</span></div>
+      ${plannerTreeSvg(tree, timingByStep, context.cartridge.name)}
+      ${plannerStepListMarkup(context, timingByStep)}
+      ${diagnosticMarkup.length || warningMarkup.length ? `<div class="terminal-note warning planner-diagnostics"><strong>Plan limits</strong><ul>${[...diagnosticMarkup, ...warningMarkup].slice(0, 8).join("")}</ul></div>` : ""}
+      <div class="terminal-note planner-truth-note">When CWI is available, durations are rough browser-equivalent proof-work estimates grounded in this machine's search and sequential rates. They cover only readable direct PoW/VDF gates, not Driver queueing, base proving, network, commit, relay, finality, hidden work, or post-mutation field state. Bounded shortest search is used first; any valid goal-directed fallback is labeled and may not be minimal. UPDATE arcs mark paired same-class turnover, not verified object identity or field results. MISSING lines summarize diagnostics rather than direct Petri arcs. Refresh or replan after every real action.</div>`;
+  }
+
+  function plannerGoalOptionsMarkup(context) {
+    return `<option value="">Choose a goal output</option>${context.options.map((option) => {
+      const selected = option.classId === state.planner.goalClassId ? " selected" : "";
+      const plugin = option.qualified?.pluginName && option.qualified.pluginName !== context.cartridge?.id
+        ? ` / ${option.qualified.pluginName}`
+        : "";
+      return `<option value="${escapeHtml(option.classId)}"${selected}>${escapeHtml(`${option.label}${plugin} / ${shortText(option.hash, 6, 4)}`)}</option>`;
+    }).join("")}`;
+  }
+
+  function renderPlanner() {
+    const cartridge = selectedCartridge();
+    if (!cartridge) {
+      return `
+        <section class="game-screen" aria-labelledby="planner-title">
+          ${screenHeading("Goal planner", "No cartridge selected", "Choose a cartridge before building an action plan.", backButton())}
+          ${errorPanel("Select a cartridge", "The planner works from one cartridge's flattened action signatures.", "cartridges")}
+        </section>`;
+    }
+    const context = plannerContext(cartridge);
+    return `
+      <section class="game-screen game-screen-wide planner-screen" aria-labelledby="planner-title">
+        ${screenHeading(
+          `${cartridge.name} cartridge`,
+          "Goal Planner",
+          "Choose an object state. The planner reserves live tokens, searches for the shortest route first, and builds a valid counted action set.",
+          `${backButton("Play")}${gameButton("Play", "actions")}${gameButton("Full Tech Tree", "tree")}${gameButton("Objects", "objects")}`,
+        )}
+        <div class="planner-toolbar">
+          <label for="planner-goal-select"><span>Target object</span><select id="planner-goal-select" class="game-select"${context.options.length ? "" : " disabled"}>${plannerGoalOptionsMarkup(context)}</select></label>
+          <span>Goal: at least one live object / exact class + hash</span>
+        </div>
+        <div data-catalog-region="planner" data-planner-result>${plannerResultMarkup(context)}</div>
+      </section>`;
+  }
+
+  function centerPlannerTarget(viewport) {
+    if (!viewport) return;
+    const targetCenter = Number(viewport.dataset.targetCenterX);
+    if (!Number.isFinite(targetCenter)) return;
+    viewport.scrollLeft = Math.max(0, targetCenter - viewport.clientWidth / 2);
+  }
+
+  function patchPlanner({ replan = true } = {}) {
+    if (state.screen !== "planner") return;
+    const region = main.querySelector("[data-planner-result]");
+    const previousViewport = region?.querySelector(".planner-tree-viewport");
+    const previousScrollLeft = previousViewport?.scrollLeft || 0;
+    const focusToken = captureFocus(region);
+    const drawerReturnToken = region?.contains(state.drawerReturnFocus)
+      ? focusTokenForElement(state.drawerReturnFocus)
+      : null;
+    const context = plannerContext(selectedCartridge(), { reuseResult: !replan });
+    const select = byId("planner-goal-select");
+    if (select) {
+      select.innerHTML = plannerGoalOptionsMarkup(context);
+      select.value = state.planner.goalClassId;
+      select.disabled = !context.options.length;
+    }
+    if (!region) return;
+    region.innerHTML = plannerResultMarkup(context);
+    const nextViewport = region.querySelector(".planner-tree-viewport");
+    if (nextViewport) {
+      if (replan) centerPlannerTarget(nextViewport);
+      else nextViewport.scrollLeft = previousScrollLeft;
+    }
+    if (drawerReturnToken) {
+      state.drawerReturnFocus = findCapturedFocus(region, drawerReturnToken);
+    }
+    if (focusToken) {
+      requestAnimationFrame(() => {
+        const focusTarget = findCapturedFocus(region, focusToken);
+        if (focusTarget && !focusTarget.disabled) focusTarget.focus({ preventScroll: true });
+        else select?.focus({ preventScroll: true });
+      });
+    }
   }
 
   function actionByKey(key) {
@@ -3601,30 +5377,33 @@
     const inputs = places.filter((place) => inputTotal(place) && !outputTotal(place));
     const outputs = places.filter((place) => outputTotal(place) && !inputTotal(place));
     const shared = places.filter((place) => inputTotal(place) && outputTotal(place));
-    const placeWidth = 126;
-    const placeHeight = 46;
-    const transitionWidth = 130;
+    const placeWidth = 142;
+    const placeHeight = 50;
+    const transitionWidth = 146;
     const transitionHeight = 56;
     const sharedGap = 18;
-    const width = Math.max(520, shared.length * placeWidth + (shared.length + 1) * sharedGap);
+    const width = Math.max(560, shared.length * placeWidth + (shared.length + 1) * sharedGap);
     const inputX = 8;
     const transitionX = (width - transitionWidth) / 2;
     const outputX = width - placeWidth - 8;
+    const sideTop = 30;
     const sideRows = Math.max(inputs.length, outputs.length, 1);
-    const sideHeight = Math.max(150, 24 + (sideRows - 1) * 56 + placeHeight);
-    const sharedStartY = sideHeight + 20;
-    const height = sideHeight + (shared.length ? 20 + placeHeight + 12 : 0);
-    const transitionY = (sideHeight - transitionHeight) / 2;
+    const sideHeight = Math.max(170, sideTop + (sideRows - 1) * 58 + placeHeight + 12);
+    const sharedStartY = sideHeight + 96;
+    const height = sideHeight + (shared.length ? 96 + placeHeight + 12 : 0);
+    const transitionY = sideTop + (sideHeight - sideTop - transitionHeight) / 2;
     const markerScope = newId("action-tree").replace(/[^a-zA-Z0-9_-]/g, "");
     const inputMarkerId = `${markerScope}-input`;
     const outputMarkerId = `${markerScope}-output`;
+    const opaqueInputMarkerId = `${markerScope}-opaque-input`;
+    const opaqueOutputMarkerId = `${markerScope}-opaque-output`;
     const titleId = `${markerScope}-title`;
     const descriptionId = `${markerScope}-description`;
 
     const rowY = (index, count) => {
-      if (count <= 1) return (sideHeight - placeHeight) / 2;
-      const available = sideHeight - placeHeight - 24;
-      return 12 + (available * index) / (count - 1);
+      if (count <= 1) return sideTop + (sideHeight - sideTop - placeHeight) / 2;
+      const available = sideHeight - sideTop - placeHeight - 12;
+      return sideTop + (available * index) / (count - 1);
     };
     const sharedPosition = (index) => {
       const gap = (width - shared.length * placeWidth) / (shared.length + 1);
@@ -3639,41 +5418,57 @@
       const labelX = 35;
       const lineStart = lines.length > 1 ? 17 : 23;
       const roles = [];
-      if (place.inputCount) roles.push(`I${place.inputCount}`);
-      if (place.opaqueInputCount) roles.push(`HI${place.opaqueInputCount}`);
-      if (place.outputCount) roles.push(`O${place.outputCount}`);
-      if (place.opaqueOutputCount) roles.push(`HO${place.opaqueOutputCount}`);
-      const status = `${roles.join(" / ")}${live ? ` / ${live} LIVE` : ""}`;
+      if (inputTotal(place) && outputTotal(place)) {
+        roles.push(`IN x${inputTotal(place)}`, `OUT x${outputTotal(place)}`);
+        const unresolved = place.opaqueInputCount + place.opaqueOutputCount;
+        if (unresolved) roles.push(`? x${unresolved}`);
+      } else {
+        if (place.inputCount) roles.push(`CONSUME x${place.inputCount}`);
+        if (place.opaqueInputCount) roles.push(`INPUT? x${place.opaqueInputCount}`);
+        if (place.outputCount) roles.push(`CREATE x${place.outputCount}`);
+        if (place.opaqueOutputCount) roles.push(`OUTPUT? x${place.opaqueOutputCount}`);
+      }
+      const status = `${roles.join(" / ")}${live ? ` / LIVE x${live}` : ""}`;
       return `
         <g class="tech-tree-node-place${live ? " has-live" : ""}" transform="translate(${x} ${y})" aria-hidden="true">
           <rect class="tech-tree-node-frame" width="${placeWidth}" height="${placeHeight}"></rect>
           <rect class="tech-tree-token-well" x="7" y="9" width="22" height="22"></rect>
           <text class="tech-tree-node-emoji" x="18" y="25" text-anchor="middle">${escapeHtml(place.ref.class?.name?.slice(0, 1) || "?")}</text>
           <text class="tech-tree-node-label" x="${labelX}" y="${lineStart}">${lines.map((line, index) => `<tspan x="${labelX}" dy="${index ? 11 : 0}">${escapeHtml(line)}</tspan>`).join("")}</text>
-          <text class="tech-tree-node-status" x="${labelX}" y="39">${escapeHtml(status)}</text>
+          <text class="tech-tree-node-status" x="${placeWidth / 2}" y="44" text-anchor="middle">${escapeHtml(status)}</text>
         </g>`;
     };
     const edgeMarkup = (sourceX, sourceY, targetX, targetY, role, count) => {
       if (!count) return "";
-      const isInput = role.endsWith("input");
-      const isOpaque = role.startsWith("opaque");
-      const offset = isOpaque ? (isInput ? -4 : 4) : 0;
+      const offset = ({ input: -9, "opaque-input": 9, output: -9, "opaque-output": 9 })[role] || 0;
       sourceY += offset;
       targetY += offset;
       const control = Math.max(28, Math.abs(targetX - sourceX) * 0.45);
-      const markerId = isOpaque ? `${markerScope}-opaque` : isInput ? inputMarkerId : outputMarkerId;
+      const markerId = ({
+        input: inputMarkerId,
+        output: outputMarkerId,
+        "opaque-input": opaqueInputMarkerId,
+        "opaque-output": opaqueOutputMarkerId,
+      })[role];
       const labelX = (sourceX + targetX) / 2;
       const labelY = (sourceY + targetY) / 2;
+      const path = `M ${sourceX} ${sourceY} C ${sourceX + control} ${sourceY}, ${targetX - control} ${targetY}, ${targetX} ${targetY}`;
       return `
         <g class="tech-tree-edge tech-tree-edge-${role}" aria-hidden="true">
-          <path d="M ${sourceX} ${sourceY} C ${sourceX + control} ${sourceY}, ${targetX - control} ${targetY}, ${targetX} ${targetY}" marker-end="url(#${markerId})"></path>
-          ${count > 1 ? `<g class="tech-tree-edge-count" transform="translate(${labelX} ${labelY})"><rect x="-13" y="-9" width="26" height="17"></rect><text y="4">x${count}</text></g>` : ""}
+          <path class="tech-tree-edge-halo" d="${path}"></path>
+          <path class="tech-tree-edge-line" d="${path}" marker-end="url(#${markerId})"></path>
+          ${techTreeEdgeLabelMarkup(role, count, labelX, labelY)}
         </g>`;
     };
     const sharedEdgeMarkup = (place, x, y, role) => {
       const isInput = role.endsWith("input");
-      const isOpaque = role.startsWith("opaque");
-      const markerId = isOpaque ? `${markerScope}-opaque` : isInput ? inputMarkerId : outputMarkerId;
+      const markerId = role === "input"
+        ? inputMarkerId
+        : role === "output"
+          ? outputMarkerId
+          : role === "opaque-input"
+            ? opaqueInputMarkerId
+            : opaqueOutputMarkerId;
       const count = role === "input"
         ? place.inputCount
         : role === "output"
@@ -3690,25 +5485,28 @@
       const sourceY = isInput ? placeTopY : transitionBottomY;
       const targetX = isInput ? transitionCenterX : placeCenterX;
       const targetY = isInput ? transitionBottomY : placeTopY;
-      const busY = sideHeight + 8;
-      const lane = (isInput ? -8 : 8) + (isOpaque ? (isInput ? -5 : 5) : 0);
+      const busY = sideHeight + 35;
+      const lane = ({ input: -18, "opaque-input": -7, output: 7, "opaque-output": 18 })[role] || 0;
       const labelX = (sourceX + targetX) / 2 + lane;
-      const labelY = busY + (isInput ? -7 : 9) + (isOpaque ? (isInput ? -4 : 4) : 0);
+      const labelY = busY + ({ input: -27, "opaque-input": -9, output: 9, "opaque-output": 27 })[role];
+      const path = `M ${sourceX} ${sourceY} C ${sourceX + lane} ${busY}, ${targetX + lane} ${busY}, ${targetX} ${targetY}`;
       return `
         <g class="tech-tree-edge tech-tree-edge-${role}" aria-hidden="true">
-          <path d="M ${sourceX} ${sourceY} C ${sourceX + lane} ${busY}, ${targetX + lane} ${busY}, ${targetX} ${targetY}" marker-end="url(#${markerId})"></path>
-          ${count > 1 ? `<g class="tech-tree-edge-count" transform="translate(${labelX} ${labelY})"><rect x="-13" y="-9" width="26" height="17"></rect><text y="4">x${count}</text></g>` : ""}
+          <path class="tech-tree-edge-halo" d="${path}"></path>
+          <path class="tech-tree-edge-line" d="${path}" marker-end="url(#${markerId})"></path>
+          ${techTreeEdgeLabelMarkup(role, count, labelX, labelY)}
         </g>`;
     };
 
     const parts = [`
       <svg class="action-tech-tree-portal" viewBox="0 0 ${width} ${height}" width="${width}" height="${height}" role="img" aria-labelledby="${titleId} ${descriptionId}" preserveAspectRatio="xMidYMid meet">
         <title id="${titleId}">${escapeHtml(action.action?.name || "Action")} direct action relationships</title>
-        <desc id="${descriptionId}">Only this action transition and its adjacent input and output class states are shown. Inputs are on the left, outputs are on the right, unresolved slots use dashed neutral arcs, and explicit mutations are excluded.</desc>
+        <desc id="${descriptionId}">Only this action transition and its adjacent class states are shown. Consumed inputs are in the left column with triangle markers. Created outputs are in the right column with diamond markers. Dashed open markers identify unresolved slots, and explicit mutations are excluded.</desc>
         <defs>
           <marker id="${inputMarkerId}" class="tech-tree-marker tech-tree-marker-input" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z"></path></marker>
-          <marker id="${outputMarkerId}" class="tech-tree-marker tech-tree-marker-output" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z"></path></marker>
-          <marker id="${markerScope}-opaque" class="tech-tree-marker tech-tree-marker-opaque" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z"></path></marker>
+          <marker id="${outputMarkerId}" class="tech-tree-marker tech-tree-marker-output" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M 0 5 L 5 0 L 10 5 L 5 10 z"></path></marker>
+          <marker id="${opaqueInputMarkerId}" class="tech-tree-marker tech-tree-marker-opaque tech-tree-marker-opaque-input" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M 1 1 L 9 5 L 1 9 z"></path></marker>
+          <marker id="${opaqueOutputMarkerId}" class="tech-tree-marker tech-tree-marker-opaque tech-tree-marker-opaque-output" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M 1 5 L 5 1 L 9 5 L 5 9 z"></path></marker>
         </defs>`];
 
     inputs.forEach((place, index) => {
@@ -3729,29 +5527,35 @@
       parts.push(sharedEdgeMarkup(place, position.x, position.y, "opaque-output"));
     });
 
+    parts.push(`
+      <text class="action-tech-tree-column-label is-input" x="${inputX + placeWidth / 2}" y="17" text-anchor="middle">CONSUMED INPUTS</text>
+      <text class="action-tech-tree-column-label is-action" x="${transitionX + transitionWidth / 2}" y="17" text-anchor="middle">ACTION TRANSITION</text>
+      <text class="action-tech-tree-column-label is-output" x="${outputX + placeWidth / 2}" y="17" text-anchor="middle">CREATED OUTPUTS</text>
+      ${shared.length ? `<text class="action-tech-tree-column-label is-shared" x="${width / 2}" y="${sharedStartY - 12}" text-anchor="middle">CONSUMED + CREATED STATES</text>` : ""}`);
+
     inputs.forEach((place, index) => parts.push(placeMarkup(place, inputX, rowY(index, inputs.length))));
     outputs.forEach((place, index) => parts.push(placeMarkup(place, outputX, rowY(index, outputs.length))));
     shared.forEach((place, index) => {
       const position = sharedPosition(index);
       parts.push(placeMarkup(place, position.x, position.y));
     });
-    if (!dependencyFlow.inputs.length && !dependencyFlow.opaqueInputs.length) parts.push(`<text class="tech-tree-empty" x="${inputX + placeWidth / 2}" y="${sideHeight / 2}" text-anchor="middle">NO CONSUMES</text>`);
-    if (!dependencyFlow.outputs.length && !dependencyFlow.opaqueOutputs.length) parts.push(`<text class="tech-tree-empty" x="${outputX + placeWidth / 2}" y="${sideHeight / 2}" text-anchor="middle">NO CREATES</text>`);
+    if (!dependencyFlow.inputs.length && !dependencyFlow.opaqueInputs.length) parts.push(`<text class="tech-tree-empty" x="${inputX + placeWidth / 2}" y="${sideTop + (sideHeight - sideTop) / 2}" text-anchor="middle">NO CONSUMED INPUTS</text>`);
+    if (!dependencyFlow.outputs.length && !dependencyFlow.opaqueOutputs.length) parts.push(`<text class="tech-tree-empty" x="${outputX + placeWidth / 2}" y="${sideTop + (sideHeight - sideTop) / 2}" text-anchor="middle">NO CREATED OUTPUTS</text>`);
 
     const transitionLines = techTreeNodeLabelLines(action.action?.name || "Action", 16);
     const transitionLineStart = transitionLines.length > 1 ? 19 : 25;
     const tokensAvailable = actionReady(action);
     const transitionStatus = runState.loading
-      ? "CHECKING"
+      ? "CHECKING DRIVER"
       : runState.error
-        ? "CHECK FAILED"
+        ? "DRIVER CHECK FAILED"
         : runState.canRun
           ? "READY TO RUN"
           : runState.feasible === false
             ? "NOT FEASIBLE"
             : tokensAvailable
-              ? "TOKENS AVAILABLE"
-              : "NEEDS TOKENS";
+              ? "INPUTS AVAILABLE"
+              : "NEEDS INPUTS";
     parts.push(`
       <g class="tech-tree-node-transition${runState.canRun ? " is-ready" : ""}" transform="translate(${transitionX} ${transitionY})" aria-hidden="true">
         <path class="tech-tree-node-frame" d="M 8 0 H ${transitionWidth - 8} L ${transitionWidth} 8 V ${transitionHeight - 8} L ${transitionWidth - 8} ${transitionHeight} H 8 L 0 ${transitionHeight - 8} V 8 Z"></path>
@@ -3767,30 +5571,124 @@
     const omittedNote = notes.length ? `<div class="terminal-note action-tech-tree-note">${escapeHtml(notes.join(" "))}</div>` : "";
     return `
       <div class="game-panel action-tech-tree-panel">
-        <div class="game-panel-header"><h3>Action tech-tree portal</h3><span>I/O only</span></div>
-        <div class="game-panel-body"><div class="action-tech-tree-viewport" tabindex="0" role="region" aria-label="Scrollable action input and output relationship graph">${parts.join("")}</div></div>
+        <div class="game-panel-header"><h3>Action I/O map</h3><span>Consume / Create</span></div>
+        <div class="game-panel-body"><div class="action-tech-tree-viewport" tabindex="0" role="region" aria-label="Scrollable action consume and create relationship graph">${parts.join("")}</div></div>
         ${omittedNote}
       </div>`;
   }
 
-  function actionProofRequirementsMarkup(action) {
+  function actionProofComponentTimingLabel(value, milliseconds, timing) {
+    if (value.complete && value.callCount === 0) return "0 modeled";
+    if (milliseconds != null) return `${value.complete ? "~" : ">="}${formatProofDuration(milliseconds)}`;
+    if (timing.requiresCwi && value.knownCount > 0) {
+      return state.hardwareIndex.status === "running" ? "Calibrating..." : "CWI required";
+    }
+    return "Unknown";
+  }
+
+  function actionProofTotalTimingLabel(timing) {
+    if (timing.totalMilliseconds != null) {
+      return `${timing.lowerBound ? ">=" : timing.hasKnownWork ? "~" : ""}${formatProofDuration(timing.totalMilliseconds)}`;
+    }
+    if (timing.requiresCwi) return state.hardwareIndex.status === "running" ? "CALIBRATING..." : "CWI REQUIRED";
+    return "UNKNOWN";
+  }
+
+  function actionProofEstimateSummary(timing) {
+    let stateLabel = "COVERAGE UNKNOWN";
+    let detail = "The public predicate does not expose readable direct proof-work counts.";
+    if (timing.complete && timing.hasKnownWork) {
+      stateLabel = "DIRECT GATES COVERED";
+      detail = timing.hasCwi
+        ? "All readable direct counts are mapped through this browser's normalized CWI component rates."
+        : "Readable direct counts are available. Run CWI to map them to this browser's component rates.";
+    } else if (timing.complete) {
+      stateLabel = "NO DIRECT GATES";
+      detail = "No direct PoW threshold or VDF call was found in the available predicate.";
+    } else if (timing.partial) {
+      stateLabel = "KNOWN WORK / LOWER BOUND";
+      detail = timing.hasCwi
+        ? "The total covers readable direct gates only; at least one direct gate remains invalid or unreadable."
+        : "Some direct work is readable, but CWI is required to time the known lower bound.";
+    }
+    const stateClass = timing.complete ? "is-complete" : timing.partial ? "is-partial" : "is-unknown";
+    return `
+      <div class="proof-estimate-summary ${stateClass}">
+        <div><span>CWI-modeled browser equivalent</span><strong>${escapeHtml(actionProofTotalTimingLabel(timing))}</strong></div>
+        <div><span>${escapeHtml(stateLabel)}</span><small>${escapeHtml(detail)}</small></div>
+      </div>`;
+  }
+
+  function actionProofCwiSourceMarkup(timing) {
+    if (!timing.hasCwi || !timing.hasKnownWork) return "";
+    const cwi = timing.cwi;
+    const liveState = state.hardwareIndex.status === "running"
+      ? " / refreshing now"
+      : state.hardwareIndex.status === "error"
+        ? " / last valid result retained"
+        : "";
+    return `
+      <div class="proof-cwi-source">
+        <span><b>CWI-1 ${cwi.score.toLocaleString()}</b> / ${escapeHtml(cwi.stability)} samples${escapeHtml(liveState)}</span>
+        <small>Search ${escapeHtml(formatHardwareRate(cwi.searchRate))} / sequential ${escapeHtml(formatHardwareRate(cwi.sequentialRate))} / measured ${escapeHtml(formatDate(cwi.measuredAt))}</small>
+      </div>`;
+  }
+
+  function actionProofCwiCalloutMarkup(timing) {
+    if (!timing.requiresCwi) return "";
+    const running = state.hardwareIndex.status === "running";
+    const failed = state.hardwareIndex.status === "error";
+    const title = running ? "Measuring this browser" : failed ? "Client calibration failed" : "Client calibration required";
+    const copy = running
+      ? "Six synthetic component samples are running off the main UI thread."
+      : failed
+        ? state.hardwareIndex.error || "The browser could not complete CWI."
+        : "Run the one-second CWI check to model the readable proof work on this browser.";
+    return `
+      <div class="proof-cwi-callout${failed ? " is-error" : ""}">
+        <div><span>Local CWI-1</span><strong>${escapeHtml(title)}</strong><small>${escapeHtml(copy)}</small></div>
+        <button class="game-button" type="button" data-command="run-hardware-index" data-hardware-index-focus${running ? " disabled" : ""}>${running ? "Testing..." : failed ? "Retry CWI" : "Run CWI"}</button>
+        ${running ? '<div class="run-request-track proof-cwi-track" role="progressbar" aria-label="Running client work index"><span></span></div>' : ""}
+      </div>`;
+  }
+
+  function actionProofRequirementsContentMarkup(action) {
     const workload = actionProofWorkload(action);
-    const rating = (kind, value) => `
+    const timing = estimateActionProofTiming(action, state.hardwareIndex.result, workload);
+    const rating = (kind, value, milliseconds) => `
       <div class="proof-rating proof-rating-${value.level.toLowerCase()}">
         <span>${kind}</span>
         <strong>${escapeHtml(value.level)}</strong>
+        <b class="proof-rating-time">${escapeHtml(actionProofComponentTimingLabel(value, milliseconds, timing))}</b>
         <small>${escapeHtml(value.detail)}</small>
       </div>`;
     return `
-      <section class="game-panel action-proof-panel" aria-labelledby="action-proof-title">
-        <div class="game-panel-header"><h3 id="action-proof-title">Direct work gates</h3><span>Partial predicate hints</span></div>
-        <div class="game-panel-body">
-          <div class="proof-rating-grid">
-            ${rating("PoW / inferred", workload.pow)}
-            ${rating("VDF / iteration band", workload.vdf)}
-          </div>
-          <p class="action-proof-note">Easy–Extreme groups assumed search-trial counts; Short–Long groups literal VDF iteration totals. Neither is a duration, and the two scales are independent. This is a partial, UI-inferred reading of direct gates only: custom or nested calls may add undisclosed work, while the object, selected Driver, and current load determine realized time.</p>
-        </div>
+      ${actionProofEstimateSummary(timing)}
+      <div class="proof-rating-grid">
+        ${rating("PoW / inferred search", workload.pow, timing.powMilliseconds)}
+        ${rating("VDF / literal chain", workload.vdf, timing.vdfMilliseconds)}
+      </div>
+      ${actionProofCwiSourceMarkup(timing)}
+      ${actionProofCwiCalloutMarkup(timing)}
+      <p class="action-proof-note">Modeled durations divide known direct search trials and valid literal iterations by normalized CWI search and sequential rates. They are synthetic browser-equivalent compute, not measurements of the selected Driver, DON proof kernels, network, queue, or commit time. Custom or nested calls can leave the result partial or unknown.</p>`;
+  }
+
+  function actionProofTimingAnnouncement(action) {
+    const timing = estimateActionProofTiming(action);
+    if (timing.requiresCwi && state.hardwareIndex.status === "running") return "Client work index calibration is running for this action estimate.";
+    if (timing.requiresCwi) return "Client work index is required for this action's readable proof-work timing.";
+    if (timing.totalMilliseconds == null) return "Direct proof-work timing is unknown.";
+    const qualifier = timing.lowerBound ? "Known-work lower bound" : "Modeled browser-equivalent time";
+    return `${qualifier}: ${formatProofDuration(timing.totalMilliseconds)}.`;
+  }
+
+  function actionProofRequirementsMarkup(action) {
+    const key = qualifiedKey(action.action);
+    return `
+      <section class="game-panel action-proof-panel" data-hardware-index data-hardware-index-view="action-proof" data-action-key="${escapeHtml(key)}" data-cwi-state="${escapeHtml(state.hardwareIndex.status)}" tabindex="-1" aria-labelledby="action-proof-title">
+        <span class="sr-only" data-hardware-index-announcement aria-live="polite" aria-atomic="true">${escapeHtml(actionProofTimingAnnouncement(action))}</span>
+        <div class="game-panel-header"><h3 id="action-proof-title">Direct work gates</h3><span>CWI browser model</span></div>
+        <div class="game-panel-body" data-hardware-index-content aria-busy="${state.hardwareIndex.status === "running"}">${actionProofRequirementsContentMarkup(action)}</div>
       </section>`;
   }
 
@@ -4023,7 +5921,7 @@
           `${cartridge.name} cartridge`,
           "Objects",
           "Only objects belonging to the selected cartridge are shown.",
-          `${backButton("Play")}${gameButton("Play", "actions")}${gameButton("Tech Tree", "tree")}${gameButton("Activity", "activity")}${gameButton("Import .dobj", "import-object", { tone: "primary", disabled: connectionStatus(activeConnection()?.id).state !== "online" })}`,
+          `${backButton("Play")}${gameButton("Play", "actions")}${gameButton("Goal Planner", "planner")}${gameButton("Tech Tree", "tree")}${gameButton("Activity", "activity")}${gameButton("Import .dobj", "import-object", { tone: "primary", disabled: connectionStatus(activeConnection()?.id).state !== "online" })}`,
         )}
         <div class="game-toolbar">
           <input id="object-search" class="game-input game-search" type="search" placeholder="Search objects" value="${escapeHtml(state.objectSearch)}" aria-label="Search objects" />
@@ -4038,9 +5936,13 @@
 
   function patchCatalogScreen() {
     const screen = state.screen;
-    if (!new Set(["actions", "objects", "cartridges", "tree"]).has(screen)) return;
+    if (!new Set(["actions", "objects", "cartridges", "planner", "tree"]).has(screen)) return;
     if (screen === "tree") {
       patchTechTree();
+      return;
+    }
+    if (screen === "planner") {
+      patchPlanner();
       return;
     }
     const region = main.querySelector(`[data-catalog-region="${screen}"]`);
@@ -4092,7 +5994,7 @@
       <div class="drawer-header">
         <div><p class="screen-kicker">Digital object</p><h2 class="drawer-title" id="drawer-title">${escapeHtml(object?.class?.name || model.fileName)}</h2></div>
         <div class="drawer-header-actions">
-          ${object ? gameButton("View branches", "object-tree", { extra: ` data-id="${escapeHtml(object.fileName)}"` }) : ""}
+          ${object ? gameButton("View neighborhood", "object-tree", { extra: ` data-id="${escapeHtml(object.fileName)}"` }) : ""}
           <button class="game-button" type="button" data-command="close-drawer">Close</button>
         </div>
       </div>
@@ -4653,6 +6555,7 @@
       "connection-edit": "connections",
       cartridges: "home",
       actions: "home",
+      planner: "actions",
       tree: "actions",
       objects: "actions",
       activity: "actions",
@@ -4789,6 +6692,8 @@
           state.techTree.selectedNodeId = "";
           state.techTree.viewBox = null;
           state.techTree.viewKey = "";
+          state.planner.goalClassId = "";
+          state.planner.result = null;
         }
         persistConfig();
         navigate("actions");
@@ -4806,6 +6711,9 @@
         state.techTree.objectFileName = "";
         state.techTree.selectedNodeId = "";
         navigate("tree");
+        break;
+      case "planner":
+        navigate("planner");
         break;
       case "tree-mode":
         state.techTree.mode = element.dataset.value === "object" ? "object" : "all";
@@ -4973,6 +6881,11 @@
       state.techTree.viewKey = "";
       render();
     }
+    if (event.target.id === "planner-goal-select") {
+      state.planner.goalClassId = event.target.value || "";
+      state.planner.result = null;
+      patchPlanner();
+    }
   });
 
   main.addEventListener("keydown", (event) => {
@@ -5125,7 +7038,7 @@
       trapDrawerFocus(event);
       return;
     }
-    if (editing || state.drawer) return;
+    if (editing || state.drawer || event.target.closest?.(".planner-tree-viewport")) return;
     if (event.key === "ArrowRight" || event.key === "ArrowDown") {
       event.preventDefault();
       moveMenuFocus(1);
