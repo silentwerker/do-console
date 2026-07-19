@@ -8,6 +8,11 @@
 
   const CONFIG_VERSION = 1;
   const STORAGE_KEY = "don.lightConsole.config.v1";
+  const HARDWARE_INDEX_VERSION = 1;
+  const HARDWARE_INDEX_BENCHMARK_ID = "browser-mix-v1";
+  const HARDWARE_INDEX_STORAGE_KEY = "don.lightConsole.clientWorkIndex.v1";
+  const HARDWARE_INDEX_SEARCH_REFERENCE = 100_000_000;
+  const HARDWARE_INDEX_SEQUENTIAL_REFERENCE = 1_000_000;
   const HANDLE_DB = "don-light-console";
   const HANDLE_STORE = "handles";
   const HANDLE_KEY = "config";
@@ -172,6 +177,60 @@
     }
   }
 
+  function normalizeHardwareIndex(value) {
+    if (!value || value.version !== HARDWARE_INDEX_VERSION || value.benchmarkId !== HARDWARE_INDEX_BENCHMARK_ID) return null;
+    const searchRate = Number(value.searchRate);
+    const sequentialRate = Number(value.sequentialRate);
+    const durationMs = Number(value.durationMs);
+    const measuredAt = String(value.measuredAt || "");
+    const normalizeSamples = (samples) => Array.isArray(samples)
+      ? samples.map(Number).filter((sample) => Number.isFinite(sample) && sample > 0).slice(0, 3)
+      : [];
+    const searchSamples = normalizeSamples(value.searchSamples);
+    const sequentialSamples = normalizeSamples(value.sequentialSamples);
+    if (
+      !Number.isFinite(searchRate) || searchRate <= 0 ||
+      !Number.isFinite(sequentialRate) || sequentialRate <= 0 ||
+      !Number.isFinite(durationMs) || durationMs <= 0 ||
+      searchSamples.length !== 3 || sequentialSamples.length !== 3 ||
+      Number.isNaN(new Date(measuredAt).valueOf())
+    ) return null;
+    const score = hardwareIndexScore(searchRate, sequentialRate);
+    if (!Number.isFinite(score)) return null;
+    return {
+      version: HARDWARE_INDEX_VERSION,
+      benchmarkId: HARDWARE_INDEX_BENCHMARK_ID,
+      score,
+      searchRate,
+      sequentialRate,
+      searchSamples,
+      sequentialSamples,
+      durationMs,
+      measuredAt,
+      stability: hardwareIndexStability(searchSamples, sequentialSamples),
+    };
+  }
+
+  function loadHardwareIndex() {
+    try {
+      return normalizeHardwareIndex(JSON.parse(localStorage.getItem(HARDWARE_INDEX_STORAGE_KEY) || "null"));
+    } catch {
+      return null;
+    }
+  }
+
+  function persistHardwareIndex(result) {
+    try {
+      localStorage.setItem(HARDWARE_INDEX_STORAGE_KEY, JSON.stringify(result));
+      return true;
+    } catch {
+      // The result remains available for this tab if browser storage is unavailable.
+      return false;
+    }
+  }
+
+  const savedHardwareIndex = loadHardwareIndex();
+
   const state = {
     config: loadConfig(),
     screen: "home",
@@ -188,6 +247,15 @@
     watchingRuns: new Set(),
     inFlightActionSubmissions: new Set(),
     ambiguousActionSubmissions: new Set(),
+    hardwareIndex: {
+      status: savedHardwareIndex ? "ready" : "idle",
+      result: savedHardwareIndex,
+      error: "",
+      worker: null,
+      runToken: 0,
+      persistent: Boolean(savedHardwareIndex),
+      restoreFocus: false,
+    },
     drawer: null,
     editingConnectionId: null,
     actionSearch: "",
@@ -1736,6 +1804,279 @@
               : `${vdfCalls.length} call${vdfCalls.length === 1 ? "" : "s"} / ${vdfTotal.toLocaleString()} total recursive iterations`,
       },
     };
+  }
+
+  function hardwareIndexWorkerMain() {
+    const SEARCH_BATCH = 16_384;
+    const SEQUENTIAL_BATCH = 256;
+    const MODULUS = (1n << 127n) - 1n;
+    const SEQUENTIAL_ADDEND = 0x9e3779b97f4a7c15n;
+
+    function measureSearch(durationMs) {
+      let checksum = 0x6d2b79f5 | 0;
+      let nonce = 0;
+      let operations = 0;
+      const startedAt = performance.now();
+      do {
+        for (let index = 0; index < SEARCH_BATCH; index += 1) {
+          let value = (nonce + index + 0x9e3779b9) | 0;
+          value = Math.imul(value ^ (value >>> 16), 0x21f0aaad);
+          value = Math.imul(value ^ (value >>> 15), 0x735a2d97);
+          value ^= value >>> 15;
+          checksum = (checksum ^ value) | 0;
+        }
+        nonce = (nonce + SEARCH_BATCH) | 0;
+        operations += SEARCH_BATCH;
+      } while (performance.now() - startedAt < durationMs);
+      const elapsedMs = performance.now() - startedAt;
+      return { rate: operations / (elapsedMs / 1000), checksum, elapsedMs };
+    }
+
+    function measureSequential(durationMs) {
+      let value = 0x123456789abcdef123456789abcdefn;
+      let operations = 0;
+      const startedAt = performance.now();
+      do {
+        for (let index = 0; index < SEQUENTIAL_BATCH; index += 1) {
+          value = (value * value + SEQUENTIAL_ADDEND) % MODULUS;
+        }
+        operations += SEQUENTIAL_BATCH;
+      } while (performance.now() - startedAt < durationMs);
+      const elapsedMs = performance.now() - startedAt;
+      return { rate: operations / (elapsedMs / 1000), checksum: value.toString(16).slice(-16), elapsedMs };
+    }
+
+    self.addEventListener("message", () => {
+      try {
+        measureSearch(55);
+        measureSequential(55);
+        const searchSamples = [measureSearch(150), measureSearch(150), measureSearch(150)];
+        const sequentialSamples = [measureSequential(150), measureSequential(150), measureSequential(150)];
+        const median = (values) => [...values].sort((left, right) => left - right)[Math.floor(values.length / 2)];
+        self.postMessage({
+          searchRate: median(searchSamples.map((sample) => sample.rate)),
+          sequentialRate: median(sequentialSamples.map((sample) => sample.rate)),
+          searchSamples: searchSamples.map((sample) => sample.rate),
+          sequentialSamples: sequentialSamples.map((sample) => sample.rate),
+          durationMs: [...searchSamples, ...sequentialSamples].reduce((sum, sample) => sum + sample.elapsedMs, 0),
+          checksum: `${searchSamples.map((sample) => sample.checksum).join(".")}:${sequentialSamples.map((sample) => sample.checksum).join(".")}`,
+        });
+      } catch (error) {
+        self.postMessage({ error: error?.message || "The benchmark worker failed." });
+      }
+    }, { once: true });
+  }
+
+  function hardwareIndexScore(searchRate, sequentialRate) {
+    const searchRatio = searchRate / HARDWARE_INDEX_SEARCH_REFERENCE;
+    const sequentialRatio = sequentialRate / HARDWARE_INDEX_SEQUENTIAL_REFERENCE;
+    return Math.max(1, Math.round(100 * Math.sqrt(searchRatio) * Math.sqrt(sequentialRatio)));
+  }
+
+  function hardwareIndexStability(searchSamples, sequentialSamples) {
+    const deviation = (samples) => {
+      const sorted = [...samples].sort((left, right) => left - right);
+      const median = sorted[Math.floor(sorted.length / 2)];
+      return Math.max(...samples.map((sample) => Math.abs(sample - median) / median));
+    };
+    const spread = Math.max(deviation(searchSamples), deviation(sequentialSamples));
+    return spread <= 0.05 ? "stable" : spread <= 0.12 ? "fair" : "noisy";
+  }
+
+  function formatHardwareRate(value) {
+    if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(value >= 10_000_000 ? 1 : 2)}M/s`;
+    if (value >= 1_000) return `${(value / 1_000).toFixed(value >= 10_000 ? 1 : 2)}K/s`;
+    return `${Math.round(value).toLocaleString()}/s`;
+  }
+
+  function hardwareIndexContentMarkup() {
+    const benchmark = state.hardwareIndex;
+    const result = benchmark.result;
+    const running = benchmark.status === "running";
+    const buttonLabel = running ? "Testing..." : result ? "Re-run" : "Run quick check";
+    const buttonAriaLabel = running ? "Testing client work index" : result ? "Re-run client work index" : "Run client work index quick check";
+    let readout;
+    if (running) {
+      readout = `
+        <div class="hardware-index-score is-running"><span>Client work index / synthetic</span><strong>CWI-1 TEST</strong><small>Six short samples / keep this tab visible</small></div>
+        <div class="run-request-track hardware-index-track" role="progressbar" aria-label="Running client work index" aria-valuetext="Testing search-style and sequential browser performance"><span></span></div>`;
+    } else if (result) {
+      const searchIndex = Math.max(1, Math.round(100 * (result.searchRate / HARDWARE_INDEX_SEARCH_REFERENCE)));
+      const sequentialIndex = Math.max(1, Math.round(100 * (result.sequentialRate / HARDWARE_INDEX_SEQUENTIAL_REFERENCE)));
+      const resultNote = benchmark.status === "error"
+        ? `Last ${benchmark.persistent ? "saved" : "tab-only"} result retained / re-run failed: ${benchmark.error}`
+        : `Single worker / ${result.stability} samples / ${benchmark.persistent ? "saved locally" : "this tab only"} / tested ${formatDate(result.measuredAt)}`;
+      readout = `
+        <div class="hardware-index-score"><span>Client work index / synthetic</span><strong>CWI-1 ${result.score.toLocaleString()}</strong><small class="hardware-index-result-note${benchmark.status === "error" ? " is-error" : ""}">${escapeHtml(resultNote)}</small></div>
+        <dl class="hardware-index-metrics">
+          <div><dt>Search-style mix</dt><dd><strong>${escapeHtml(formatHardwareRate(result.searchRate))}</strong><small>Index ${searchIndex.toLocaleString()}</small></dd></div>
+          <div><dt>Sequential chain</dt><dd><strong>${escapeHtml(formatHardwareRate(result.sequentialRate))}</strong><small>Index ${sequentialIndex.toLocaleString()} / not a VDF</small></dd></div>
+        </dl>`;
+    } else {
+      readout = `
+        <div class="hardware-index-score${benchmark.status === "error" ? " is-error" : ""}">
+          <span>Client work index / synthetic</span><strong>CWI-1 --</strong><small>${escapeHtml(benchmark.error || "Not tested on this browser")}</small>
+        </div>`;
+    }
+    return `
+      <div class="hardware-index-heading">
+        ${readout}
+        <button class="game-button" type="button" data-command="run-hardware-index" aria-label="${buttonAriaLabel}"${running ? " disabled" : ""}>${buttonLabel}</button>
+      </div>
+      <p class="hardware-index-note">CWI-1 100 is a fixed v1 reference: 100M independent mixes/sec plus 1M dependent BigInt steps/sec. Higher is faster only for this synthetic browser test—not a percentile or hardware grade. It does not run a Driver request, DON proof, PoW, or VDF, and it cannot predict action time.</p>`;
+  }
+
+  function hardwareIndexAnnouncement() {
+    const benchmark = state.hardwareIndex;
+    const result = benchmark.result;
+    if (benchmark.status === "running") return "Client work index test started. Keep this tab visible.";
+    if (benchmark.status === "error" && result) return `Client work index re-run failed. CWI-1 ${result.score.toLocaleString()} retained. ${benchmark.error}`;
+    if (benchmark.status === "error") return `Client work index failed. ${benchmark.error}`;
+    if (result) return `Client work index ready. CWI-1 ${result.score.toLocaleString()}. ${result.stability} samples. ${benchmark.persistent ? "Saved locally." : "Available for this tab only."}`;
+    return "";
+  }
+
+  function patchHardwareIndex() {
+    const focusReturnPending = state.hardwareIndex.restoreFocus && state.hardwareIndex.status !== "running";
+    const focusedElement = document.activeElement;
+    const focusedInIndex = focusedElement?.closest?.("[data-hardware-index]");
+    const focusRunningStatus = state.hardwareIndex.restoreFocus && state.hardwareIndex.status === "running" && focusedInIndex;
+    const restoreFocus = focusReturnPending && (
+      !focusedElement ||
+      focusedElement === document.body ||
+      focusedElement === document.documentElement ||
+      !focusedElement.isConnected ||
+      focusedInIndex
+    );
+    document.querySelectorAll("[data-hardware-index]").forEach((region) => {
+      const content = region.querySelector("[data-hardware-index-content]");
+      const announcement = region.querySelector("[data-hardware-index-announcement]");
+      if (content) content.innerHTML = hardwareIndexContentMarkup();
+      if (announcement) announcement.textContent = hardwareIndexAnnouncement();
+      if (content) content.setAttribute("aria-busy", String(state.hardwareIndex.status === "running"));
+    });
+    if (focusRunningStatus) {
+      document.querySelector("[data-hardware-index-announcement]")?.focus({ preventScroll: true });
+    }
+    if (focusReturnPending) {
+      state.hardwareIndex.restoreFocus = false;
+    }
+    if (restoreFocus) {
+      requestAnimationFrame(() => {
+        const button = document.querySelector('[data-hardware-index] [data-command="run-hardware-index"]');
+        if (button && !button.disabled) button.focus({ preventScroll: true });
+      });
+    }
+  }
+
+  async function runHardwareIndex() {
+    if (state.hardwareIndex.status === "running") return;
+    if (document.activeElement?.closest?.('[data-command="run-hardware-index"]')) {
+      state.hardwareIndex.restoreFocus = true;
+    }
+    if (document.hidden) {
+      state.hardwareIndex.status = "error";
+      state.hardwareIndex.error = "Keep this tab visible before starting the quick check.";
+      patchHardwareIndex();
+      if (!document.querySelector("[data-hardware-index]")) toast("Client work index paused", state.hardwareIndex.error, "error");
+      return;
+    }
+    if (typeof Worker !== "function" || typeof Blob !== "function" || typeof globalThis.URL?.createObjectURL !== "function") {
+      state.hardwareIndex.status = "error";
+      state.hardwareIndex.error = "This browser cannot start the benchmark worker.";
+      patchHardwareIndex();
+      if (!document.querySelector("[data-hardware-index]")) toast("Client work index unavailable", state.hardwareIndex.error, "error");
+      return;
+    }
+
+    const token = ++state.hardwareIndex.runToken;
+    state.hardwareIndex.status = "running";
+    state.hardwareIndex.error = "";
+    patchHardwareIndex();
+    let workerUrl = "";
+    let worker = null;
+    try {
+      const source = `(${hardwareIndexWorkerMain.toString()})();`;
+      workerUrl = globalThis.URL.createObjectURL(new Blob([source], { type: "text/javascript" }));
+      worker = new Worker(workerUrl, { name: "don-client-work-index" });
+      state.hardwareIndex.worker = worker;
+      const raw = await new Promise((resolve, reject) => {
+        let settled = false;
+        let timeout = 0;
+        const finish = (handler, value) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timeout);
+          document.removeEventListener("visibilitychange", onVisibilityChange);
+          handler(value);
+        };
+        const onVisibilityChange = () => {
+          if (document.hidden) finish(reject, new Error("The quick check stopped because this tab was hidden."));
+        };
+        timeout = setTimeout(() => finish(reject, new Error("The quick index timed out.")), 7000);
+        document.addEventListener("visibilitychange", onVisibilityChange);
+        worker.addEventListener("message", (event) => {
+          if (document.hidden) finish(reject, new Error("The quick check stopped because this tab was hidden."));
+          else if (event.data?.error) finish(reject, new Error(event.data.error));
+          else finish(resolve, event.data);
+        }, { once: true });
+        worker.addEventListener("error", (event) => {
+          if (settled) return;
+          event.preventDefault();
+          finish(reject, new Error(event.message || "The benchmark worker could not start."));
+        }, { once: true });
+        try {
+          worker.postMessage({ run: true });
+        } catch (error) {
+          finish(reject, error);
+        }
+      });
+      if (token !== state.hardwareIndex.runToken) return;
+      if (document.hidden) throw new Error("The quick check stopped because this tab was hidden.");
+      const searchRate = Number(raw?.searchRate);
+      const sequentialRate = Number(raw?.sequentialRate);
+      const durationMs = Number(raw?.durationMs);
+      const normalizeSamples = (samples) => Array.isArray(samples) ? samples.map(Number) : [];
+      const searchSamples = normalizeSamples(raw?.searchSamples);
+      const sequentialSamples = normalizeSamples(raw?.sequentialSamples);
+      const validSamples = (samples) => samples.length === 3 && samples.every((sample) => Number.isFinite(sample) && sample > 0);
+      if (
+        !Number.isFinite(searchRate) || searchRate <= 0 ||
+        !Number.isFinite(sequentialRate) || sequentialRate <= 0 ||
+        !Number.isFinite(durationMs) || durationMs <= 0 ||
+        !validSamples(searchSamples) || !validSamples(sequentialSamples)
+      ) {
+        throw new Error("The benchmark returned an invalid result.");
+      }
+      const result = normalizeHardwareIndex({
+        version: HARDWARE_INDEX_VERSION,
+        benchmarkId: HARDWARE_INDEX_BENCHMARK_ID,
+        searchRate,
+        sequentialRate,
+        searchSamples,
+        sequentialSamples,
+        durationMs,
+        measuredAt: new Date().toISOString(),
+        stability: hardwareIndexStability(searchSamples, sequentialSamples),
+      });
+      if (!result) throw new Error("The benchmark result could not be normalized.");
+      state.hardwareIndex.status = "ready";
+      state.hardwareIndex.result = result;
+      state.hardwareIndex.persistent = persistHardwareIndex(result);
+      if (!document.querySelector("[data-hardware-index]")) {
+        toast("Client work index ready", `CWI-1 ${result.score.toLocaleString()} / ${state.hardwareIndex.persistent ? "saved locally" : "this tab only"}`, "success");
+      }
+    } catch (error) {
+      if (token !== state.hardwareIndex.runToken) return;
+      state.hardwareIndex.status = "error";
+      state.hardwareIndex.error = error.message;
+      if (!document.querySelector("[data-hardware-index]")) toast("Client work index failed", error.message, "error");
+    } finally {
+      worker?.terminate();
+      if (workerUrl) globalThis.URL.revokeObjectURL(workerUrl);
+      if (token === state.hardwareIndex.runToken) state.hardwareIndex.worker = null;
+      patchHardwareIndex();
+    }
   }
 
   function techTreeClassId(value, explicitHash = "") {
@@ -3927,6 +4268,16 @@
           ${menuTile("save-config", "OUT", state.linkedConfigName ? "Save linked config" : "Save config", "Create or link a JSON config file; supported browsers remember the file handle.", { meta: state.linkedConfigName || "Export" })}
           ${menuTile("reset-config", "RST", "Reset defaults", "Restore the local Driver profile and clear saved cartridge selections.", { meta: "Caution" })}
         </div>
+        <div class="game-panel hardware-index-panel">
+          <div class="game-panel-header"><h2>Client work index</h2><span>Quick browser test</span></div>
+          <div class="game-panel-body">
+            <p class="screen-copy hardware-index-intro">Run two brief single-worker loops to get a rough search-style and sequential-work index for this browser. The test takes about one second and needs this tab to stay visible.</p>
+            <div class="hardware-index" data-hardware-index>
+              <span class="sr-only" data-hardware-index-announcement tabindex="-1" aria-live="polite" aria-atomic="true">${escapeHtml(hardwareIndexAnnouncement())}</span>
+              <div data-hardware-index-content aria-busy="${state.hardwareIndex.status === "running"}">${hardwareIndexContentMarkup()}</div>
+            </div>
+          </div>
+        </div>
         <div class="game-panel">
           <div class="game-panel-header"><h2>Current configuration</h2><span>version ${CONFIG_VERSION}</span></div>
           <div class="game-panel-body"><pre class="code-block">${safeJson(state.config)}</pre></div>
@@ -4311,6 +4662,9 @@
         break;
       case "config":
         navigate("config");
+        break;
+      case "run-hardware-index":
+        await runHardwareIndex();
         break;
       case "open-config":
         await openConfigFile();

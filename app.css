@@ -2759,6 +2759,132 @@ html.has-tech-tree-fullscreen body {
   line-height: 1.55;
 }
 
+.hardware-index-panel .game-panel-header > span {
+  color: var(--amber);
+  font-size: 8px;
+  font-weight: 900;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.hardware-index-intro {
+  max-width: 760px;
+  margin: 0 0 12px;
+}
+
+.hardware-index {
+  padding: 12px;
+  border: 2px solid var(--lcd-line);
+  background:
+    repeating-linear-gradient(0deg, transparent 0 3px, var(--screen-grid) 3px 4px),
+    var(--lcd-deep);
+  box-shadow:
+    inset 3px 3px 0 var(--screen-inset-dark),
+    inset -2px -2px 0 var(--screen-inset-light);
+}
+
+.hardware-index-heading {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 10px 12px;
+}
+
+.hardware-index-heading > .game-button {
+  grid-column: 2;
+  grid-row: 1;
+  align-self: center;
+  min-width: 138px;
+}
+
+.hardware-index-score {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.hardware-index-score > span,
+.hardware-index-score > small,
+.hardware-index-metrics dt,
+.hardware-index-metrics small {
+  color: var(--lcd-muted);
+  font-size: 9px;
+  font-weight: 900;
+  line-height: 1.45;
+}
+
+.hardware-index-score > span,
+.hardware-index-metrics dt {
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.hardware-index-score > strong {
+  overflow: hidden;
+  color: var(--lcd-text);
+  font-size: clamp(18px, 3vw, 26px);
+  letter-spacing: 0.06em;
+  line-height: 1.1;
+  text-overflow: ellipsis;
+}
+
+.hardware-index-score.is-running > strong {
+  color: var(--amber);
+}
+
+.hardware-index-score.is-error > strong,
+.hardware-index-score.is-error > small {
+  color: var(--coral);
+}
+
+.hardware-index-result-note.is-error {
+  color: var(--coral);
+}
+
+.hardware-index-metrics {
+  display: grid;
+  grid-column: 1 / -1;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin: 0;
+}
+
+.hardware-index-metrics > div {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+  padding: 9px 10px;
+  border: 1px solid var(--lcd-line);
+  background: var(--lcd-raised);
+  box-shadow: inset 2px 2px 0 var(--screen-inset-dark);
+}
+
+.hardware-index-metrics dd {
+  display: grid;
+  gap: 3px;
+  margin: 0;
+}
+
+.hardware-index-metrics strong {
+  overflow: hidden;
+  color: var(--lcd-text);
+  font-size: 13px;
+  letter-spacing: 0.04em;
+  text-overflow: ellipsis;
+}
+
+.hardware-index-track {
+  grid-column: 1 / -1;
+  margin-top: 1px;
+}
+
+.hardware-index-note {
+  margin: 11px 0 0;
+  color: var(--lcd-muted);
+  font-size: 10px;
+  line-height: 1.55;
+}
+
 .run-progress-body {
   padding: 12px;
 }
@@ -3565,6 +3691,20 @@ body.drawer-open {
   }
 
   .summary-strip {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .hardware-index-heading {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .hardware-index-heading > .game-button {
+    width: 100%;
+    grid-column: 1;
+    grid-row: auto;
+  }
+
+  .hardware-index-metrics {
     grid-template-columns: minmax(0, 1fr);
   }
 
