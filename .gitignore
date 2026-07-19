@@ -1,0 +1,12 @@
+# Generated archive
+game_console.zip
+
+# User-specific connection profiles and selections
+don-console.config.json
+
+# OS and editor metadata
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
