@@ -392,6 +392,11 @@
     },
     planner: {
       goalClassId: "",
+      // Default to making a new token so selecting a class that is already in
+      // inventory still produces an action set. "target-total" is the opt-in
+      // inventory-satisfiable mode (have at least goalQuantity in total).
+      goalSemantics: "additional",
+      goalQuantity: 1,
       result: null,
     },
     linkedConfigHandle: null,
@@ -1152,6 +1157,8 @@
     state.techTree.selectedNodeId = "";
     state.techTree.objectFileName = "";
     state.planner.goalClassId = "";
+    state.planner.goalSemantics = "additional";
+    state.planner.goalQuantity = 1;
     state.planner.result = null;
   }
 
@@ -2014,8 +2021,8 @@
       );
   }
 
-  function plannerRequest(goalClassId) {
-    const value = goalClassId && typeof goalClassId === "object" ? goalClassId : { classId: goalClassId };
+  function plannerRequest(goalRequest) {
+    const value = goalRequest && typeof goalRequest === "object" ? goalRequest : { classId: goalRequest };
     const quantity = value.quantity === undefined ? 1 : Number(value.quantity);
     const semantics = value.semantics === "additional" ? "additional" : "target-total";
     const boundedInteger = (candidate, fallback, maximum, minimum = 0) => {
@@ -2030,6 +2037,15 @@
       maxSteps: boundedInteger(value.maxSteps, PLANNER_DEFAULT_MAX_STEPS, 256),
       maxExpandedStates: boundedInteger(value.maxExpandedStates, PLANNER_DEFAULT_MAX_EXPANDED_STATES, 250000),
     };
+  }
+
+  /** Convert transient planner UI state into the planner's explicit request contract. */
+  function plannerStateRequest(plannerState = state.planner) {
+    return plannerRequest({
+      classId: plannerState?.goalClassId,
+      quantity: plannerState?.goalQuantity,
+      semantics: plannerState?.goalSemantics,
+    });
   }
 
   function plannerGoalSummary(catalog, inventory, request) {
@@ -2389,8 +2405,8 @@
   }
 
   /** Find a valid lexical action sequence, using bounded shortest search first. */
-  function planGoalOutput(catalog, inventory, goalClassId) {
-    const request = plannerRequest(goalClassId);
+  function planGoalOutput(catalog, inventory, goalRequest) {
+    const request = plannerRequest(goalRequest);
     const normalizedInventory = Array.isArray(inventory) ? buildPlannerInventory(inventory) : inventory;
     if (
       !catalog?.classById ||
@@ -4772,11 +4788,15 @@
       if (!optionIds.has(state.planner.goalClassId)) {
         state.planner.goalClassId = goalOptions[0]?.classId || "";
       }
-      const cachedResult = settings.reuseResult && state.planner.result?.goal?.classId === state.planner.goalClassId
+      const request = plannerStateRequest();
+      const cachedResult = settings.reuseResult &&
+        state.planner.result?.goal?.classId === request.classId &&
+        state.planner.result?.goal?.semantics === request.semantics &&
+        state.planner.result?.goal?.quantity === request.quantity
         ? state.planner.result
         : null;
       const result = cachedResult || (state.planner.goalClassId
-        ? planGoalOutput(catalog, inventory, state.planner.goalClassId)
+        ? planGoalOutput(catalog, inventory, request)
         : null);
       state.planner.result = result;
       return { cartridge, catalog, inventory, options: goalOptions, result, error: null };
@@ -5158,6 +5178,9 @@
         ? "No actions required"
         : `${result.totals.expandedStates.toLocaleString()} states checked`;
     const hasMissingBranches = tree?.children?.some((child) => child.inputRole === "missing");
+    const goalRule = result.goal.semantics === "additional"
+      ? `make +${result.goal.quantity} / ${result.goal.initialCount} on hand / finish with ${result.goal.targetCount}`
+      : `have ${result.goal.targetCount}+ / ${result.goal.initialCount} on hand`;
     const diagnosticMarkup = (result.diagnostics || []).map((diagnostic) => {
       const classIds = [...new Set(diagnostic.classIds || [])];
       const actionIds = [...new Set(diagnostic.actionIds || [])];
@@ -5180,7 +5203,7 @@
     ])].filter(Boolean).map((message) => `<li><span>${escapeHtml(message)}</span></li>`);
     return `
       <div class="planner-summary" aria-label="Plan summary">
-        <div class="planner-summary-item"><span>Goal state</span><strong>${escapeHtml(stateLabel)}</strong><small>${escapeHtml(result.goal.label)} / ${escapeHtml(shortText(result.goal.hash, 6, 4))} / need ${result.goal.targetCount}</small></div>
+        <div class="planner-summary-item"><span>Goal state</span><strong>${escapeHtml(stateLabel)}</strong><small>${escapeHtml(result.goal.label)} / ${escapeHtml(shortText(result.goal.hash, 6, 4))} / ${escapeHtml(goalRule)}</small></div>
         <div class="planner-summary-item"><span>Total proof work</span><strong aria-live="polite" aria-atomic="true">${escapeHtml(totalLabel)}</strong><small>${escapeHtml(totalBasis)}</small></div>
         <div class="planner-summary-item"><span>Action set</span><strong>${result.totals.actionCount}</strong><small>${escapeHtml(actionSetBasis)}</small></div>
         <div class="planner-summary-item"><span>Grounding</span><strong>${cwi ? `CWI-1 ${cwi.score.toLocaleString()}` : "No CWI"}</strong><small>${escapeHtml(groundingNote)}</small>${cwiControl}</div>
@@ -5198,7 +5221,8 @@
       const plugin = option.qualified?.pluginName && option.qualified.pluginName !== context.cartridge?.id
         ? ` / ${option.qualified.pluginName}`
         : "";
-      return `<option value="${escapeHtml(option.classId)}"${selected}>${escapeHtml(`${option.label}${plugin} / ${shortText(option.hash, 6, 4)}`)}</option>`;
+      const onHand = context.inventory?.counts?.get(option.classId) || 0;
+      return `<option value="${escapeHtml(option.classId)}"${selected}>${escapeHtml(`${option.label}${plugin} / ${shortText(option.hash, 6, 4)} / ${onHand} live`)}</option>`;
     }).join("")}`;
   }
 
@@ -5217,12 +5241,12 @@
         ${screenHeading(
           `${cartridge.name} cartridge`,
           "Goal Planner",
-          "Choose an object state. The planner reserves live tokens, searches for the shortest route first, and builds a valid counted action set.",
+          "Choose an output and whether to make another or accept one already on hand. Existing live objects remain available as inputs.",
           `${backButton("Play")}${gameButton("Play", "actions")}${gameButton("Full Tech Tree", "tree")}${gameButton("Objects", "objects")}`,
         )}
         <div class="planner-toolbar">
           <label for="planner-goal-select"><span>Target object</span><select id="planner-goal-select" class="game-select"${context.options.length ? "" : " disabled"}>${plannerGoalOptionsMarkup(context)}</select></label>
-          <span>Goal: at least one live object / exact class + hash</span>
+          <label for="planner-goal-semantics"><span>Plan for</span><select id="planner-goal-semantics" class="game-select"${context.options.length ? "" : " disabled"}><option value="additional"${state.planner.goalSemantics === "additional" ? " selected" : ""}>Make one more</option><option value="target-total"${state.planner.goalSemantics === "target-total" ? " selected" : ""}>Have at least one</option></select></label>
         </div>
         <div data-catalog-region="planner" data-planner-result>${plannerResultMarkup(context)}</div>
       </section>`;
@@ -5250,6 +5274,11 @@
       select.innerHTML = plannerGoalOptionsMarkup(context);
       select.value = state.planner.goalClassId;
       select.disabled = !context.options.length;
+    }
+    const semanticsSelect = byId("planner-goal-semantics");
+    if (semanticsSelect) {
+      semanticsSelect.value = state.planner.goalSemantics;
+      semanticsSelect.disabled = !context.options.length;
     }
     if (!region) return;
     region.innerHTML = plannerResultMarkup(context);
@@ -6693,6 +6722,8 @@
           state.techTree.viewBox = null;
           state.techTree.viewKey = "";
           state.planner.goalClassId = "";
+          state.planner.goalSemantics = "additional";
+          state.planner.goalQuantity = 1;
           state.planner.result = null;
         }
         persistConfig();
@@ -6883,6 +6914,11 @@
     }
     if (event.target.id === "planner-goal-select") {
       state.planner.goalClassId = event.target.value || "";
+      state.planner.result = null;
+      patchPlanner();
+    }
+    if (event.target.id === "planner-goal-semantics") {
+      state.planner.goalSemantics = event.target.value === "target-total" ? "target-total" : "additional";
       state.planner.result = null;
       patchPlanner();
     }
