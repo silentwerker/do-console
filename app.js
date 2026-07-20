@@ -2160,7 +2160,7 @@
     });
   }
 
-  /** Build a deterministic Petri catalog from one cartridge's flattened action totals. */
+  /** Build a deterministic dependency catalog from one cartridge's flattened action totals. */
   function buildPlannerCatalog(cartridge, workspace = {}) {
     const cartridgeId = String(cartridge?.id || cartridge?.name || "");
     const classById = new Map();
@@ -5608,7 +5608,7 @@
         ${screenHeading(
           `${cartridge.name} cartridge`,
           "Cartridge Skill Tree",
-          "Explore every public class and action signature as a Petri net, including disconnected networks.",
+          "Explore every public class and action signature as a dependency graph, including disconnected networks.",
           `${backButton("Play")}${gameButton("Play", "actions")}${gameButton("Goal Planner", "planner")}${gameButton("Objects", "objects")}`,
         )}
         <div class="tech-tree-toolbar">
@@ -6569,7 +6569,7 @@
         <div id="planner-tree-viewport" class="planner-tree-viewport" role="region" aria-label="Goal dependency map. Drag to pan, use the mouse wheel or plus and minus keys to zoom, and press zero to fit the complete plan.">
           <svg id="planner-tree-svg" class="planner-tree-svg" viewBox="${plannerTreeViewBoxValue()}" preserveAspectRatio="xMidYMid meet" role="img" tabindex="0" aria-labelledby="planner-tree-title planner-tree-description">
             <title id="planner-tree-title">${escapeHtml(cartridgeName)} goal plan</title>
-            <desc id="planner-tree-description">The target object is at the top. Created objects flow upward from actions; required objects flow upward into the actions that use them. Object badges show PoW with a pick and VDF with an hourglass; green is low, yellow is medium or unknown, and red is high. Dashed update arcs mark paired same-class input and output turnover whose post-state is not simulated. Dotted missing lines summarize unresolved prerequisite diagnostics rather than direct Petri arcs. The complete path is fitted automatically; drag to pan and zoom for detail.</desc>
+            <desc id="planner-tree-description">The target object is at the top. Created objects flow upward from actions; required objects flow upward into the actions that use them. Object badges show PoW with a pick and VDF with an hourglass; green is low, yellow is medium or unknown, and red is high. Dashed update arcs mark paired same-class input and output turnover whose post-state is not simulated. Dotted missing lines summarize unresolved prerequisite diagnostics rather than direct input or output relationships. The complete path is fitted automatically; drag to pan and zoom for detail.</desc>
             <defs>
               <marker id="planner-arrow-input" class="planner-marker-input" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M 0 0 L 10 5 L 0 10 Z"></path></marker>
               <marker id="planner-arrow-output" class="planner-marker-output" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M 1 5 L 5 1 L 9 5 L 5 9 Z"></path></marker>
