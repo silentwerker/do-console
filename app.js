@@ -9033,6 +9033,23 @@
     return classRefKey({ class: object?.class, hash: object?.classHash });
   }
 
+  function normalizedWorkflowHash(value) {
+    const hash = String(value || "").trim().toLowerCase().replace(/^0x/, "");
+    return /^[0-9a-f]{64}$/.test(hash) ? hash : "";
+  }
+
+  function workflowObjectTypeHash(object) {
+    const fields = object?.fields;
+    if (!fields || typeof fields !== "object") return "";
+    if (Object.prototype.hasOwnProperty.call(fields, "_raw")) {
+      if (!Array.isArray(fields._raw)) return "";
+      const typeEntries = fields._raw.filter((entry) => Array.isArray(entry) && entry[0] === "type");
+      if (typeEntries.length !== 1) return "";
+      return normalizedWorkflowHash(typeEntries[0]?.[1]?.Raw);
+    }
+    return normalizedWorkflowHash(fields.type?.Raw);
+  }
+
   function goalWorkflowUnrelatedActiveRun(workflow) {
     if (state.workspace.connectionId !== workflow.connection.id) return null;
     const owned = goalWorkflowRunIds(workflow);
@@ -9078,20 +9095,47 @@
       );
     }
     const orderedInputs = [...step.inputs].sort((left, right) => left.slotIndex - right.slotIndex);
-    if (orderedInputs.length !== (action.totalInputs || []).length) {
+    if (
+      orderedInputs.length !== (action.totalInputs || []).length ||
+      orderedInputs.some((input, slotIndex) => input.slotIndex !== slotIndex)
+    ) {
       throw goalWorkflowError(`${step.label} has an incomplete materialized input map. Replan this goal.`, { retryable: false });
     }
     const objects = [];
     for (const input of orderedInputs) {
+      const expectedRef = action.totalInputs[input.slotIndex];
+      if (!expectedRef || classRefKey(expectedRef) !== input.classId) {
+        throw goalWorkflowError(`${step.label} has an invalid exact input-slot binding. Replan this goal.`, { retryable: false });
+      }
       const binding = workflow.tokenBindings[input.tokenId];
       if (!binding) {
         throw goalWorkflowError(`The planned ${input.classLabel} input is not bound to a verified object. Replan from live inventory.`, { retryable: false });
       }
+      if (
+        (binding.tokenId && binding.tokenId !== input.tokenId) ||
+        (binding.classId && binding.classId !== input.classId)
+      ) {
+        throw goalWorkflowError(`The saved token identity for ${input.classLabel} no longer matches this plan. Replan this goal.`, { retryable: false });
+      }
       const object = workflowObjectForBinding(snapshot.objects, binding);
-      if (!object || object.status !== "live" || workflowObjectClassId(object) !== input.classId) {
+      if (!object || object.status !== "live" || !sameQualified(object.class, expectedRef.class)) {
         throw goalWorkflowError(
-          `${input.classLabel} for input slot ${input.slotIndex + 1} is no longer live at the exact planned class version.`,
+          `${input.classLabel} for input slot ${input.slotIndex + 1} is no longer live as the planned input class.`,
           { retryable: true },
+        );
+      }
+      if (
+        input.sourceKind === "inventory" &&
+        ((input.fileName && input.fileName !== object.fileName) ||
+          (input.contentHash && input.contentHash !== object.contentHash))
+      ) {
+        throw goalWorkflowError(`The frozen inventory identity for ${input.classLabel} changed. Replan this goal.`, { retryable: false });
+      }
+      const expectedTypeHash = normalizedWorkflowHash(expectedRef.hash);
+      if (!expectedTypeHash || workflowObjectTypeHash(object) !== expectedTypeHash) {
+        throw goalWorkflowError(
+          `${input.classLabel} for input slot ${input.slotIndex + 1} does not carry the exact committed type required by ${step.label}. Replan this goal.`,
+          { retryable: false },
         );
       }
       if (!binding.fileName) binding.fileName = object.fileName || "";
@@ -9101,17 +9145,30 @@
     }
     const inputObjectPaths = objects.map((object) => object.fileName);
     if (inputObjectPaths.some((fileName) => !fileName) || new Set(inputObjectPaths).size !== inputObjectPaths.length) {
-      throw goalWorkflowError(`${step.label} could not resolve distinct file paths for every input slot.`, { retryable: true });
+      throw goalWorkflowError(`${step.label} could not resolve distinct file paths for every input slot. Replan this goal.`, { retryable: false });
+    }
+    const inputObjectHashes = objects.map((object) => normalizedWorkflowHash(object.contentHash));
+    const availableInputObjectHashes = inputObjectHashes.filter(Boolean);
+    if (new Set(availableInputObjectHashes).size !== availableInputObjectHashes.length) {
+      throw goalWorkflowError(`${step.label} could not resolve distinct content identities for every input slot. Replan this goal.`, { retryable: false });
     }
     const report = await driverRequest(
       workflow.connection,
       `/actions/${encodeURIComponent(step.actionKey)}/feasibility`,
       { timeout: 15000 },
     );
-    const available = new Set((report?.availableInputs || []).map((candidate) => candidate.fileName));
-    if (report?.feasible !== true || inputObjectPaths.some((fileName) => !available.has(fileName))) {
+    if (!sameQualified(report?.action, step.action)) {
       throw goalWorkflowError(
-        `${step.label} is not feasible with the exact objects reserved by this plan. Refresh inventory or replan before retrying.`,
+        `${step.label} received a feasibility report for a different action. Rebuild the plan from the live catalog.`,
+        { retryable: false },
+      );
+    }
+    // availableInputs is one Driver-selected assignment (one candidate per input
+    // slot), not an exhaustive allow-list. The frozen bindings were independently
+    // checked above for live status, committed type, and distinct object identity.
+    if (report?.feasible !== true) {
+      throw goalWorkflowError(
+        `${step.label} is not currently feasible according to the Driver. Refresh inventory or replan before retrying.`,
         { retryable: true },
       );
     }
