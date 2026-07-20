@@ -4941,10 +4941,6 @@ html.has-planner-tree-fullscreen .game-shell::after {
   color: var(--lcd-muted);
 }
 
-.planner-truth-note {
-  margin-top: 15px;
-}
-
 @media (max-width: 900px) {
   .planner-summary {
     grid-template-columns: repeat(2, minmax(0, 1fr));
