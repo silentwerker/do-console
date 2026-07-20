@@ -20,6 +20,11 @@
   const HARDWARE_INDEX_POLL_MS = 1_200;
   const HARDWARE_INDEX_ACTION = Object.freeze({ pluginName: "craft-rocket", name: "MineIron" });
   const ACTION_COMMIT_ALLOWANCE_MS = 60_000;
+  const WORK_ESTIMATOR_REFERENCE_CWI_MS = 41_700;
+  const POW_REFERENCE_WORK_MS = 1_000;
+  const VDF_ITERATION_WORK_MS = 5_000;
+  const STRUCTURAL_SLOT_WORK_MS = 60_000;
+  const ACTION_OPERATIONAL_CONTINGENCY = 0.25;
   const HARDWARE_INDEX_PROOF_START = Object.freeze({ phase: "generateProof", status: "running", message: "Generating proof" });
   const HARDWARE_INDEX_PROOF_STOP = Object.freeze({ phase: "generateProof", status: "done", message: "Proof generation complete" });
   const clearedHardwareIndexRunUrls = new Set();
@@ -3374,9 +3379,88 @@
     };
   }
 
-  // CWI-4 supplies the proof component. Every action estimate adds one fixed minute
-  // for average commit/settlement time. The stored CWI remains proof-only, and the
-  // planner sums this combined estimate once per unique action step.
+  const PROOF_GATE_LEVEL_ORDER = Object.freeze({
+    pow: Object.freeze({ None: 0, Easy: 1, Medium: 2, Unknown: 2.5, Hard: 3, Extreme: 4, Invalid: 5 }),
+    vdf: Object.freeze({ None: 0, Short: 1, Medium: 2, Unknown: 2.5, Long: 3, Invalid: 4 }),
+  });
+
+  function proofGateTone(kind, level) {
+    if (level === "Invalid" || (kind === "pow" && (level === "Hard" || level === "Extreme")) || (kind === "vdf" && level === "Long")) return "red";
+    if (level === "Medium" || level === "Unknown") return "yellow";
+    if ((kind === "pow" && (level === "None" || level === "Easy")) || (kind === "vdf" && (level === "None" || level === "Short"))) return "green";
+    return "yellow";
+  }
+
+  function proofDifficultySummary(workloads, options = {}) {
+    const entries = (Array.isArray(workloads) ? workloads : [workloads]).filter(Boolean);
+    const inventory = Boolean(options.inventory);
+    const producerCount = Number(options.producerCount ?? entries.length) || 0;
+    const unknownReason = String(options.unknownReason || "producer metadata unavailable");
+    const badge = (kind) => {
+      const label = kind === "pow" ? "PoW" : "VDF";
+      const glyph = kind === "pow" ? "⛏" : "⌛";
+      if (inventory) {
+        return { kind, label, glyph, level: "No action", tone: "green", title: `${label}: no action required; live inventory satisfies this plan.` };
+      }
+      if (!entries.length) {
+        return { kind, label, glyph, level: "Unknown", tone: "yellow", title: `${label}: unknown; ${unknownReason}.` };
+      }
+      const order = PROOF_GATE_LEVEL_ORDER[kind];
+      const candidates = entries.map((workload) => {
+        const candidate = String(workload?.[kind]?.level || "Unknown");
+        return Object.hasOwn(order, candidate) ? candidate : "Unknown";
+      });
+      const level = candidates.reduce((highest, candidate) =>
+        (order[candidate] ?? order.Unknown) > (order[highest] ?? order.Unknown) ? candidate : highest,
+      candidates[0] || "Unknown");
+      const suffix = producerCount > 1 ? `; highest severity across ${producerCount} producing actions` : "";
+      return { kind, label, glyph, level, tone: proofGateTone(kind, level), title: `${label}: ${level}${suffix}.` };
+    };
+    const badges = [badge("pow"), badge("vdf")];
+    const producerSuffix = !inventory && producerCount > 1 ? `; highest of ${producerCount} producers` : "";
+    const unknownSuffix = !inventory && !entries.length ? `; ${unknownReason}` : "";
+    return { badges, text: `${badges.map((item) => `${item.label} ${item.level}`).join(", ")}${producerSuffix}${unknownSuffix}` };
+  }
+
+  function proofDifficultySvgMarkup(summary, x, y, gap = 3) {
+    if (!summary?.badges?.length) return "";
+    return `<g class="work-gate-badges" aria-hidden="true">${summary.badges.map((badge, index) => {
+      const offsetY = y + index * (16 + gap);
+      return `<g class="work-gate-badge is-${badge.tone}" transform="translate(${x} ${offsetY})"><title>${escapeHtml(badge.title)}</title><rect width="16" height="16"></rect><text class="work-gate-glyph" x="8" y="12" text-anchor="middle">${escapeHtml(badge.glyph)}</text></g>`;
+    }).join("")}</g>`;
+  }
+
+  function finiteBigIntRatio(numerator, denominator) {
+    if (typeof numerator !== "bigint" || typeof denominator !== "bigint" || denominator <= 0n || numerator < 0n) return null;
+    const whole = numerator / denominator;
+    const wholeNumber = Number(whole);
+    if (!Number.isFinite(wholeNumber)) return Number.POSITIVE_INFINITY;
+    return wholeNumber + Number(numerator % denominator) / Number(denominator);
+  }
+
+  function mineIronReferenceAttempts(cwi, action, workload) {
+    if (
+      cwi &&
+      sameQualified(action?.action, HARDWARE_INDEX_ACTION) &&
+      String(action?.hash || "") === cwi.actionHash &&
+      workload?.pow?.complete &&
+      workload.pow.expectedAttempts > 0n
+    ) {
+      return workload.pow.expectedAttempts;
+    }
+    const benchmark = mineIronBenchmarkAction();
+    if (!benchmark || (cwi?.actionHash && benchmark.hash !== cwi.actionHash)) return null;
+    const benchmarkWorkload = actionProofWorkload(benchmark);
+    return benchmarkWorkload.pow.complete && benchmarkWorkload.pow.expectedAttempts > 0n
+      ? benchmarkWorkload.pow.expectedAttempts
+      : null;
+  }
+
+  // CWI-4 observes MineIron's complete Generate Proof window. The estimator scales
+  // that machine-specific result with the readable proof gates and flattened I/O
+  // shape, then adds commit and operational allowances. The calibration constants
+  // come from craft-rocket's authored 1 s PoW / 5 s VDF scale and observed Driver
+  // proof windows (41.7 s MineIron reference; roughly 60 s per extra I/O slot).
   function estimateActionProofTiming(
     action,
     cwiResult = currentHardwareIndex(),
@@ -3389,30 +3473,65 @@
       sameQualified(action?.action, HARDWARE_INDEX_ACTION) &&
       String(action?.hash || "") === cwi.actionHash
     );
-    const directWorkKnown = (workload.pow.knownCount || 0) + (workload.vdf.knownCount || 0) > 0;
-    const proofMilliseconds = hasCwi ? cwi.durationMs : null;
+    const directWorkKnown = Boolean(workload.complete || (workload.pow.knownCount || 0) + (workload.vdf.knownCount || 0) > 0);
+    const referenceAttempts = hasCwi ? mineIronReferenceAttempts(cwi, action, workload) : null;
+    const powRatio = referenceAttempts ? finiteBigIntRatio(workload.pow.expectedAttempts || 0n, referenceAttempts) : null;
+    const powWorkMilliseconds = powRatio == null ? 0 : powRatio * POW_REFERENCE_WORK_MS;
+    const vdfIterations = Number(workload.vdf.totalIterations || 0n);
+    const vdfWorkMilliseconds = Number.isFinite(vdfIterations)
+      ? vdfIterations * VDF_ITERATION_WORK_MS
+      : Number.POSITIVE_INFINITY;
+    const directWorkMilliseconds = powWorkMilliseconds + vdfWorkMilliseconds;
+    const totalInputs = Array.isArray(action?.totalInputs) ? action.totalInputs.length : 0;
+    const totalOutputs = Array.isArray(action?.totalOutputs) ? action.totalOutputs.length : 0;
+    const ioSlotCount = totalInputs + totalOutputs;
+    const structuralWorkMilliseconds = Math.max(0, ioSlotCount - 1) * STRUCTURAL_SLOT_WORK_MS;
+    const hardwareScale = hasCwi ? cwi.durationMs / WORK_ESTIMATOR_REFERENCE_CWI_MS : null;
+    const additionalDirectWorkMilliseconds = hasCwi
+      ? Math.max(0, directWorkMilliseconds - POW_REFERENCE_WORK_MS) * hardwareScale
+      : null;
+    const structuralProofMilliseconds = hasCwi ? structuralWorkMilliseconds * hardwareScale : null;
+    const proofMilliseconds = hasCwi
+      ? cwi.durationMs + additionalDirectWorkMilliseconds + structuralProofMilliseconds
+      : null;
     const commitAllowanceMilliseconds = ACTION_COMMIT_ALLOWANCE_MS;
-    const totalMilliseconds = hasCwi ? proofMilliseconds + commitAllowanceMilliseconds : null;
+    const nominalMilliseconds = hasCwi ? proofMilliseconds + commitAllowanceMilliseconds : null;
+    const operationalAllowanceMilliseconds = hasCwi
+      ? nominalMilliseconds * ACTION_OPERATIONAL_CONTINGENCY
+      : null;
+    const totalMilliseconds = hasCwi ? nominalMilliseconds + operationalAllowanceMilliseconds : null;
+    const workloadComplete = Boolean(benchmarkAction || (workload.complete && referenceAttempts));
     return {
       workload,
       cwi,
       hasCwi,
-      hasKnownWork: true,
+      hasKnownWork: directWorkKnown || ioSlotCount > 0,
       directWorkKnown,
       requiresCwi: !hasCwi,
-      complete: hasCwi,
-      partial: false,
-      lowerBound: false,
-      coverage: hasCwi ? (benchmarkAction ? "observed" : "average") : "unknown",
-      estimateKind: hasCwi ? (benchmarkAction ? "observed" : "average") : "unavailable",
+      complete: Boolean(hasCwi && workloadComplete),
+      partial: Boolean(hasCwi && !workloadComplete),
+      lowerBound: Boolean(hasCwi && !workloadComplete),
+      coverage: hasCwi ? (benchmarkAction ? "observed" : workloadComplete ? "calibrated" : "lower-bound") : "unknown",
+      estimateKind: hasCwi ? (benchmarkAction ? "observed" : workloadComplete ? "calibrated" : "lower-bound") : "unavailable",
       benchmarkAction,
+      referenceAttempts,
+      powRatio,
+      ioSlotCount,
+      hardwareScale,
+      directWorkMilliseconds,
+      structuralWorkMilliseconds,
+      additionalDirectWorkMilliseconds,
+      structuralProofMilliseconds,
       proofMilliseconds,
       commitAllowanceMilliseconds,
+      nominalMilliseconds,
+      operationalAllowanceMilliseconds,
+      operationalContingency: ACTION_OPERATIONAL_CONTINGENCY,
       totalMilliseconds,
-      powMilliseconds: null,
-      vdfMilliseconds: null,
-      powLowerBound: false,
-      vdfLowerBound: false,
+      powMilliseconds: hasCwi && powRatio != null ? powWorkMilliseconds * hardwareScale : null,
+      vdfMilliseconds: hasCwi ? vdfWorkMilliseconds * hardwareScale : null,
+      powLowerBound: Boolean(!workload.pow.complete || !referenceAttempts),
+      vdfLowerBound: Boolean(!workload.vdf.complete),
     };
   }
 
@@ -3734,7 +3853,7 @@
         ${readout}
         ${buttonMarkup}
       </div>
-      <p class="hardware-index-note"><strong>${HARDWARE_INDEX_LABEL}</strong> measures one exact Driver event window: <code>generateProof/running</code> with message <code>Generating proof</code> through <code>generateProof/done</code> with message <code>Proof generation complete</code>. Transaction submission, commit, confirmation, and live-output verification are excluded. The submitted MineIron still settles and may create one retained Iron. Proof baselines/hr is one hour divided by the observed proof duration, so higher is faster when the Driver version and MineIron action hash match. Action and planner estimates use this proof baseline plus a fixed ${escapeHtml(formatProofDuration(ACTION_COMMIT_ALLOWANCE_MS))} average commit allowance per action; actual commit time can vary.</p>`;
+      <p class="hardware-index-note"><strong>${HARDWARE_INDEX_LABEL}</strong> measures one exact Driver event window: <code>generateProof/running</code> with message <code>Generating proof</code> through <code>generateProof/done</code> with message <code>Proof generation complete</code>. Transaction submission, commit, confirmation, and live-output verification are excluded. The submitted MineIron still settles and may create one retained Iron. Proof baselines/hr is one hour divided by the observed proof duration, so higher is faster when the Driver version and MineIron action hash match. Action and planner estimates scale this baseline with PoW, VDF, and I/O workload, then add ${escapeHtml(formatProofDuration(ACTION_COMMIT_ALLOWANCE_MS))} for commit and a ${Math.round(ACTION_OPERATIONAL_CONTINGENCY * 100)}% operational allowance per action.</p>`;
   }
 
   function hardwareIndexAnnouncement() {
@@ -4688,6 +4807,25 @@
 
     const allNodes = [...places.values(), ...transitions.values()];
     const allEdges = [...edgeMap.values()];
+    const producerTransitionsByPlace = new Map([...places.keys()].map((id) => [id, new Map()]));
+    const transitionWorkloads = new Map();
+    for (const edge of allEdges) {
+      if (edge.role !== "output" && edge.role !== "opaque-output") continue;
+      const transition = transitions.get(edge.source);
+      if (!transition || !places.has(edge.target)) continue;
+      producerTransitionsByPlace.get(edge.target).set(transition.id, transition);
+    }
+    for (const place of places.values()) {
+      const producers = [...(producerTransitionsByPlace.get(place.id)?.values() || [])];
+      const workloads = producers.map((transition) => {
+        if (!transitionWorkloads.has(transition.id)) transitionWorkloads.set(transition.id, actionProofWorkload(transition.action));
+        return transitionWorkloads.get(transition.id);
+      });
+      place.proofDifficulty = proofDifficultySummary(workloads, {
+        producerCount: producers.length,
+        unknownReason: "no producing action in this cartridge",
+      });
+    }
     const requestedObject = state.techTree.objectFileName
       ? cartridge.objects.find((object) => object.fileName === state.techTree.objectFileName) || null
       : null;
@@ -4957,7 +5095,8 @@
 
   function techTreeNodeAria(node) {
     const kind = node.kind === "place" ? "state" : "transition";
-    return `${kind}, ${node.label}, ${techTreeNodeStatus(node)}`;
+    const difficulty = node.kind === "place" && node.proofDifficulty ? `, ${node.proofDifficulty.text}` : "";
+    return `${kind}, ${node.label}, ${techTreeNodeStatus(node)}${difficulty}`;
   }
 
   function techTreeLineage(model, nodeId) {
@@ -5201,7 +5340,7 @@
     for (const node of model.nodes) {
       const position = layout.positions.get(node.id);
       if (!position) continue;
-      const lines = techTreeNodeLabelLines(node.label);
+      const lines = techTreeNodeLabelLines(node.label, node.kind === "place" ? 15 : 18);
       const selected = node.id === state.techTree.selectedNodeId;
       const focused = node.id === model.focusPlaceId;
       const classes = [
@@ -5222,10 +5361,14 @@
       const shape = node.kind === "place"
         ? `<rect class="tech-tree-node-frame" width="${position.width}" height="${position.height}"></rect><rect class="tech-tree-token-well" x="8" y="10" width="23" height="23"></rect><text class="tech-tree-node-emoji" x="19.5" y="27" text-anchor="middle">${escapeHtml(node.emoji || "\ud83d\udce6")}</text>`
         : `<path class="tech-tree-node-frame" d="M 8 0 H ${position.width - 8} L ${position.width} 8 V ${position.height - 8} L ${position.width - 8} ${position.height} H 8 L 0 ${position.height - 8} V 8 Z"></path>`;
+      const difficultyMarkup = node.kind === "place"
+        ? proofDifficultySvgMarkup(node.proofDifficulty, position.width - 20, 4, 2)
+        : "";
       parts.push(`
         <g class="${classes}" transform="${transform}" data-tree-node-id="${escapeHtml(node.id)}" data-tree-kind="${node.kind}" role="button" tabindex="0" aria-pressed="${selected}" aria-label="${escapeHtml(techTreeNodeAria(node))}">
-          <title>${escapeHtml(`${node.label}: ${status}`)}</title>
+          <title>${escapeHtml(`${node.label}: ${status}${node.proofDifficulty ? `. ${node.proofDifficulty.text}` : ""}`)}</title>
           ${shape}
+          ${difficultyMarkup}
           <text class="tech-tree-node-label" x="${anchorX}" y="${lineStart}" text-anchor="${textAnchor}">
             ${lines.map((line, index) => `<tspan x="${anchorX}" dy="${index ? 12 : 0}">${escapeHtml(line)}</tspan>`).join("")}
           </text>
@@ -5403,6 +5546,7 @@
             <span><i class="legend-edge legend-input" aria-hidden="true"></i>Consume</span>
             <span><i class="legend-edge legend-output" aria-hidden="true"></i>Create</span>
             <span><i class="legend-edge legend-opaque" aria-hidden="true"></i>Unresolved I/O</span>
+            <span class="work-gate-key"><b class="gate-symbol" aria-hidden="true">⛏</b>PoW <b class="gate-symbol" aria-hidden="true">⌛</b>VDF <small><i class="gate-tone is-green" aria-hidden="true"></i>low <i class="gate-tone is-yellow" aria-hidden="true"></i>mid/? <i class="gate-tone is-red" aria-hidden="true"></i>high</small></span>
             <span class="tech-tree-counts"><b data-tree-place-count>0</b> states / <b data-tree-action-count>0</b> transitions / <b data-tree-network-count>0</b> networks</span>
           </div>
           <div id="tech-tree-canvas" class="tech-tree-canvas">
@@ -5411,7 +5555,7 @@
             </button>
             <svg id="tech-tree-svg" role="group" aria-labelledby="tech-tree-svg-title tech-tree-svg-description" preserveAspectRatio="xMidYMid meet">
               <title id="tech-tree-svg-title">${escapeHtml(cartridge.name)} action dependency graph</title>
-              <desc id="tech-tree-svg-description">Class states connect to action transitions through labelled consume and create arcs. Consume arcs use triangle markers, create arcs use diamond markers, and dashed open markers identify unresolved input or output arcs. Explicit mutations are excluded.</desc>
+              <desc id="tech-tree-svg-description">Class states connect to action transitions through labelled consume and create arcs. Consume arcs use triangle markers, create arcs use diamond markers, and dashed open markers identify unresolved input or output arcs. Object badges show PoW with a pick and VDF with an hourglass; green is low, yellow is medium or unknown, and red is high. Explicit mutations are excluded.</desc>
             </svg>
             <span class="tech-tree-map-help" aria-hidden="true">Click: trace prerequisites / again: clear / drag: pan / wheel: zoom</span>
           </div>
@@ -5597,7 +5741,7 @@
     root.dataset.treeFingerprint = model.fingerprint;
     const accessibleMarkup = `
       <title id="tech-tree-svg-title">${escapeHtml(model.cartridge.name)} action dependency graph</title>
-      <desc id="tech-tree-svg-description">Class states connect to action transitions through labelled required-input and produced-output arcs. Consume arcs use triangle markers, create arcs use diamond markers, and dashed open markers identify unresolved relationships. Select a node to emphasize only the prerequisite steps that can lead to it; select it again to clear the emphasis.</desc>`;
+      <desc id="tech-tree-svg-description">Class states connect to action transitions through labelled required-input and produced-output arcs. Consume arcs use triangle markers, create arcs use diamond markers, and dashed open markers identify unresolved relationships. Object badges show PoW with a pick and VDF with an hourglass; green is low, yellow is medium or unknown, and red is high. Select a node to emphasize only the prerequisite steps that can lead to it; select it again to clear the emphasis.</desc>`;
     svg.innerHTML = accessibleMarkup + (model.nodes.length
       ? drawTechTreeSvg(model, layout)
       : '<text class="tech-tree-empty" x="20" y="40">No classes or actions are available for this cartridge.</text>');
@@ -5909,7 +6053,10 @@
     let knownCount = 0;
     let directWorkCount = 0;
     let observedCount = 0;
-    let averageCount = 0;
+    let calibratedCount = 0;
+    let lowerBoundCount = 0;
+    let nominalMilliseconds = 0;
+    let operationalAllowanceMilliseconds = 0;
     let complete = true;
     let requiresCwi = false;
     for (const id of ids) {
@@ -5924,11 +6071,26 @@
       }
       if (timing.hasKnownWork) directWorkCount += 1;
       if (timing.estimateKind === "observed") observedCount += 1;
-      if (timing.estimateKind === "average") averageCount += 1;
+      if (timing.estimateKind === "calibrated") calibratedCount += 1;
+      if (timing.estimateKind === "lower-bound") lowerBoundCount += 1;
+      if (timing.nominalMilliseconds != null) nominalMilliseconds += timing.nominalMilliseconds;
+      if (timing.operationalAllowanceMilliseconds != null) operationalAllowanceMilliseconds += timing.operationalAllowanceMilliseconds;
       if (!timing.complete || timing.totalMilliseconds == null) complete = false;
       requiresCwi ||= timing.requiresCwi;
     }
-    return { count: ids.length, knownMilliseconds, knownCount, directWorkCount, observedCount, averageCount, complete, requiresCwi };
+    return {
+      count: ids.length,
+      knownMilliseconds,
+      knownCount,
+      directWorkCount,
+      observedCount,
+      calibratedCount,
+      lowerBoundCount,
+      nominalMilliseconds,
+      operationalAllowanceMilliseconds,
+      complete,
+      requiresCwi,
+    };
   }
 
   function plannerWorkloadSummary(stepIds, timingByStep) {
@@ -5962,15 +6124,15 @@
     if (!timing) return "Time unknown";
     if (timing.requiresCwi) return "Run CWI";
     if (timing.totalMilliseconds == null) return "Time unknown";
-    return `~${formatProofDuration(timing.totalMilliseconds)} total`;
+    return `${timing.lowerBound ? ">= " : "~"}${formatProofDuration(timing.totalMilliseconds)} total`;
   }
 
   function plannerDirectTimingBreakdown(timing) {
     if (!timing?.workload) return "PoW unknown / VDF unknown";
     if (timing.requiresCwi) return `PoW ${timing.workload.pow.level} / VDF ${timing.workload.vdf.level} / proof baseline requires CWI`;
-    const source = timing.estimateKind === "observed" ? "proof observed" : timing.hasCwi ? "proof average" : "no CWI";
+    const source = timing.estimateKind === "observed" ? "proof observed" : timing.lowerBound ? "proof lower bound" : "scaled proof";
     const proof = timing.proofMilliseconds == null ? "proof unknown" : `${formatProofDuration(timing.proofMilliseconds)} ${source}`;
-    return `PoW ${timing.workload.pow.level} / VDF ${timing.workload.vdf.level} / ${proof} + ${formatProofDuration(timing.commitAllowanceMilliseconds)} commit`;
+    return `PoW ${timing.workload.pow.level} / VDF ${timing.workload.vdf.level} / ${proof} + ${formatProofDuration(timing.commitAllowanceMilliseconds)} commit + ${Math.round(timing.operationalContingency * 100)}% operations`;
   }
 
   function buildPlannerDisplayTree(result, timingByStep, catalog) {
@@ -6215,6 +6377,17 @@
     return `${node.isRoot ? "TARGET" : "READY"} / ${plannerTimingLabel(summary)}`;
   }
 
+  function plannerObjectDifficulty(node, timingByStep) {
+    if (node.kind !== "object") return null;
+    if (node.state === "inventory") return proofDifficultySummary([], { inventory: true });
+    const producerStepId = node.token?.producedByStepId || node.aliasStep?.id || "";
+    const workload = producerStepId ? timingByStep.get(producerStepId)?.workload : null;
+    return proofDifficultySummary(workload ? [workload] : [], {
+      producerCount: workload ? 1 : 0,
+      unknownReason: producerStepId ? "producer proof metadata unavailable" : "no producing step selected in this plan",
+    });
+  }
+
   function plannerTreeSvg(root, timingByStep, cartridgeName) {
     const layout = layoutPlannerDisplayTree(root);
     if (!layout) return "";
@@ -6264,8 +6437,9 @@
     const nodeMarkup = layout.nodes.map((node) => {
       const classes = ["planner-node", `planner-node-${node.kind}`, `is-${node.state}`];
       if (node.isRoot) classes.push("is-target");
-      const lines = techTreeNodeLabelLines(node.label, node.kind === "object" ? 20 : 18);
+      const lines = techTreeNodeLabelLines(node.label, 18);
       const status = plannerNodeStatus(node, timingByStep);
+      const difficulty = plannerObjectDifficulty(node, timingByStep);
       const inventorySource = node.state === "inventory" && node.token
         ? ` Driver object: ${node.token.fileName || node.token.contentHash || node.token.tokenId}.`
         : "";
@@ -6274,14 +6448,24 @@
         : `<rect class="planner-node-frame" x="${node.x}" y="${node.y}" width="${node.size.width}" height="${node.size.height}"></rect><rect class="planner-object-tab" x="${node.x + 12}" y="${node.y - 4}" width="34" height="7"></rect>`;
       const textX = node.x + node.size.width / 2;
       const firstY = node.y + (lines.length > 1 ? 20 : 25);
+      const difficultyMarkup = difficulty
+        ? proofDifficultySvgMarkup(difficulty, node.x + node.size.width - 20, node.y + 5, 2)
+        : "";
       return `
         <g class="${classes.join(" ")}" aria-hidden="true">
-          <title>${escapeHtml(`${node.label}: ${status}.${inventorySource}`)}</title>
+          <title>${escapeHtml(`${node.label}: ${status}.${inventorySource}${difficulty ? ` ${difficulty.text}.` : ""}`)}</title>
           ${shape}
+          ${difficultyMarkup}
           ${lines.map((line, index) => `<text class="planner-node-label" x="${textX}" y="${firstY + index * 12}">${escapeHtml(line)}</text>`).join("")}
           <text class="planner-node-status" x="${textX}" y="${node.y + node.size.height - 9}">${escapeHtml(status)}</text>
         </g>`;
     }).join("");
+    const accessibleDifficulty = layout.nodes
+      .filter((node) => node.kind === "object")
+      .map((node) => {
+        const difficulty = plannerObjectDifficulty(node, timingByStep);
+        return `<li>${escapeHtml(`${node.label}: ${difficulty?.text || "PoW unknown, VDF unknown"}`)}</li>`;
+      }).join("");
     return `
       <div id="planner-tree-canvas" class="planner-tree-canvas ${canvasShape}" data-plan-node-count="${layout.nodes.length}">
         <div class="planner-tree-control-bar">
@@ -6300,7 +6484,7 @@
         <div id="planner-tree-viewport" class="planner-tree-viewport" role="region" aria-label="Goal dependency map. Drag to pan, use the mouse wheel or plus and minus keys to zoom, and press zero to fit the complete plan.">
           <svg id="planner-tree-svg" class="planner-tree-svg" viewBox="${plannerTreeViewBoxValue()}" preserveAspectRatio="xMidYMid meet" role="img" tabindex="0" aria-labelledby="planner-tree-title planner-tree-description">
             <title id="planner-tree-title">${escapeHtml(cartridgeName)} goal plan</title>
-            <desc id="planner-tree-description">The target object is at the top. Created objects flow upward from actions; required objects flow upward into the actions that use them. Dashed update arcs mark paired same-class input and output turnover whose post-state is not simulated. Dotted missing lines summarize unresolved prerequisite diagnostics rather than direct Petri arcs. The complete path is fitted automatically; drag to pan and zoom for detail.</desc>
+            <desc id="planner-tree-description">The target object is at the top. Created objects flow upward from actions; required objects flow upward into the actions that use them. Object badges show PoW with a pick and VDF with an hourglass; green is low, yellow is medium or unknown, and red is high. Dashed update arcs mark paired same-class input and output turnover whose post-state is not simulated. Dotted missing lines summarize unresolved prerequisite diagnostics rather than direct Petri arcs. The complete path is fitted automatically; drag to pan and zoom for detail.</desc>
             <defs>
               <marker id="planner-arrow-input" class="planner-marker-input" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M 0 0 L 10 5 L 0 10 Z"></path></marker>
               <marker id="planner-arrow-output" class="planner-marker-output" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M 1 5 L 5 1 L 9 5 L 5 9 Z"></path></marker>
@@ -6310,6 +6494,7 @@
             ${edgeMarkup}
             ${nodeMarkup}
           </svg>
+          <div class="sr-only"><span>Object proof difficulty in this plan:</span><ul>${accessibleDifficulty}</ul></div>
         </div>
       </div>`;
   }
@@ -6372,7 +6557,7 @@
         ? "Already available / no actions"
         : totalTiming.requiresCwi
           ? "Run CWI to apply the MineIron proof-window baseline"
-          : `${totalTiming.count} action${totalTiming.count === 1 ? "" : "s"} × (${formatProofDuration(cwi?.durationMs)} proof + ${formatProofDuration(ACTION_COMMIT_ALLOWANCE_MS)} average commit)`;
+          : `${totalTiming.count} action${totalTiming.count === 1 ? "" : "s"} / ${formatProofDuration(totalTiming.nominalMilliseconds)} nominal + ${formatProofDuration(totalTiming.operationalAllowanceMilliseconds)} operational allowance`;
     const tree = buildPlannerDisplayTree(result, timingByStep, context.catalog);
     const stateLabel = {
       satisfied: "Already on hand",
@@ -6387,7 +6572,7 @@
         : gameButton("Run CWI", "run-hardware-index", { tone: "primary" })
       : "";
     const groundingNote = cwi
-      ? `Observed MineIron proof window ${formatProofDuration(cwi.durationMs)} / estimates add ${formatProofDuration(ACTION_COMMIT_ALLOWANCE_MS)} average commit per action / ${formatDate(cwi.measuredAt)}`
+      ? `Observed MineIron proof window ${formatProofDuration(cwi.durationMs)} / workload and I/O scaled / ${formatProofDuration(ACTION_COMMIT_ALLOWANCE_MS)} commit per action / ${Math.round(ACTION_OPERATIONAL_CONTINGENCY * 100)}% operations / ${formatDate(cwi.measuredAt)}`
       : totalTiming.requiresCwi
         ? hardwareIndexUiIsActive()
           ? state.hardwareIndex.status === "settling"
@@ -6457,11 +6642,11 @@
         <div class="planner-summary-item"><span>Grounding</span><strong>${cwi ? `${HARDWARE_INDEX_LABEL} ${formatProofDuration(cwi.durationMs)}` : "No CWI"}</strong><small>${escapeHtml(groundingNote)}</small>${cwiControl}</div>
       </div>
       ${inventorySatisfiedNote}
-      <div class="planner-flow-key" aria-label="Plan relationship legend"><span><i class="planner-key-input" aria-hidden="true"></i>USE / consumed input</span><span><i class="planner-key-output" aria-hidden="true"></i>MAKE / created output</span><span><i class="planner-key-update" aria-hidden="true"></i>UPDATE / paired turnover</span>${inventoryKey}${hasMissingBranches ? '<span><i class="planner-key-missing" aria-hidden="true"></i>MISSING / unresolved prerequisite</span>' : ""}<span>${escapeHtml(treeGuide)}</span></div>
+      <div class="planner-flow-key" aria-label="Plan relationship legend"><span><i class="planner-key-input" aria-hidden="true"></i>USE / consumed input</span><span><i class="planner-key-output" aria-hidden="true"></i>MAKE / created output</span><span><i class="planner-key-update" aria-hidden="true"></i>UPDATE / paired turnover</span>${inventoryKey}${hasMissingBranches ? '<span><i class="planner-key-missing" aria-hidden="true"></i>MISSING / unresolved prerequisite</span>' : ""}<span class="work-gate-key"><b class="gate-symbol" aria-hidden="true">⛏</b>PoW <b class="gate-symbol" aria-hidden="true">⌛</b>VDF <small><i class="gate-tone is-green" aria-hidden="true"></i>low <i class="gate-tone is-yellow" aria-hidden="true"></i>mid/? <i class="gate-tone is-red" aria-hidden="true"></i>high</small></span><span>${escapeHtml(treeGuide)}</span></div>
       ${plannerTreeSvg(tree, timingByStep, context.cartridge.name)}
       ${plannerStepListMarkup(context, timingByStep)}
       ${diagnosticMarkup.length || warningMarkup.length ? `<div class="terminal-note warning planner-diagnostics"><strong>Plan limits</strong><ul>${[...diagnosticMarkup, ...warningMarkup].slice(0, 8).join("")}</ul></div>` : ""}
-      <div class="terminal-note planner-truth-note">CWI records the exact Driver window from <code>generateProof/running</code> with message <code>Generating proof</code> through <code>generateProof/done</code> with message <code>Proof generation complete</code>. CWI itself excludes commit. Every action estimate adds a fixed ${escapeHtml(formatProofDuration(ACTION_COMMIT_ALLOWANCE_MS))} average commit allowance, so the planner total is the sum of proof baseline + commit allowance for each action step. Actual commit time can vary. MineIron with the measured action hash has an observed proof component; every other proof component is a CWI average, not an action-specific prediction. PoW/VDF labels describe readable gate severity only and do not add fabricated component seconds. Bounded shortest search is used first; any valid goal-directed fallback is labeled and may not be minimal. UPDATE arcs mark paired same-class turnover, not verified object identity or field results. Refresh or replan after every real action.</div>`;
+      <div class="terminal-note planner-truth-note">CWI records the exact Driver window from <code>generateProof/running</code> with message <code>Generating proof</code> through <code>generateProof/done</code> with message <code>Proof generation complete</code>. It excludes commit. Other proof estimates scale that machine-specific MineIron result with readable PoW targets, VDF iterations, and flattened input/output size. Each action then adds ${escapeHtml(formatProofDuration(ACTION_COMMIT_ALLOWANCE_MS))} for commit plus a ${Math.round(ACTION_OPERATIONAL_CONTINGENCY * 100)}% operational allowance for retries, errors, and slow settlement. This is a calibrated planning estimate, not a guarantee; unreadable predicates are marked as lower bounds. The planner selects a valid fewest-action route, not necessarily the fastest route. UPDATE arcs mark paired same-class turnover, not verified object identity or field results. Refresh or replan after every real action.</div>`;
   }
 
   function plannerGoalOptionsMarkup(context) {
@@ -6939,6 +7124,17 @@
 
   function renderActionTechTreePortal(action, runState = {}) {
     const dependencyFlow = actionDependencyFlow(action);
+    const selectedWorkload = actionProofWorkload(action);
+    const producerWorkloadsByClass = new Map();
+    for (const candidate of selectedCartridge()?.actions || []) {
+      const flow = actionDependencyFlow(candidate);
+      const workload = actionProofWorkload(candidate);
+      for (const ref of [...flow.outputs, ...flow.opaqueOutputs]) {
+        const key = classRefKey(ref);
+        if (!producerWorkloadsByClass.has(key)) producerWorkloadsByClass.set(key, new Map());
+        producerWorkloadsByClass.get(key).set(techTreeActionId(candidate), workload);
+      }
+    }
     const placeMap = new Map();
     const addPlaces = (refs, role) => {
       for (const { ref, count } of techTreeGroupedRefs(refs)) {
@@ -6967,6 +7163,15 @@
     const inputs = places.filter((place) => inputTotal(place) && !outputTotal(place));
     const outputs = places.filter((place) => outputTotal(place) && !inputTotal(place));
     const shared = places.filter((place) => inputTotal(place) && outputTotal(place));
+    for (const place of places) {
+      const producerWorkloads = outputTotal(place)
+        ? [selectedWorkload]
+        : [...(producerWorkloadsByClass.get(place.key)?.values() || [])];
+      place.proofDifficulty = proofDifficultySummary(producerWorkloads, {
+        producerCount: producerWorkloads.length,
+        unknownReason: "no producing action in this cartridge",
+      });
+    }
     const placeWidth = 142;
     const placeHeight = 50;
     const transitionWidth = 146;
@@ -7004,7 +7209,7 @@
     };
     const placeMarkup = (place, x, y) => {
       const live = compatibleObjects(place.ref).length;
-      const lines = techTreeNodeLabelLines(place.ref.class?.name || "Unknown", 14);
+      const lines = techTreeNodeLabelLines(place.ref.class?.name || "Unknown", 12);
       const labelX = 35;
       const lineStart = lines.length > 1 ? 17 : 23;
       const roles = [];
@@ -7021,9 +7226,11 @@
       const status = `${roles.join(" / ")}${live ? ` / LIVE x${live}` : ""}`;
       return `
         <g class="tech-tree-node-place${live ? " has-live" : ""}" transform="translate(${x} ${y})" aria-hidden="true">
+          <title>${escapeHtml(`${place.ref.class?.name || "Unknown"}: ${place.proofDifficulty.text}`)}</title>
           <rect class="tech-tree-node-frame" width="${placeWidth}" height="${placeHeight}"></rect>
           <rect class="tech-tree-token-well" x="7" y="9" width="22" height="22"></rect>
           <text class="tech-tree-node-emoji" x="18" y="25" text-anchor="middle">${escapeHtml(place.ref.class?.name?.slice(0, 1) || "?")}</text>
+          ${proofDifficultySvgMarkup(place.proofDifficulty, placeWidth - 20, 3, 1)}
           <text class="tech-tree-node-label" x="${labelX}" y="${lineStart}">${lines.map((line, index) => `<tspan x="${labelX}" dy="${index ? 11 : 0}">${escapeHtml(line)}</tspan>`).join("")}</text>
           <text class="tech-tree-node-status" x="${placeWidth / 2}" y="44" text-anchor="middle">${escapeHtml(status)}</text>
         </g>`;
@@ -7091,7 +7298,7 @@
     const parts = [`
       <svg class="action-tech-tree-portal" viewBox="0 0 ${width} ${height}" width="${width}" height="${height}" role="img" aria-labelledby="${titleId} ${descriptionId}" preserveAspectRatio="xMidYMid meet">
         <title id="${titleId}">${escapeHtml(action.action?.name || "Action")} direct action relationships</title>
-        <desc id="${descriptionId}">Only this action transition and its adjacent class states are shown. Consumed inputs are in the left column with triangle markers. Created outputs are in the right column with diamond markers. Dashed open markers identify unresolved slots, and explicit mutations are excluded.</desc>
+        <desc id="${descriptionId}">Only this action transition and its adjacent class states are shown. Consumed inputs are in the left column with triangle markers. Created outputs are in the right column with diamond markers. Dashed open markers identify unresolved slots, and explicit mutations are excluded. Object badges show PoW with a pick and VDF with an hourglass; green is low, yellow is medium or unknown, and red is high. ${escapeHtml(places.map((place) => `${place.ref.class?.name || "Unknown"}: ${place.proofDifficulty.text}`).join("; "))}</desc>
         <defs>
           <marker id="${inputMarkerId}" class="tech-tree-marker tech-tree-marker-input" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z"></path></marker>
           <marker id="${outputMarkerId}" class="tech-tree-marker tech-tree-marker-output" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M 0 5 L 5 0 L 10 5 L 5 10 z"></path></marker>
@@ -7176,7 +7383,7 @@
 
   function actionProofTotalTimingLabel(timing) {
     if (timing.totalMilliseconds != null) {
-      return `~${formatProofDuration(timing.totalMilliseconds)}`;
+      return `${timing.lowerBound ? ">= " : "~"}${formatProofDuration(timing.totalMilliseconds)}`;
     }
     if (timing.requiresCwi) return hardwareIndexUiIsActive() ? "CWI ACTIVE" : "CWI REQUIRED";
     return "UNKNOWN";
@@ -7193,16 +7400,20 @@
 
   function actionProofEstimateSummary(action, timing) {
     const stateLabel = timing.estimateKind === "observed"
-      ? "OBSERVED PROOF + COMMIT ALLOWANCE"
-      : timing.estimateKind === "average"
-        ? "PROOF AVERAGE + COMMIT ALLOWANCE"
-        : "CALIBRATION REQUIRED";
+      ? "OBSERVED PROOF + PLANNING ALLOWANCES"
+      : timing.estimateKind === "calibrated"
+        ? "CWI-SCALED WORKLOAD ESTIMATE"
+        : timing.estimateKind === "lower-bound"
+          ? "KNOWN-WORK LOWER BOUND"
+          : "CALIBRATION REQUIRED";
     const detail = timing.estimateKind === "observed"
-      ? `This MineIron proof component was observed; the total adds a fixed ${formatProofDuration(timing.commitAllowanceMilliseconds)} average commit allowance.`
-      : timing.estimateKind === "average"
-        ? `The CWI proof average is reused for this action, then a fixed ${formatProofDuration(timing.commitAllowanceMilliseconds)} average commit allowance is added.`
-        : "Run one real MineIron Generate Proof window on the selected Driver to establish the proof component.";
-    const stateClass = timing.hasCwi ? "is-complete" : "is-unknown";
+      ? `This MineIron proof component was observed. The total adds ${formatProofDuration(timing.commitAllowanceMilliseconds)} for commit and ${Math.round(timing.operationalContingency * 100)}% for operational variance.`
+      : timing.estimateKind === "calibrated"
+        ? `PoW, VDF, and ${timing.ioSlotCount} I/O slot${timing.ioSlotCount === 1 ? "" : "s"} scale this Driver's CWI; commit and a ${Math.round(timing.operationalContingency * 100)}% retry/settlement allowance are included.`
+        : timing.estimateKind === "lower-bound"
+          ? `Some proof metadata is unreadable. This includes only known workload, I/O structure, commit, and the ${Math.round(timing.operationalContingency * 100)}% operational allowance.`
+          : "Run one real MineIron Generate Proof window on the selected Driver to ground the workload estimate.";
+    const stateClass = timing.complete ? "is-complete" : timing.hasCwi ? "is-partial" : "is-unknown";
     return `
       <div class="proof-estimate-summary ${stateClass}">
         <div><span>${escapeHtml(actionEstimateTargetLabel(action))}</span><strong>${escapeHtml(actionProofTotalTimingLabel(timing))}</strong></div>
@@ -7223,7 +7434,7 @@
     return `
       <div class="proof-cwi-source">
         <span>Raw ${HARDWARE_INDEX_LABEL} proof baseline <b>${escapeHtml(formatProofDuration(cwi.durationMs))}</b>${escapeHtml(liveState)}</span>
-        <small>Proof only / estimates add ${escapeHtml(formatProofDuration(ACTION_COMMIT_ALLOWANCE_MS))} average commit / ${escapeHtml(cwi.driverUrl)} / ${escapeHtml(shortText(cwi.actionHash, 10, 7))} / ${escapeHtml(formatDate(cwi.measuredAt))}</small>
+        <small>Proof only / estimates scale workload and add ${escapeHtml(formatProofDuration(ACTION_COMMIT_ALLOWANCE_MS))} commit + ${Math.round(ACTION_OPERATIONAL_CONTINGENCY * 100)}% operations / ${escapeHtml(cwi.driverUrl)} / ${escapeHtml(shortText(cwi.actionHash, 10, 7))} / ${escapeHtml(formatDate(cwi.measuredAt))}</small>
       </div>`;
   }
 
@@ -7294,7 +7505,7 @@
         ${rating("VDF / literal chain", workload.vdf)}
       </div>
       ${actionProofCwiCalloutMarkup(timing)}
-      <p class="action-proof-note">PoW and VDF remain severity/workload labels only. CWI measures the MineIron proof window from <code>generateProof/running</code> “Generating proof” through <code>generateProof/done</code> “Proof generation complete”. Each action estimate uses that proof component and adds ${escapeHtml(formatProofDuration(ACTION_COMMIT_ALLOWANCE_MS))} for average commit time. Actual commit time can vary.</p>
+      <p class="action-proof-note">CWI measures the MineIron proof window from <code>generateProof/running</code> “Generating proof” through <code>generateProof/done</code> “Proof generation complete”. The estimate scales that hardware baseline using readable PoW targets, VDF iterations, and I/O size, then adds ${escapeHtml(formatProofDuration(ACTION_COMMIT_ALLOWANCE_MS))} for commit and ${Math.round(ACTION_OPERATIONAL_CONTINGENCY * 100)}% for retries, errors, and slow settlement. It is a planning estimate, not a guarantee.</p>
       ${actionProofCwiSourceMarkup(timing)}`;
   }
 
@@ -7304,8 +7515,9 @@
     if (timing.requiresCwi && state.hardwareIndex.status === "running") return "A real MineIron Generate Proof measurement is in progress.";
     if (timing.requiresCwi) return "Client work index is required for the selected-Driver proof-window baseline.";
     if (timing.totalMilliseconds == null) return "Action timing is unknown.";
-    const proofSource = timing.estimateKind === "observed" ? "observed MineIron proof" : "CWI proof average";
-    return `Estimated total action time: ${formatProofDuration(timing.totalMilliseconds)}. Includes ${formatProofDuration(timing.proofMilliseconds)} ${proofSource} plus ${formatProofDuration(timing.commitAllowanceMilliseconds)} average commit allowance.`;
+    const proofSource = timing.estimateKind === "observed" ? "observed MineIron proof" : timing.lowerBound ? "known-work proof lower bound" : "CWI-scaled proof";
+    const prefix = timing.lowerBound ? "Estimated action-time lower bound" : "Estimated total action time";
+    return `${prefix}: ${formatProofDuration(timing.totalMilliseconds)}. Includes ${formatProofDuration(timing.proofMilliseconds)} ${proofSource}, ${formatProofDuration(timing.commitAllowanceMilliseconds)} commit allowance, and ${formatProofDuration(timing.operationalAllowanceMilliseconds)} operational allowance.`;
   }
 
   function actionProofRequirementsMarkup(action) {
@@ -8025,7 +8237,7 @@
         <div class="game-panel hardware-index-panel">
           <div class="game-panel-header"><h2>Client work index</h2><span>Selected Driver proof baseline</span></div>
           <div class="game-panel-body">
-            <p class="screen-copy hardware-index-intro">Run one real zero-input <code>craft-rocket::MineIron</code> action and measure one exact Driver event window: <code>generateProof/running</code> with message <code>Generating proof</code> through <code>generateProof/done</code> with message <code>Proof generation complete</code>. The timer freezes at the stop event, and proof baselines/hr reports relative machine throughput: higher is faster when the Driver version and MineIron action hash match. Transaction submission, chain commit, confirmation, and live-output verification continue as settlement but are excluded from CWI. Action and planner estimates add a fixed ${escapeHtml(formatProofDuration(ACTION_COMMIT_ALLOWANCE_MS))} average commit allowance to this proof baseline for every action. The submitted action may create one retained Iron and cannot be cancelled by closing this page. Allow several minutes on slower hardware. The run id is saved immediately, and completed proof measurements are stored locally per Driver URL, Driver version, and MineIron action hash for 30 days.</p>
+            <p class="screen-copy hardware-index-intro">Run one real zero-input <code>craft-rocket::MineIron</code> action and measure one exact Driver event window: <code>generateProof/running</code> with message <code>Generating proof</code> through <code>generateProof/done</code> with message <code>Proof generation complete</code>. The timer freezes at the stop event, and proof baselines/hr reports relative machine throughput: higher is faster when the Driver version and MineIron action hash match. Transaction submission, chain commit, confirmation, and live-output verification continue as settlement but are excluded from CWI. Action and planner estimates scale that hardware result with readable PoW, VDF, and I/O workload, then add ${escapeHtml(formatProofDuration(ACTION_COMMIT_ALLOWANCE_MS))} for commit and ${Math.round(ACTION_OPERATIONAL_CONTINGENCY * 100)}% for operational variance per action. The submitted action may create one retained Iron and cannot be cancelled by closing this page. Allow several minutes on slower hardware. The run id is saved immediately, and completed proof measurements are stored locally per Driver URL, Driver version, and MineIron action hash for 30 days.</p>
             <div class="hardware-index" id="config-cwi-panel" tabindex="-1" data-hardware-index data-hardware-index-view="full">
               <span class="sr-only" data-hardware-index-announcement aria-live="polite" aria-atomic="true">${escapeHtml(hardwareIndexAnnouncement())}</span>
               <div data-hardware-index-content>${hardwareIndexContentMarkup()}</div>

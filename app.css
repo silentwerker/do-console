@@ -2549,6 +2549,86 @@ button.object-card {
   outline: none;
 }
 
+.work-gate-badges,
+.work-gate-badge {
+  pointer-events: visiblePainted;
+}
+
+.work-gate-glyph {
+  pointer-events: none;
+}
+
+.work-gate-badge rect {
+  stroke: #090c09;
+  stroke-width: 1.5;
+  vector-effect: non-scaling-stroke;
+  shape-rendering: crispEdges;
+}
+
+.work-gate-badge.is-green rect,
+.gate-tone.is-green {
+  fill: #43d65c;
+  background: #43d65c;
+}
+
+.work-gate-badge.is-yellow rect,
+.gate-tone.is-yellow {
+  fill: #ffd447;
+  background: #ffd447;
+}
+
+.work-gate-badge.is-red rect,
+.gate-tone.is-red {
+  fill: #ff5b58;
+  background: #ff5b58;
+}
+
+.work-gate-glyph {
+  fill: #090c09;
+  font-family: "Segoe UI Symbol", "Apple Symbols", sans-serif;
+  font-size: 10px;
+  font-weight: 900;
+}
+
+.work-gate-key {
+  gap: 4px !important;
+}
+
+.work-gate-key .gate-symbol {
+  display: inline-grid;
+  width: 16px;
+  height: 16px;
+  place-items: center;
+  border: 1px solid var(--lcd-line);
+  background: var(--lcd-raised);
+  color: var(--lcd-text);
+  font-family: "Segoe UI Symbol", "Apple Symbols", sans-serif;
+  font-size: 10px;
+  line-height: 1;
+}
+
+.work-gate-key small {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  color: var(--lcd-muted);
+  font-size: 6px;
+  font-weight: 900;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.work-gate-key .gate-tone {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border: 1px solid #090c09;
+}
+
+.work-gate-key .gate-tone::after {
+  content: none;
+}
+
 .tech-tree-node-frame {
   fill: var(--lcd);
   stroke: var(--lcd-line);
