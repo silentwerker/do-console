@@ -2114,9 +2114,6 @@
           backButton(),
         )}
         <div data-catalog-region="cartridges">${cartridgeCatalogMarkup(connection)}</div>
-        <div class="terminal-note warning">
-          A plain browser client cannot stage or inspect publisher identity before installation. dobjd validates the archive and catalog, but selecting Load commits the cartridge directly to that Driver.
-        </div>
       </section>`;
   }
 
