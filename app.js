@@ -641,6 +641,16 @@
         typeof workflow.tokenBindings !== "object"
       ) return null;
       workflow.executionMode = executionMode;
+      workflow.retryable = workflow.retryable !== false;
+      workflow.goal.terminalProducerActionId = String(workflow.goal.terminalProducerActionId || "");
+      workflow.goal.terminalProducerLabel = String(workflow.goal.terminalProducerLabel || "");
+      workflow.goal.actualTerminalProducerActionId = String(workflow.goal.actualTerminalProducerActionId || "");
+      workflow.goal.actualTerminalProducerLabel = String(workflow.goal.actualTerminalProducerLabel || "");
+      const frozenTerminalStep = workflow.steps.at(-1);
+      if (frozenTerminalStep) {
+        workflow.goal.actualTerminalProducerActionId = String(frozenTerminalStep.actionId || "");
+        workflow.goal.actualTerminalProducerLabel = String(frozenTerminalStep.label || workflow.goal.actualTerminalProducerLabel || "");
+      }
       workflow.completedQuantity = completedQuantity;
       workflow.completedActionCount = Math.max(0, Number(workflow.completedActionCount) || 0);
       workflow.batchGoalIncrease = Math.max(1, Math.trunc(Number(workflow.batchGoalIncrease) || 1));
@@ -649,6 +659,17 @@
         Number(workflow.estimatedActionCount) || workflow.steps.length,
       );
       workflow.currentStepIndex = Math.max(0, Math.min(workflow.steps.length, Number(workflow.currentStepIndex) || 0));
+      const recipeInvariantError = goalWorkflowRecipeInvariantError(workflow);
+      if (recipeInvariantError) {
+        workflow.status = "needs-review";
+        workflow.pauseRequested = false;
+        workflow.exitRequested = true;
+        workflow.recoveryRequired = false;
+        workflow.retryable = false;
+        workflow.error = recipeInvariantError;
+        workflow.message = "The saved recipe lock does not match its frozen final action. No further action can be submitted; acknowledge this monitor and replan from live state.";
+        return workflow;
+      }
       if (options.recoverInterrupted === false) return workflow;
       const exitWasRequested = Boolean(workflow.exitRequested || workflow.status === "stopping");
       workflow.pauseRequested = false;
@@ -751,6 +772,7 @@
     planner: {
       goalClassId: "",
       goalQuantity: 1,
+      terminalProducerByGoal: new Map(),
       quantityTimer: null,
       result: null,
       viewBox: null,
@@ -1577,6 +1599,7 @@
     clearTimeout(state.planner.quantityTimer);
     state.planner.goalClassId = "";
     state.planner.goalQuantity = 1;
+    state.planner.terminalProducerByGoal.clear();
     state.planner.quantityTimer = null;
     state.planner.result = null;
     state.planner.viewBox = null;
@@ -2259,6 +2282,12 @@
     }
 
     const rawActions = Array.isArray(cartridge?.actions) ? cartridge.actions : [];
+    const actionKeyMultiplicity = new Map();
+    for (const raw of rawActions) {
+      if (!raw?.action?.pluginName || !raw?.action?.name) continue;
+      const actionKey = qualifiedKey(raw.action);
+      actionKeyMultiplicity.set(actionKey, (actionKeyMultiplicity.get(actionKey) || 0) + 1);
+    }
     for (const action of rawActions) {
       for (const ref of [...(action.totalInputs || []), ...(action.totalOutputs || [])]) ensureClass(ref);
     }
@@ -2379,6 +2408,10 @@
       classById,
       actions,
       actionById,
+      actionKeyMultiplicity,
+      ambiguousActionKeys: new Set(
+        [...actionKeyMultiplicity].filter(([, count]) => count !== 1).map(([actionKey]) => actionKey),
+      ),
       positiveProducersByClass,
       positiveProducerIdsByClass: new Map(
         [...positiveProducersByClass].map(([classId, values]) => [classId, values.map((action) => action.id)]),
@@ -2492,6 +2525,7 @@
       classId: String(value.classId || ""),
       quantity,
       semantics,
+      terminalProducerActionId: String(value.terminalProducerActionId || ""),
       maxSteps: boundedInteger(value.maxSteps, PLANNER_DEFAULT_MAX_STEPS, GOAL_WORKFLOW_MAX_STEPS),
       maxExpandedStates: boundedInteger(value.maxExpandedStates, PLANNER_DEFAULT_MAX_EXPANDED_STATES, 250000),
     };
@@ -2509,6 +2543,7 @@
       classId: plannerState?.goalClassId,
       quantity: plannerState?.goalQuantity,
       semantics: "additional",
+      terminalProducerActionId: plannerState?.terminalProducerByGoal?.get(plannerState?.goalClassId) || "",
     });
   }
 
@@ -2523,6 +2558,7 @@
       label: item?.label || request.classId || "Unknown",
       quantity: request.quantity,
       semantics: request.semantics,
+      terminalProducerActionId: request.terminalProducerActionId,
       initialCount,
       targetCount,
       finalCount: initialCount,
@@ -2735,7 +2771,25 @@
     }
 
     const targetCount = plannerGoalSummary(catalog, inventory, request).targetCount;
-    const candidate = ensureAvailable(request.classId, targetCount, initialState).next().value || null;
+    const terminalProducer = request.terminalProducerActionId
+      ? catalog.actionById.get(request.terminalProducerActionId)
+      : null;
+
+    function* finishWithSelectedProducer(state) {
+      if (!terminalProducer || state.sequence.length >= request.maxSteps) return;
+      for (const firedState of enableAndFire(terminalProducer, state, new Set([terminalProducer.id]))) {
+        if (countOf(firedState, request.classId) >= targetCount) {
+          yield firedState;
+          return;
+        }
+        yield* finishWithSelectedProducer(firedState);
+        if (limitHit) return;
+      }
+    }
+
+    const candidate = terminalProducer
+      ? finishWithSelectedProducer(initialState).next().value || null
+      : ensureAvailable(request.classId, targetCount, initialState).next().value || null;
     return {
       success: Boolean(candidate),
       sequence: candidate ? candidate.sequence : [],
@@ -2873,7 +2927,18 @@
     // A produced turnover token can represent an existing tool carried through
     // the plan. Prefer genuine positive-net outputs so an "additional" goal's
     // display tree starts at the object the action set actually added.
-    const preferredGoalTokens = [...createdGoalTokens, ...turnoverGoalTokens, ...inventoryGoalTokens];
+    const terminalStep = steps.at(-1) || null;
+    goal.actualTerminalProducerActionId = terminalStep?.actionId || "";
+    const selectedTerminalTokens = request.terminalProducerActionId && terminalStep?.actionId === request.terminalProducerActionId
+      ? createdGoalTokens.filter((token) => token.producedByStepId === terminalStep.id)
+      : [];
+    const selectedTerminalTokenIds = new Set(selectedTerminalTokens.map((token) => token.tokenId));
+    const preferredGoalTokens = [
+      ...selectedTerminalTokens,
+      ...createdGoalTokens.filter((token) => !selectedTerminalTokenIds.has(token.tokenId)),
+      ...turnoverGoalTokens,
+      ...inventoryGoalTokens,
+    ];
     const selectedGoalTokens = request.semantics === "additional"
       ? preferredGoalTokens.slice(0, Math.max(0, request.quantity))
       : preferredGoalTokens.slice(0, Math.max(0, goal.targetCount));
@@ -2889,10 +2954,39 @@
     };
   }
 
+  function plannerSelectedTerminalIsValid(materialized, request) {
+    if (!request.terminalProducerActionId) return true;
+    const terminalStep = materialized.steps.at(-1);
+    if (!terminalStep || terminalStep.actionId !== request.terminalProducerActionId) return false;
+    const tokenById = new Map(materialized.tokens.map((token) => [token.tokenId, token]));
+    return materialized.goalTokenIds.some(
+      (tokenId) => tokenById.get(tokenId)?.producedByStepId === terminalStep.id,
+    );
+  }
+
   /** Find a valid lexical action sequence, using bounded shortest search first. */
   function planGoalOutput(catalog, inventory, goalRequest) {
     const request = plannerRequest(goalRequest);
     const normalizedInventory = Array.isArray(inventory) ? buildPlannerInventory(inventory) : inventory;
+    if (
+      request.terminalProducerActionId &&
+      request.classId &&
+      catalog?.classById &&
+      catalog?.actionById &&
+      catalog?.positiveProducersByClass &&
+      normalizedInventory?.counts &&
+      normalizedInventory?.objects &&
+      !catalog.actionById.has(request.terminalProducerActionId)
+    ) {
+      const result = plannerEmptyResult(catalog, normalizedInventory, request, "invalid-producer", [{
+        code: "selected-producer-missing",
+        message: "The selected recipe version is no longer available in this cartridge.",
+        classIds: [request.classId],
+        actionIds: [request.terminalProducerActionId],
+      }]);
+      result.totals.visitedStates = 0;
+      return result;
+    }
     if (
       !catalog?.classById ||
       !catalog?.actionById ||
@@ -2915,6 +3009,45 @@
       ]);
       result.totals.visitedStates = 0;
       return result;
+    }
+
+    const goalProducers = catalog.positiveProducersByClass.get(request.classId) || [];
+    if (request.terminalProducerActionId) {
+      const selectedProducer = catalog.actionById.get(request.terminalProducerActionId);
+      const producesGoal = goalProducers.some((action) => action.id === selectedProducer?.id);
+      const qualifiedMultiplicity = selectedProducer
+        ? catalog.actionKeyMultiplicity?.get(selectedProducer.actionKey) || 0
+        : 0;
+      const diagnostic = !selectedProducer
+        ? {
+            code: "selected-producer-missing",
+            message: "The selected recipe version is no longer available in this cartridge.",
+          }
+        : !selectedProducer.searchable
+          ? {
+              code: "selected-producer-unsearchable",
+              message: `${selectedProducer.label} has incomplete exact identities and cannot be planned safely.`,
+            }
+          : !producesGoal
+            ? {
+                code: "selected-producer-wrong-goal",
+                message: `${selectedProducer.label} does not create a new object of this exact target version.`,
+              }
+            : qualifiedMultiplicity !== 1
+              ? {
+                  code: "selected-producer-ambiguous",
+                  message: `${selectedProducer.label} has multiple installed hashes under the same Driver action name, so this browser cannot guarantee which recipe version would run.`,
+                }
+              : null;
+      if (diagnostic) {
+        const result = plannerEmptyResult(catalog, normalizedInventory, request, "invalid-producer", [{
+          ...diagnostic,
+          classIds: [request.classId],
+          actionIds: selectedProducer ? [selectedProducer.id] : [request.terminalProducerActionId],
+        }]);
+        result.totals.visitedStates = 0;
+        return result;
+      }
     }
 
     const goal = plannerGoalSummary(catalog, normalizedInventory, request);
@@ -2949,7 +3082,6 @@
     const support = plannerStructuralSupport(closure, normalizedInventory);
     const cycleDiagnostics = plannerCycleDiagnostics(closure, normalizedInventory, support);
     const relatedWarnings = closure.actions.flatMap((action) => action.warnings.map((warning) => `${action.label}: ${warning}`));
-    const goalProducers = catalog.positiveProducersByClass.get(request.classId) || [];
     if (!goalProducers.length || !support.supported.has(request.classId)) {
       const missingClassIds = closure.classIds.filter(
         (classId) =>
@@ -3020,7 +3152,7 @@
       const node = queue[cursor];
       cursor += 1;
       expandedStates += 1;
-      if (node.marking[goalIndex] >= goal.targetCount) {
+      if (!request.terminalProducerActionId && node.marking[goalIndex] >= goal.targetCount) {
         winningNode = node;
         break;
       }
@@ -3044,6 +3176,15 @@
           if (index === undefined) continue;
           next[index] = Math.min(caps[index], next[index] + output.count);
         }
+        const child = { marking: next, depth: node.depth + 1, parent: node, actionId: action.id };
+        if (
+          request.terminalProducerActionId &&
+          action.id === request.terminalProducerActionId &&
+          next[goalIndex] >= goal.targetCount
+        ) {
+          winningNode = child;
+          break;
+        }
         const key = markingKey(next);
         if (visited.has(key)) continue;
         if (visited.size >= visitedStateBudget) {
@@ -3051,8 +3192,9 @@
           break;
         }
         visited.add(key);
-        queue.push({ marking: next, depth: node.depth + 1, parent: node, actionId: action.id });
+        queue.push(child);
       }
+      if (winningNode) break;
     }
 
     if (!winningNode) {
@@ -3080,6 +3222,7 @@
         const validFallback =
           completeReplay &&
           materialized.goal.finalCount >= materialized.goal.targetCount &&
+          plannerSelectedTerminalIsValid(materialized, request) &&
           !materialized.warnings.some((warning) => warning.includes("could not consume") || warning.includes("unknown action"));
         if (validFallback) {
           return {
@@ -3130,6 +3273,17 @@
     for (let node = winningNode; node?.parent; node = node.parent) sequence.push(node.actionId);
     sequence.reverse();
     const materialized = materializePlannerSequence(catalog, normalizedInventory, sequence, request);
+    if (!plannerSelectedTerminalIsValid(materialized, request)) {
+      const result = plannerEmptyResult(catalog, normalizedInventory, request, "search-limit", [{
+        code: "selected-producer-terminal-mismatch",
+        message: "The bounded plan did not preserve the selected recipe as its final target-producing action.",
+        classIds: [request.classId],
+        actionIds: [request.terminalProducerActionId].filter(Boolean),
+      }], relatedWarnings);
+      result.totals.expandedStates = expandedStates;
+      result.totals.visitedStates = visited.size;
+      return result;
+    }
     return {
       version: 1,
       status: "planned",
@@ -3185,6 +3339,7 @@
       goal: {
         ...requestedGoal,
         finalCount: unitResult.status === "planned" ? requestedGoal.targetCount : unitResult.goal?.finalCount ?? requestedGoal.initialCount,
+        actualTerminalProducerActionId: unitResult.goal?.actualTerminalProducerActionId || "",
       },
       execution: repeat,
       totals: {
@@ -6211,7 +6366,7 @@
   }
 
   function plannerContext(cartridge = selectedCartridge(), settings = {}) {
-    if (!cartridge) return { cartridge: null, catalog: null, inventory: null, options: [], result: null, error: null };
+    if (!cartridge) return { cartridge: null, catalog: null, inventory: null, options: [], producerOptions: [], selectedProducerActionId: "", result: null, error: null };
     const sourceError = state.workspace.errors.actions || state.workspace.errors.objects;
     if (sourceError) {
       const source = state.workspace.errors.actions ? "action catalog" : "object inventory";
@@ -6220,6 +6375,8 @@
         catalog: null,
         inventory: null,
         options: [],
+        producerOptions: [],
+        selectedProducerActionId: "",
         result: null,
         error: `Planner unavailable because the Driver ${source} could not be loaded: ${sourceError}`,
       };
@@ -6227,31 +6384,57 @@
     try {
       const catalog = buildPlannerCatalog(cartridge, state.workspace);
       const inventory = buildPlannerInventory(state.workspace.objects);
-      const goalOptions = plannerGoalOptions(catalog);
+      let goalOptions = plannerGoalOptions(catalog);
       const optionIds = new Set(goalOptions.map((option) => option.classId));
       if (!optionIds.has(state.planner.goalClassId)) {
-        state.planner.goalClassId = goalOptions[0]?.classId || "";
+        const staleGoalClassId = state.planner.goalClassId;
+        const preserveUnavailableGoal = Boolean(
+          staleGoalClassId &&
+          (catalog.classById.has(staleGoalClassId) || state.planner.terminalProducerByGoal.has(staleGoalClassId)),
+        );
+        if (preserveUnavailableGoal) {
+          const item = catalog.classById.get(staleGoalClassId);
+          const identity = staleGoalClassId.match(/^(.*?)::(.*?)@([^@]*)$/);
+          goalOptions = [{
+            classId: staleGoalClassId,
+            qualified: item?.qualified || { pluginName: identity?.[1] || "?", name: identity?.[2] || "Unknown" },
+            hash: item?.hash || identity?.[3] || "",
+            label: item?.label || identity?.[2] || "Unavailable target",
+            emoji: item?.emoji || "📦",
+            description: item?.description || "The selected target version is no longer produced by this cartridge.",
+            declared: Boolean(item?.declared),
+            external: Boolean(item?.external),
+            producerActionIds: [],
+            producerCount: 0,
+            unavailable: true,
+          }, ...goalOptions];
+        } else {
+          state.planner.goalClassId = goalOptions[0]?.classId || "";
+        }
       }
+      const selectedProducerActionId = state.planner.terminalProducerByGoal.get(state.planner.goalClassId) || "";
+      const producerOptions = [...(catalog.positiveProducersByClass.get(state.planner.goalClassId) || [])];
       const request = plannerStateRequest();
       const cachedResult = settings.reuseResult &&
         state.planner.result?.goal?.classId === request.classId &&
         state.planner.result?.goal?.semantics === request.semantics &&
-        state.planner.result?.goal?.quantity === request.quantity
+        state.planner.result?.goal?.quantity === request.quantity &&
+        state.planner.result?.goal?.terminalProducerActionId === request.terminalProducerActionId
         ? state.planner.result
         : null;
       const result = cachedResult || (state.planner.goalClassId
         ? planGoalCraftRequest(catalog, inventory, request)
         : null);
       state.planner.result = result;
-      return { cartridge, catalog, inventory, options: goalOptions, result, error: null };
+      return { cartridge, catalog, inventory, options: goalOptions, producerOptions, selectedProducerActionId, result, error: null };
     } catch (error) {
       state.planner.result = null;
-      return { cartridge, catalog: null, inventory: null, options: [], result: null, error: error.message };
+      return { cartridge, catalog: null, inventory: null, options: [], producerOptions: [], selectedProducerActionId: "", result: null, error: error.message };
     }
   }
 
   function plannerActionForStep(step, catalog) {
-    return catalog?.actionById?.get(step.actionId)?.raw || actionByKey(step.actionKey);
+    return catalog?.actionById?.get(step.actionId)?.raw || null;
   }
 
   function plannerStepSlotRole(step, classId, slotIndex, endpoint, catalog) {
@@ -6618,6 +6801,7 @@
     return JSON.stringify([
       state.planner.goalClassId,
       state.planner.goalQuantity,
+      state.planner.terminalProducerByGoal.get(state.planner.goalClassId) || "",
       layout.nodes.map((node) => [node.id, node.kind, node.state, node.depth, node.x, node.y]),
       layout.edges.map((edge) => [edge.source.id, edge.target.id, edge.role]),
     ]);
@@ -6833,6 +7017,7 @@
       context?.result?.steps?.length || 0,
       context?.result?.goal?.classId || "",
       context?.result?.goal?.quantity || 0,
+      context?.result?.goal?.terminalProducerActionId || "",
     ]);
   }
 
@@ -6859,11 +7044,16 @@
         </section>`;
     }
     if (result?.status === "planned" && result.steps?.length) {
-      const disabled = !online || hardwareIndexUiIsActive();
+      const ambiguousStep = result.steps.find(
+        (step) => (context.catalog?.actionKeyMultiplicity?.get(step.actionKey) || 0) !== 1,
+      );
+      const disabled = !online || hardwareIndexUiIsActive() || Boolean(ambiguousStep);
       const reason = !online
         ? "The selected Driver must be online."
         : hardwareIndexUiIsActive()
           ? "Wait for the CWI action to finish before starting an automated flow."
+          : ambiguousStep
+            ? `${ambiguousStep.label} has multiple installed versions under one Driver action name; exact execution cannot be guaranteed.`
           : "Open a preflight manager, then press Play to submit the action set one step at a time.";
       return `
         <section class="planner-workflow-launch" data-goal-workflow-launch data-goal-workflow-fingerprint="${fingerprint}" aria-label="Goal workflow">
@@ -6908,7 +7098,19 @@
       unreachable: "Blocked",
       "search-limit": "Search limit",
       "invalid-goal": "Invalid goal",
+      "invalid-producer": "Recipe unavailable",
     }[result.status] || result.status;
+    const selectedRecipe = result.goal.terminalProducerActionId
+      ? context.catalog?.actionById?.get(result.goal.terminalProducerActionId)
+      : null;
+    const actualRecipe = result.goal.actualTerminalProducerActionId
+      ? context.catalog?.actionById?.get(result.goal.actualTerminalProducerActionId)
+      : null;
+    const recipeLabel = result.goal.terminalProducerActionId
+      ? selectedRecipe?.label || "Selected recipe unavailable"
+      : actualRecipe
+        ? `Auto -> ${actualRecipe.label}`
+        : "Auto";
     const cwiControl = !cwi && totalTiming.requiresCwi
       ? hardwareIndexUiIsActive()
         ? `<button class="game-button primary" type="button" disabled>${state.hardwareIndex.status === "settling" ? "MineIron settling" : "CWI measuring"}</button>`
@@ -6955,7 +7157,7 @@
       : result.steps.length > 40
       ? "The complete path is fitted; zoom for detail and drag to pan. UPDATE tools remain compact references."
       : "The complete path is fitted. Read down for requirements; arrows flow up toward the target.";
-    const goalRule = `craft ${result.goal.quantity} new / ${result.goal.initialCount} on hand / finish with at least ${result.goal.targetCount}`;
+    const goalRule = `craft ${result.goal.quantity} new / ${result.goal.initialCount} on hand / finish with at least ${result.goal.targetCount} / recipe ${recipeLabel}`;
     const successfulPlan = result.status === "planned";
     const successfulFallback = successfulPlan && result.strategy === "goal-directed-fallback";
     const displayedDiagnostics = (result.diagnostics || []).filter((diagnostic) =>
@@ -7029,8 +7231,30 @@
         ? ` / ${option.qualified.pluginName}`
         : "";
       const onHand = context.inventory?.counts?.get(option.classId) || 0;
-      return `<option value="${escapeHtml(option.classId)}"${selected}>${escapeHtml(`${option.label}${plugin} / ${shortText(option.hash, 6, 4)} / ${onHand} live`)}</option>`;
+      const availability = option.unavailable ? " / recipe unavailable" : "";
+      return `<option value="${escapeHtml(option.classId)}"${selected}${option.unavailable ? " disabled" : ""}>${escapeHtml(`${option.label}${plugin} / ${shortText(option.hash, 6, 4)} / ${onHand} live${availability}`)}</option>`;
     }).join("")}`;
+  }
+
+  function plannerProducerOptionsMarkup(context) {
+    const selectedId = context.selectedProducerActionId || "";
+    const goal = context.catalog?.classById?.get(state.planner.goalClassId);
+    const options = [
+      `<option value=""${selectedId ? "" : " selected"}>Auto / planner chooses</option>`,
+    ];
+    for (const action of context.producerOptions || []) {
+      const goalNet = action.positiveNetOutputs.find((item) => item.classId === state.planner.goalClassId)?.net || 0;
+      const plugin = action.qualified.pluginName !== context.cartridge?.id ? ` / ${action.qualified.pluginName}` : "";
+      const inputLabel = `${action.inputSlots.length} input${action.inputSlots.length === 1 ? "" : "s"}`;
+      const outputLabel = `+${goalNet} ${goal?.label || "target"}`;
+      const ambiguous = (context.catalog?.actionKeyMultiplicity?.get(action.actionKey) || 0) !== 1;
+      const label = `${action.label}${plugin} / ${inputLabel} / ${outputLabel} / ${shortText(action.hash, 6, 4)}${ambiguous ? " / version conflict" : ""}`;
+      options.push(`<option value="${escapeHtml(action.id)}"${action.id === selectedId ? " selected" : ""}${ambiguous ? " disabled" : ""}>${escapeHtml(label)}</option>`);
+    }
+    if (selectedId && !(context.producerOptions || []).some((action) => action.id === selectedId)) {
+      options.push(`<option value="${escapeHtml(selectedId)}" selected disabled>Selected recipe unavailable / ${escapeHtml(shortText(selectedId, 18, 10))}</option>`);
+    }
+    return options.join("");
   }
 
   function renderPlanner() {
@@ -7053,6 +7277,7 @@
         ${cartridgeNavigation("planner")}
         <div class="planner-toolbar">
           <label for="planner-goal-select"><span>Target object</span><select id="planner-goal-select" class="game-select"${context.options.length ? "" : " disabled"}>${plannerGoalOptionsMarkup(context)}</select></label>
+          <label for="planner-producer-select"><span>Recipe</span><select id="planner-producer-select" class="game-select"${context.producerOptions.length ? "" : " disabled"} aria-label="Final crafting recipe">${plannerProducerOptionsMarkup(context)}</select></label>
           <label for="planner-goal-quantity"><span>Quantity</span><input id="planner-goal-quantity" class="game-input planner-quantity-input" type="number" min="1" max="${PLANNER_MAX_QUANTITY}" step="1" inputmode="numeric" value="${state.planner.goalQuantity}"${context.options.length ? "" : " disabled"} aria-describedby="planner-quantity-help" /><small id="planner-quantity-help" class="sr-only">Whole number from 1 to ${PLANNER_MAX_QUANTITY}.</small></label>
         </div>
         <div data-catalog-region="planner" data-planner-result>${plannerResultMarkup(context)}</div>
@@ -7396,6 +7621,12 @@
       select.innerHTML = plannerGoalOptionsMarkup(context);
       select.value = state.planner.goalClassId;
       select.disabled = !context.options.length;
+    }
+    const producerSelect = byId("planner-producer-select");
+    if (producerSelect) {
+      producerSelect.innerHTML = plannerProducerOptionsMarkup(context);
+      producerSelect.value = context.selectedProducerActionId;
+      producerSelect.disabled = !context.producerOptions.length;
     }
     const quantityInput = byId("planner-goal-quantity");
     if (quantityInput) {
@@ -8174,6 +8405,32 @@
     return quantity > 1 ? `${quantity} × ${label}` : label;
   }
 
+  function goalWorkflowRecipeLabel(workflow = state.goalWorkflow) {
+    if (workflow?.goal?.terminalProducerActionId) {
+      return workflow.goal.terminalProducerLabel || "Selected recipe";
+    }
+    return workflow?.goal?.actualTerminalProducerLabel
+      ? `Auto (first batch: ${workflow.goal.actualTerminalProducerLabel})`
+      : "Auto";
+  }
+
+  function goalWorkflowRecipeInvariantError(workflow) {
+    const selectedProducerActionId = String(workflow?.goal?.terminalProducerActionId || "");
+    if (!selectedProducerActionId) return "";
+    const terminalStep = workflow?.steps?.at(-1);
+    if (!terminalStep || terminalStep.actionId !== selectedProducerActionId) {
+      return "The selected recipe identity does not match the frozen workflow's final action.";
+    }
+    const goalTokenIds = new Set(workflow.goalTokenIds || []);
+    const selectedGoalOutput = (terminalStep.outputs || []).some(
+      (output) => goalTokenIds.has(output.tokenId) && output.classId === workflow.goal.classId,
+    );
+    if (!selectedGoalOutput) {
+      return "The selected recipe's frozen final action does not produce the saved goal token.";
+    }
+    return "";
+  }
+
   function goalWorkflowElapsedMilliseconds(workflow = state.goalWorkflow) {
     const started = new Date(workflow?.startedAt || 0).valueOf();
     if (!Number.isFinite(started) || started <= 0) return 0;
@@ -8363,11 +8620,29 @@
     if (!Array.isArray(result.goalTokenIds) || result.goalTokenIds.length !== 1) {
       throw new Error("The refreshed craft batch did not materialize one distinct goal object.");
     }
+    const selectedProducerActionId = String(result.goal?.terminalProducerActionId || "");
+    if (selectedProducerActionId) {
+      const terminalStep = result.steps.at(-1);
+      const selectedProducer = context.catalog?.actionById?.get(selectedProducerActionId);
+      const goalToken = (result.tokens || []).find((token) => token.tokenId === result.goalTokenIds[0]);
+      if (!selectedProducer || terminalStep?.actionId !== selectedProducerActionId) {
+        throw new Error("The refreshed action set no longer ends with the selected crafting recipe.");
+      }
+      if (goalToken?.producedByStepId !== terminalStep.id) {
+        throw new Error("The refreshed goal object was not produced by the selected final crafting recipe.");
+      }
+      if ((context.catalog.actionKeyMultiplicity?.get(selectedProducer.actionKey) || 0) !== 1) {
+        throw new Error(`${selectedProducer.label} has multiple installed hashes under the same Driver action name, so its exact recipe cannot be frozen safely.`);
+      }
+    }
     const timingByStep = new Map();
     const steps = result.steps.map((step) => {
       const normalized = context.catalog?.actionById?.get(step.actionId);
       if (!normalized?.raw || normalized.id !== step.actionId) {
         throw new Error(`The exact action version for ${step.label} is no longer installed.`);
+      }
+      if ((context.catalog.actionKeyMultiplicity?.get(normalized.actionKey) || 0) !== 1) {
+        throw new Error(`${step.label} has multiple installed hashes under the same Driver action name, so its exact version cannot be frozen safely.`);
       }
       const timing = estimateActionProofTiming(normalized.raw);
       timingByStep.set(step.id, timing);
@@ -8462,6 +8737,12 @@
       throw new Error("Multi-object workflows must use recoverable live-replan batches.");
     }
     const batch = createGoalWorkflowPlanBatch(context);
+    const selectedProducer = result.goal.terminalProducerActionId
+      ? context.catalog?.actionById?.get(result.goal.terminalProducerActionId)
+      : null;
+    const actualProducer = result.goal.actualTerminalProducerActionId
+      ? context.catalog?.actionById?.get(result.goal.actualTerminalProducerActionId)
+      : null;
     const now = new Date().toISOString();
     const estimatedBatchCount = Math.ceil(result.goal.quantity / batch.goalIncrease);
     const estimatedTotalMilliseconds = batch.estimatedMilliseconds == null
@@ -8487,6 +8768,10 @@
         semantics: result.goal.semantics,
         initialCount: result.goal.initialCount,
         targetCount: result.goal.targetCount,
+        terminalProducerActionId: result.goal.terminalProducerActionId || "",
+        terminalProducerLabel: selectedProducer?.label || "",
+        actualTerminalProducerActionId: result.goal.actualTerminalProducerActionId || "",
+        actualTerminalProducerLabel: actualProducer?.label || "",
       },
       executionMode: repeatUnit ? "repeat-unit" : "fixed-plan",
       completedQuantity: 0,
@@ -8500,6 +8785,7 @@
       currentStepIndex: 0,
       estimatedTotalMilliseconds,
       estimateComplete: batch.estimateComplete,
+      retryable: true,
       pauseRequested: false,
       exitRequested: false,
       recoveryRequired: false,
@@ -8775,6 +9061,13 @@
     if (!action || action.hash !== step.actionHash || !sameQualified(action.action, step.action)) {
       throw goalWorkflowError(
         `${step.label} no longer matches the action hash frozen in this plan. Rebuild the plan from the live catalog.`,
+        { retryable: false },
+      );
+    }
+    const matchingQualifiedActions = snapshot.actions.filter((candidate) => sameQualified(candidate.action, step.action));
+    if (matchingQualifiedActions.length !== 1) {
+      throw goalWorkflowError(
+        `${step.label} now has multiple installed hashes under the same Driver action name. This console cannot guarantee the frozen action version, so the flow was stopped before submission.`,
         { retryable: false },
       );
     }
@@ -9055,13 +9348,29 @@
         }
         const catalog = buildPlannerCatalog(cartridge, state.workspace);
         const inventory = buildPlannerInventory(objects);
+        if (
+          workflow.goal.terminalProducerActionId &&
+          !catalog.actionById.has(workflow.goal.terminalProducerActionId)
+        ) {
+          throw goalWorkflowError(
+            "The selected crafting recipe version is no longer installed. This workflow will not switch recipes; exit it and build a new plan from the live catalog.",
+            { retryable: false },
+          );
+        }
         const result = planGoalOutput(catalog, inventory, {
           classId: workflow.goal.classId,
           quantity: 1,
           semantics: "additional",
+          terminalProducerActionId: workflow.goal.terminalProducerActionId || "",
           maxSteps: GOAL_WORKFLOW_MAX_STEPS,
         });
         if (result.status !== "planned" || !result.steps.length) {
+          if (workflow.goal.terminalProducerActionId && result.status === "invalid-producer") {
+            throw goalWorkflowError(
+              "The selected crafting recipe is no longer an exact, runnable producer for this goal. This workflow will not switch to Auto; exit it and build a new plan.",
+              { retryable: false },
+            );
+          }
           throw goalWorkflowError(
             `${nextCompletedQuantity} of ${quantity} goal objects are complete, but the next batch could not be planned from live inventory (${result.status || "no plan"}). Retry to recheck live state.`,
             { retryable: true },
@@ -9119,19 +9428,23 @@
   function failGoalWorkflow(workflow, stepState, error) {
     const needsReview = Boolean(error?.workflowNeedsReview);
     const exitRequested = Boolean(workflow.exitRequested);
+    const retryable = !exitRequested && !needsReview && error?.workflowRetryable !== false;
     workflow.status = needsReview ? "needs-review" : "error";
     workflow.pauseRequested = false;
     workflow.exitRequested = exitRequested;
     workflow.error = error?.message || "The workflow stopped unexpectedly.";
+    workflow.retryable = retryable;
     workflow.message = exitRequested
       ? "Exit remains armed. No later action will be submitted. Review this result, then acknowledge the stopped flow."
       : needsReview
         ? "Automation is safety-locked. No later action will be submitted."
-        : "The workflow is stopped. Retry performs a fresh live preflight and never skips this step.";
+        : retryable
+          ? "The workflow is stopped. Retry performs a fresh live preflight and never skips this step."
+          : "The frozen workflow can no longer continue. Exit it and build a new plan from live Driver state.";
     if (stepState) {
       stepState.status = needsReview ? "needs-review" : "failed";
       stepState.error = workflow.error;
-      stepState.retryable = !exitRequested && !needsReview && error?.workflowRetryable !== false;
+      stepState.retryable = retryable;
       stepState.outcomeUnknown ||= needsReview && !stepState.runId;
     }
     persistGoalWorkflow();
@@ -9273,6 +9586,19 @@
   function launchGoalWorkflowEngine(options = {}) {
     const workflow = state.goalWorkflow;
     if (!workflow || state.goalWorkflowLoopPromise) return;
+    const recipeInvariantError = goalWorkflowRecipeInvariantError(workflow);
+    if (recipeInvariantError) {
+      workflow.status = "needs-review";
+      workflow.pauseRequested = false;
+      workflow.exitRequested = true;
+      workflow.recoveryRequired = false;
+      workflow.retryable = false;
+      workflow.error = recipeInvariantError;
+      workflow.message = "The saved recipe lock no longer matches its frozen final action. No action was submitted; acknowledge this monitor and replan from live state.";
+      persistGoalWorkflow();
+      toast("Workflow recipe lock failed", recipeInvariantError, "error", 9000);
+      return;
+    }
     if (workflow.status === "needs-review") {
       toast("Review required", "This workflow cannot submit another action until the unknown outcome is reconciled.", "warning", 7500);
       return;
@@ -9419,6 +9745,7 @@
     const step = goalWorkflowCurrentStep(workflow);
     const stepState = goalWorkflowCurrentStepState(workflow);
     if (!workflow || workflow.status !== "error" || state.goalWorkflowLoopPromise) return;
+    if (workflow.retryable === false) return;
     if (!step && workflow.currentStepIndex >= workflow.steps.length) {
       const awaitingNextCraft = workflow.executionMode === "repeat-unit" && workflow.completedQuantity < workflow.goal.quantity;
       const approved = globalThis.confirm(
@@ -9428,6 +9755,7 @@
       );
       if (!approved) return;
       workflow.status = "paused";
+      workflow.retryable = true;
       workflow.error = "";
       workflow.message = awaitingNextCraft
         ? `Retrying the live goal check and next-batch plan for ${goalWorkflowGoalLabel(workflow)}.`
@@ -9450,6 +9778,7 @@
     stepState.error = "";
     stepState.outcomeUnknown = false;
     workflow.status = "paused";
+    workflow.retryable = true;
     workflow.error = "";
     workflow.message = `Retry armed for ${step.label}; a fresh live preflight is required.`;
     persistGoalWorkflow();
@@ -10092,10 +10421,14 @@
       controls.push(control("Exit flow", "workflow-exit", { danger: true, glyph: "\u25a0" }));
     } else if (workflow.status === "error") {
       if (!stepState && workflow.currentStepIndex >= workflow.steps.length) {
-        const label = workflow.executionMode === "repeat-unit" && workflow.completedQuantity < workflow.goal.quantity
-          ? "Retry live replan"
-          : "Retry goal check";
-        controls.push(control(label, "workflow-retry", { primary: true, glyph: "\u21bb" }));
+        if (workflow.retryable !== false) {
+          const label = workflow.executionMode === "repeat-unit" && workflow.completedQuantity < workflow.goal.quantity
+            ? "Retry live replan"
+            : "Retry goal check";
+          controls.push(control(label, "workflow-retry", { primary: true, glyph: "\u21bb" }));
+        } else {
+          controls.push(control("Replan required", "", { disabled: true }));
+        }
       }
       else if (stepState?.retryable) controls.push(control("Retry live check", "workflow-retry", { primary: true, glyph: "\u21bb" }));
       controls.push(control("View activity", "workflow-activity"));
@@ -10130,8 +10463,10 @@
       Boolean(stepState?.outcomeUnknown),
       Boolean(workflow.pauseRequested),
       Boolean(workflow.exitRequested),
+      workflow.retryable !== false,
       workflow.error || "",
       workflow.estimatedTotalMilliseconds,
+      workflow.goal?.terminalProducerActionId || "",
       goalWorkflowOwnedByOtherTab(workflow),
     ]);
   }
@@ -10144,6 +10479,7 @@
     const batchNote = workflow.executionMode === "repeat-unit"
       ? "The controller replans from live inventory between goal batches until the requested quantity is verified."
       : "The saved action set will run in its displayed order.";
+    const recipeNote = `Recipe: ${goalWorkflowRecipeLabel(workflow)}.`;
     return `
       <div data-workflow-start-confirmation data-workflow-fingerprint="${escapeHtml(goalWorkflowDrawerFingerprint(workflow))}">
         <p id="workflow-dialog-description" class="sr-only">Confirm the state-changing Driver workflow for ${escapeHtml(goalWorkflowGoalLabel(workflow))}, or cancel to return to its workflow monitor.</p>
@@ -10165,7 +10501,7 @@
                 <div class="summary-stat"><span>Estimate</span><strong>${escapeHtml(estimate)}</strong></div>
                 <div class="summary-stat"><span>Cartridge</span><strong>${escapeHtml(workflow.cartridgeName)}</strong></div>
               </div>
-              <p class="workflow-start-batch-note">${escapeHtml(batchNote)}</p>
+              <p class="workflow-start-batch-note">${escapeHtml(`${recipeNote} ${batchNote}`)}</p>
               <div class="terminal-note warning workflow-start-warning"><strong>Committed steps cannot be undone.</strong><br />Inputs are consumed. Pause or Exit stops later submissions only; an action already accepted by the Driver always finishes.</div>
             </div>
           </section>
@@ -10194,7 +10530,7 @@
       <div data-workflow-drawer data-workflow-fingerprint="${escapeHtml(goalWorkflowDrawerFingerprint(workflow))}">
         <p id="workflow-dialog-description" class="sr-only">Sequential Driver actions for ${escapeHtml(goalWorkflowGoalLabel(workflow))}. Completed steps cannot be undone, and Pause or Exit takes effect only before the next action.</p>
         <div class="drawer-header workflow-drawer-header">
-          <div><p class="screen-kicker">Goal workflow</p><h2 class="drawer-title" id="drawer-title" data-workflow-focus tabindex="-1">${escapeHtml(goalWorkflowGoalLabel(workflow))}</h2><small>${escapeHtml(workflow.connection.name)} / ${escapeHtml(workflow.cartridgeName)}</small></div>
+          <div><p class="screen-kicker">Goal workflow</p><h2 class="drawer-title" id="drawer-title" data-workflow-focus tabindex="-1">${escapeHtml(goalWorkflowGoalLabel(workflow))}</h2><small>${escapeHtml(workflow.connection.name)} / ${escapeHtml(workflow.cartridgeName)} / Recipe: ${escapeHtml(goalWorkflowRecipeLabel(workflow))}</small></div>
           <div class="drawer-header-actions"><span data-workflow-badge>${goalWorkflowBadgeMarkup(workflow)}</span><button class="game-button" type="button" data-command="close-drawer">Close</button></div>
         </div>
         <div class="drawer-body workflow-drawer-body" aria-describedby="workflow-safety-note">
@@ -10715,6 +11051,7 @@
           clearTimeout(state.planner.quantityTimer);
           state.planner.goalClassId = "";
           state.planner.goalQuantity = 1;
+          state.planner.terminalProducerByGoal.clear();
           state.planner.quantityTimer = null;
           state.planner.result = null;
           state.planner.viewBox = null;
@@ -10995,6 +11332,18 @@
       state.planner.quantityTimer = null;
       state.planner.goalClassId = event.target.value || "";
       state.planner.result = null;
+      patchPlanner();
+    }
+    if (event.target.id === "planner-producer-select") {
+      const producerActionId = event.target.value || "";
+      if (producerActionId) state.planner.terminalProducerByGoal.set(state.planner.goalClassId, producerActionId);
+      else state.planner.terminalProducerByGoal.delete(state.planner.goalClassId);
+      state.planner.result = null;
+      state.planner.viewBox = null;
+      state.planner.viewKey = "";
+      state.planner.layout = null;
+      state.planner.drag = null;
+      state.planner.viewMode = "fit";
       patchPlanner();
     }
     if (event.target.id === "planner-goal-quantity") {

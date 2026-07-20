@@ -4061,7 +4061,7 @@ body.drawer-open {
 
 .planner-toolbar {
   display: grid;
-  grid-template-columns: minmax(260px, 1fr) minmax(112px, 150px);
+  grid-template-columns: minmax(240px, 1fr) minmax(240px, 0.9fr) minmax(112px, 150px);
   align-items: end;
   gap: 10px 18px;
   padding: 10px;
@@ -5067,6 +5067,16 @@ html.has-planner-tree-fullscreen .game-shell::after {
 }
 
 @media (max-width: 900px) {
+  .planner-toolbar {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .planner-toolbar label[for="planner-goal-quantity"] {
+    grid-column: 1 / -1;
+    width: min(100%, 260px);
+    justify-self: end;
+  }
+
   .planner-summary {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
@@ -5077,6 +5087,12 @@ html.has-planner-tree-fullscreen .game-shell::after {
   .planner-toolbar label {
     grid-template-columns: minmax(0, 1fr);
     align-items: stretch;
+  }
+
+  .planner-toolbar label[for="planner-goal-quantity"] {
+    grid-column: auto;
+    width: 100%;
+    justify-self: stretch;
   }
 
   .planner-flow-key > span:last-child {
