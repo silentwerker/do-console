@@ -1059,6 +1059,46 @@ button {
   gap: 9px;
 }
 
+.cartridge-nav-shell {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px;
+  margin-bottom: 13px;
+  border: 2px solid var(--lcd-line);
+  background: var(--toolbar-bg);
+  box-shadow: 4px 4px 0 var(--hard-shadow);
+}
+
+.cartridge-nav {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.cartridge-nav-toggle {
+  display: none;
+}
+
+.cartridge-nav-items,
+.cartridge-context-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 7px;
+}
+
+.cartridge-nav-items .game-button[aria-current="page"] {
+  cursor: default;
+}
+
+.cartridge-context-actions {
+  flex: 0 0 auto;
+  padding-left: 10px;
+  border-left: 2px dotted var(--lcd-line);
+}
+
 .console-menu-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -1644,6 +1684,16 @@ button.object-card {
   box-shadow: 3px 3px 0 var(--amber-dark);
 }
 
+.action-card.is-unavailable {
+  background: var(--neutral-bg);
+  filter: grayscale(0.82) saturate(0.35);
+}
+
+.action-card.is-unavailable:hover,
+.action-card.is-unavailable:focus-visible {
+  filter: grayscale(0.35) saturate(0.7);
+}
+
 .object-card .card-orb {
   background: var(--coral);
   box-shadow: 3px 3px 0 var(--coral-dark);
@@ -1748,6 +1798,14 @@ button.object-card {
 .compact-card-meta .compact-card-arrow {
   color: var(--amber);
   font-size: 10px;
+}
+
+.compact-card-goal {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--lcd-text);
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .card-title {
@@ -4003,7 +4061,7 @@ body.drawer-open {
 
 .planner-toolbar {
   display: grid;
-  grid-template-columns: minmax(260px, 1fr) auto;
+  grid-template-columns: minmax(260px, 1fr) minmax(112px, 150px);
   align-items: end;
   gap: 10px 18px;
   padding: 10px;
@@ -4030,9 +4088,15 @@ body.drawer-open {
   text-transform: uppercase;
 }
 
-.planner-toolbar .game-select {
+.planner-toolbar .game-select,
+.planner-toolbar .game-input {
   width: 100%;
   min-width: 0;
+}
+
+.planner-quantity-input {
+  text-align: center;
+  font-variant-numeric: tabular-nums;
 }
 
 .planner-summary {
@@ -4426,10 +4490,6 @@ body.drawer-open {
   font-weight: 900;
   letter-spacing: 0.04em;
   text-transform: uppercase;
-}
-
-.planner-mode-note {
-  margin-bottom: 12px;
 }
 
 .planner-flow-key > span {
@@ -5057,6 +5117,54 @@ html.has-planner-tree-fullscreen .game-shell::after {
 }
 
 @media (max-width: 900px) {
+  .cartridge-nav-shell {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    align-items: stretch;
+  }
+
+  .cartridge-nav {
+    width: 100%;
+  }
+
+  .cartridge-nav-toggle {
+    display: grid;
+    width: 100%;
+    grid-template-columns: minmax(0, 1fr) auto auto;
+    justify-content: stretch;
+    text-align: left;
+  }
+
+  .cartridge-nav-toggle > span:first-child {
+    justify-self: start;
+  }
+
+  .cartridge-nav-toggle > strong {
+    color: var(--amber);
+    font-size: 9px;
+  }
+
+  .cartridge-nav-items {
+    display: none;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 7px;
+    padding-top: 8px;
+  }
+
+  .cartridge-nav.is-open .cartridge-nav-items {
+    display: grid;
+  }
+
+  .cartridge-nav-items .game-button {
+    width: 100%;
+  }
+
+  .cartridge-context-actions {
+    padding: 8px 0 0;
+    border-top: 2px dotted var(--lcd-line);
+    border-left: 0;
+  }
+
   .tech-tree-toolbar {
     grid-template-columns: minmax(0, 1fr) auto;
   }
@@ -5504,6 +5612,11 @@ html.has-planner-tree-fullscreen .game-shell::after {
 }
 
 @media (forced-colors: active) {
+  .action-card.is-unavailable {
+    border-style: dashed;
+    filter: none;
+  }
+
   .cwi-progress progress {
     appearance: auto;
     border-color: CanvasText;

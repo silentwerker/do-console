@@ -14,6 +14,8 @@
   const GOAL_WORKFLOW_MAX_POLL_ERRORS = 50;
   const GOAL_WORKFLOW_OUTPUT_ATTEMPTS = 30;
   const GOAL_WORKFLOW_OUTPUT_POLL_MS = 2_000;
+  const GOAL_WORKFLOW_MAX_STEPS = 512;
+  const GOAL_WORKFLOW_MAX_QUANTITY = 99;
   const HARDWARE_INDEX_VERSION = 4;
   const HARDWARE_INDEX_LABEL = "CWI-4";
   const HARDWARE_INDEX_BENCHMARK_ID = "driver-craft-rocket-mineiron-proof-window-v1";
@@ -607,6 +609,10 @@
       const raw = localStorage.getItem(GOAL_WORKFLOW_STORAGE_KEY);
       if (!raw) return null;
       const workflow = JSON.parse(raw);
+      const executionMode = workflow?.executionMode === "repeat-unit" ? "repeat-unit" : "fixed-plan";
+      const quantity = Number(workflow?.goal?.quantity);
+      const completedQuantity = Number(workflow?.completedQuantity ?? 0);
+      const expectedGoalTokens = executionMode === "repeat-unit" ? 1 : quantity;
       if (
         !workflow ||
         workflow.version !== GOAL_WORKFLOW_VERSION ||
@@ -618,10 +624,29 @@
         !Array.isArray(workflow.steps) ||
         !Array.isArray(workflow.stepStates) ||
         workflow.steps.length !== workflow.stepStates.length ||
-        workflow.steps.length > 256 ||
+        workflow.steps.length > GOAL_WORKFLOW_MAX_STEPS ||
+        !Array.isArray(workflow.goalTokenIds) ||
+        workflow.goalTokenIds.length < 1 ||
+        workflow.goalTokenIds.length > GOAL_WORKFLOW_MAX_QUANTITY ||
+        !Number.isInteger(quantity) ||
+        quantity < 1 ||
+        quantity > GOAL_WORKFLOW_MAX_QUANTITY ||
+        workflow.goalTokenIds.length !== expectedGoalTokens ||
+        !Number.isInteger(completedQuantity) ||
+        completedQuantity < 0 ||
+        completedQuantity > quantity ||
+        (executionMode === "repeat-unit" && quantity < 2) ||
         !workflow.tokenBindings ||
         typeof workflow.tokenBindings !== "object"
       ) return null;
+      workflow.executionMode = executionMode;
+      workflow.completedQuantity = completedQuantity;
+      workflow.completedActionCount = Math.max(0, Number(workflow.completedActionCount) || 0);
+      workflow.batchGoalIncrease = Math.max(1, Math.trunc(Number(workflow.batchGoalIncrease) || 1));
+      workflow.estimatedActionCount = Math.max(
+        workflow.steps.length,
+        Number(workflow.estimatedActionCount) || workflow.steps.length,
+      );
       workflow.currentStepIndex = Math.max(0, Math.min(workflow.steps.length, Number(workflow.currentStepIndex) || 0));
       if (options.recoverInterrupted === false) return workflow;
       const exitWasRequested = Boolean(workflow.exitRequested || workflow.status === "stopping");
@@ -702,6 +727,7 @@
       settlementWatchers: new Set(),
     },
     drawer: null,
+    cartridgeNavOpen: false,
     editingConnectionId: null,
     actionSearch: "",
     actionFilter: "all",
@@ -723,11 +749,8 @@
     },
     planner: {
       goalClassId: "",
-      // Default to making a new token so selecting a class that is already in
-      // inventory still produces an action set. "target-total" is the opt-in
-      // inventory-satisfiable mode (have at least goalQuantity in total).
-      goalSemantics: "additional",
       goalQuantity: 1,
+      quantityTimer: null,
       result: null,
       viewBox: null,
       viewKey: "",
@@ -1550,9 +1573,10 @@
     state.techTree.viewKey = "";
     state.techTree.selectedNodeId = "";
     state.techTree.objectFileName = "";
+    clearTimeout(state.planner.quantityTimer);
     state.planner.goalClassId = "";
-    state.planner.goalSemantics = "additional";
     state.planner.goalQuantity = 1;
+    state.planner.quantityTimer = null;
     state.planner.result = null;
     state.planner.viewBox = null;
     state.planner.viewKey = "";
@@ -1722,7 +1746,7 @@
           <h1 class="screen-title" id="${escapeHtml(`${state.screen}-title`)}">${escapeHtml(title)}</h1>
           <p class="screen-copy">${escapeHtml(copy)}</p>
         </div>
-        <div class="screen-actions">${actions}</div>
+        ${actions ? `<div class="screen-actions">${actions}</div>` : ""}
       </div>`;
   }
 
@@ -1735,6 +1759,34 @@
     const disabled = options.disabled ? " disabled" : "";
     const extra = options.extra || "";
     return `<button class="game-button${tone}" type="button" data-command="${escapeHtml(command)}"${extra}${disabled}>${escapeHtml(label)}</button>`;
+  }
+
+  function cartridgeNavigation(activeScreen, contextActions = "") {
+    const cartridge = selectedCartridge();
+    if (!cartridge) return "";
+    const items = [
+      { screen: "cartridges", command: "cartridges", label: "Change Cartridge" },
+      { screen: "actions", command: "actions", label: "Play" },
+      { screen: "planner", command: "planner", label: "Goal Planner" },
+      { screen: "tree", command: "tree", label: "Tech Tree" },
+      { screen: "objects", command: "objects", label: "Objects" },
+      { screen: "activity", command: "activity", label: "Activity" },
+    ];
+    const activeLabel = items.find((item) => item.screen === activeScreen)?.label || "Cartridge";
+    const buttons = items.map((item) => gameButton(item.label, item.command, {
+      tone: item.screen === activeScreen ? "primary" : "",
+      extra: item.screen === activeScreen ? ' aria-current="page"' : "",
+    })).join("");
+    return `
+      <div class="cartridge-nav-shell">
+        <nav class="cartridge-nav${state.cartridgeNavOpen ? " is-open" : ""}" aria-label="${escapeHtml(cartridge.name)} cartridge menu">
+          <button class="game-button cartridge-nav-toggle" type="button" data-command="toggle-cartridge-nav" aria-expanded="${state.cartridgeNavOpen}" aria-controls="cartridge-nav-items">
+            <span>Cartridge menu</span><strong>${escapeHtml(activeLabel)}</strong><span data-cartridge-nav-symbol aria-hidden="true">${state.cartridgeNavOpen ? "−" : "+"}</span>
+          </button>
+          <div id="cartridge-nav-items" class="cartridge-nav-items">${buttons}</div>
+        </nav>
+        ${contextActions ? `<div class="cartridge-context-actions" role="group" aria-label="Page actions">${contextActions}</div>` : ""}
+      </div>`;
   }
 
   function badge(value) {
@@ -1769,12 +1821,13 @@
   }
 
   function errorPanel(title, message, command = "refresh") {
+    const buttonLabel = command === "connections" ? "Connections" : command === "cartridges" ? "Select Cartridge" : "Try again";
     return `
       <div class="game-panel">
         <div class="game-error">
           <h2>${escapeHtml(title)}</h2>
           <p>${escapeHtml(message)}</p>
-          ${gameButton(command === "connections" ? "Connections" : "Try again", command, { tone: "primary" })}
+          ${gameButton(buttonLabel, command, { tone: "primary" })}
         </div>
       </div>`;
   }
@@ -2104,9 +2157,9 @@
 
   // Planner domain core. This block is intentionally pure: it reads catalog data,
   // models exact class-version tokens, and returns data for a caller to render.
-  const PLANNER_DEFAULT_MAX_STEPS = 128;
+  const PLANNER_DEFAULT_MAX_STEPS = GOAL_WORKFLOW_MAX_STEPS;
   const PLANNER_DEFAULT_MAX_EXPANDED_STATES = 30000;
-  const PLANNER_MAX_QUANTITY = 1000000;
+  const PLANNER_MAX_QUANTITY = GOAL_WORKFLOW_MAX_QUANTITY;
 
   function plannerCompareText(left, right) {
     const a = String(left || "");
@@ -2428,7 +2481,7 @@
   function plannerRequest(goalRequest) {
     const value = goalRequest && typeof goalRequest === "object" ? goalRequest : { classId: goalRequest };
     const quantity = value.quantity === undefined ? 1 : Number(value.quantity);
-    const semantics = value.semantics === "additional" ? "additional" : "target-total";
+    const semantics = value.semantics === "target-total" ? "target-total" : "additional";
     const boundedInteger = (candidate, fallback, maximum, minimum = 0) => {
       if (candidate === undefined) return fallback;
       const number = Number(candidate);
@@ -2438,9 +2491,15 @@
       classId: String(value.classId || ""),
       quantity,
       semantics,
-      maxSteps: boundedInteger(value.maxSteps, PLANNER_DEFAULT_MAX_STEPS, 256),
+      maxSteps: boundedInteger(value.maxSteps, PLANNER_DEFAULT_MAX_STEPS, GOAL_WORKFLOW_MAX_STEPS),
       maxExpandedStates: boundedInteger(value.maxExpandedStates, PLANNER_DEFAULT_MAX_EXPANDED_STATES, 250000),
     };
+  }
+
+  function normalizePlannerQuantity(value, fallback = 1) {
+    const quantity = Number(value);
+    if (!Number.isFinite(quantity)) return fallback;
+    return Math.min(PLANNER_MAX_QUANTITY, Math.max(1, Math.trunc(quantity)));
   }
 
   /** Convert transient planner UI state into the planner's explicit request contract. */
@@ -2448,7 +2507,7 @@
     return plannerRequest({
       classId: plannerState?.goalClassId,
       quantity: plannerState?.goalQuantity,
-      semantics: plannerState?.goalSemantics,
+      semantics: "additional",
     });
   }
 
@@ -3093,6 +3152,47 @@
       warnings: plannerUniqueStrings([...(normalizedInventory.warnings || []), ...materialized.warnings]),
       diagnostics: cycleDiagnostics,
     };
+  }
+
+  /**
+   * Large craft quantities can expand into thousands of actions, which is too
+   * large for a recoverable localStorage checkpoint and too dense to render as
+   * one useful tree. Preview one exact goal batch and let the workflow
+   * controller replan from live inventory until the quantity is verified.
+   */
+  function planGoalCraftRequest(catalog, inventory, goalRequest) {
+    const request = plannerRequest(goalRequest);
+    if (request.quantity <= 1) return planGoalOutput(catalog, inventory, request);
+    const unitRequest = { ...request, quantity: 1, semantics: "additional" };
+    const unitResult = planGoalOutput(catalog, inventory, unitRequest);
+    const requestedGoal = plannerGoalSummary(catalog, inventory, request);
+    const unitGoalIncrease = Math.max(
+      1,
+      (Number(unitResult.goal?.finalCount) || requestedGoal.initialCount) - requestedGoal.initialCount,
+    );
+    const estimatedBatchCount = Math.ceil(request.quantity / unitGoalIncrease);
+    const repeat = {
+      mode: "repeat-unit",
+      quantity: request.quantity,
+      unitQuantity: 1,
+      unitGoalIncrease,
+      estimatedBatchCount,
+      unitActionCount: unitResult.totals?.actionCount || 0,
+    };
+    const result = {
+      ...unitResult,
+      goal: {
+        ...requestedGoal,
+        finalCount: unitResult.status === "planned" ? requestedGoal.targetCount : unitResult.goal?.finalCount ?? requestedGoal.initialCount,
+      },
+      execution: repeat,
+      totals: {
+        ...unitResult.totals,
+        actionCount: (unitResult.totals?.actionCount || 0) * estimatedBatchCount,
+        unitActionCount: unitResult.totals?.actionCount || 0,
+      },
+    };
+    return result;
   }
   // End planner domain core.
 
@@ -5607,10 +5707,10 @@
       <section class="game-screen game-screen-wide tech-tree-screen" aria-labelledby="tree-title">
         ${screenHeading(
           `${cartridge.name} cartridge`,
-          "Cartridge Skill Tree",
+          "Tech Tree",
           "Explore every public class and action signature as a dependency graph, including disconnected networks.",
-          `${backButton("Play")}${gameButton("Play", "actions")}${gameButton("Goal Planner", "planner")}${gameButton("Objects", "objects")}`,
         )}
+        ${cartridgeNavigation("tree")}
         <div class="tech-tree-toolbar">
           <div class="game-toolbar-group" role="group" aria-label="Tree view">
             ${gameButton("Full Net", "tree-mode", { tone: allMode ? "primary" : "", extra: ` data-value="all" aria-pressed="${allMode}"` })}
@@ -6003,6 +6103,28 @@
     updateTechTreeDetails(model);
   }
 
+  function plannerGoalTargetForAction(catalog, action) {
+    const normalized = catalog?.actionById?.get(plannerActionId(action));
+    if (!normalized) return null;
+    const positiveNetByClass = new Map(normalized.positiveNetOutputs.map((output) => [output.classId, output.net]));
+    const candidates = [];
+    const seen = new Set();
+    for (const output of normalized.outputSlots) {
+      const net = positiveNetByClass.get(output.classId) || 0;
+      if (net <= 0 || seen.has(output.classId)) continue;
+      seen.add(output.classId);
+      const objectClass = catalog.classById.get(output.classId);
+      candidates.push({
+        classId: output.classId,
+        label: objectClass?.label || output.ref?.class?.name || "output",
+        net,
+        slotIndex: output.slotIndex,
+      });
+    }
+    candidates.sort((left, right) => right.net - left.net || left.slotIndex - right.slotIndex || plannerCompareText(left.classId, right.classId));
+    return candidates[0] || null;
+  }
+
   function actionCatalogMarkup(cartridge = selectedCartridge()) {
     if (!cartridge) return errorPanel("Select a cartridge", "Choose a cartridge from the cartridge menu to open its Play screen.", "cartridges");
     const query = state.actionSearch.trim().toLowerCase();
@@ -6014,24 +6136,37 @@
       if (state.actionFilter === "needs") return !ready;
       return true;
     });
+    let plannerCatalog = null;
+    try {
+      plannerCatalog = buildPlannerCatalog(cartridge, state.workspace);
+    } catch {
+      // Action Setup remains available if the planner catalog cannot be built.
+    }
     const visible = filtered.slice(0, state.actionLimit);
     const cards = visible.map((action, index) => {
       const ready = actionReady(action);
       const inputCount = (action.totalInputs || []).length;
       const outputCount = (action.totalOutputs || []).length;
       const name = action.action?.name || "Unnamed action";
-      const ariaLabel = `${name}. ${ready ? "Ready" : "Needs items"}. ${inputCount} input${inputCount === 1 ? "" : "s"}, ${outputCount} output${outputCount === 1 ? "" : "s"}. Open action setup.`;
+      const goalTarget = ready ? null : plannerGoalTargetForAction(plannerCatalog, action);
+      const opensPlanner = Boolean(goalTarget);
+      const ariaLabel = `${name}. ${ready ? "Ready" : "Needs items"}. ${inputCount} input${inputCount === 1 ? "" : "s"}, ${outputCount} output${outputCount === 1 ? "" : "s"}. ${opensPlanner ? `Open Goal Planner for ${goalTarget.label}.` : "Open action setup."}`;
       const descriptionId = `action-card-${index}-description`;
       const inputNames = techTreeGroupedRefs(action.totalInputs || []).map(({ ref, count }) => `${ref.class?.name || "unknown"}${count > 1 ? ` x${count}` : ""}`).join(", ") || "none";
       const outputNames = techTreeGroupedRefs(action.totalOutputs || []).map(({ ref, count }) => `${ref.class?.name || "unknown"}${count > 1 ? ` x${count}` : ""}`).join(", ") || "none";
+      const command = opensPlanner ? "plan-goal" : "setup-action";
+      const commandId = opensPlanner ? goalTarget.classId : qualifiedKey(action.action);
+      const meta = opensPlanner
+        ? `<span>Goal</span><span class="compact-card-goal">${escapeHtml(goalTarget.label)}</span>`
+        : `<span>${inputCount} in</span><span class="compact-card-arrow">→</span><span>${outputCount} out</span>`;
       return `
-        <button class="action-card compact-card menu-focusable" type="button" data-command="setup-action" data-id="${escapeHtml(qualifiedKey(action.action))}" aria-label="${escapeHtml(ariaLabel)}" aria-describedby="${descriptionId}" title="${escapeHtml(action.description || ariaLabel)}">
+        <button class="action-card compact-card menu-focusable${ready ? "" : " is-unavailable"}" type="button" data-command="${command}" data-id="${escapeHtml(commandId)}" aria-label="${escapeHtml(ariaLabel)}" aria-describedby="${descriptionId}" title="${escapeHtml(ariaLabel)}">
           <span class="compact-card-top">
             <span class="card-orb" aria-hidden="true">${escapeHtml(action.emoji || "ACT")}</span>
-            <span class="card-status ${ready ? "is-ready" : "is-needs"}">${ready ? "Ready" : "Needs"}</span>
+            <span class="card-status ${ready ? "is-ready" : "is-needs"}">${ready ? "Ready" : opensPlanner ? "Plan" : "Needs"}</span>
           </span>
           <span class="card-title">${escapeHtml(name)}</span>
-          <span class="compact-card-meta" aria-hidden="true"><span>${inputCount} in</span><span class="compact-card-arrow">→</span><span>${outputCount} out</span></span>
+          <span class="compact-card-meta" aria-hidden="true">${meta}</span>
           <span id="${descriptionId}" class="sr-only">${escapeHtml(`${action.description || "No description"} Inputs: ${inputNames}. Outputs: ${outputNames}.`)}</span>
         </button>`;
     }).join("");
@@ -6060,8 +6195,8 @@
           `${cartridge.name} cartridge`,
           "Play",
           "Choose an action. The Driver performs the authoritative feasibility check before inputs are submitted.",
-          `${backButton()}${gameButton("Switch Cartridge", "cartridges")}${gameButton("Goal Planner", "planner")}${gameButton("Tech Tree", "tree")}${gameButton("Objects", "objects")}${gameButton("Activity", "activity")}`,
         )}
+        ${cartridgeNavigation("actions")}
         <div class="game-toolbar">
           <input id="action-search" class="game-input game-search" type="search" placeholder="Search actions" value="${escapeHtml(state.actionSearch)}" aria-label="Search actions" />
           <div class="game-toolbar-group">${filters}</div>
@@ -6100,7 +6235,7 @@
         ? state.planner.result
         : null;
       const result = cachedResult || (state.planner.goalClassId
-        ? planGoalOutput(catalog, inventory, request)
+        ? planGoalCraftRequest(catalog, inventory, request)
         : null);
       state.planner.result = result;
       return { cartridge, catalog, inventory, options: goalOptions, result, error: null };
@@ -6132,8 +6267,17 @@
     return summary.complete ? `~${duration}` : `>= ${duration}`;
   }
 
-  function plannerTimingSummary(stepIds, timingByStep) {
+  function plannerExecutionMultiplier(result) {
+    if (result?.execution?.mode !== "repeat-unit") return 1;
+    return Math.max(
+      1,
+      Math.trunc(Number(result.execution.estimatedBatchCount || result.execution.quantity || result.goal?.quantity) || 1),
+    );
+  }
+
+  function plannerTimingSummary(stepIds, timingByStep, multiplier = 1) {
     const ids = [...new Set(stepIds || [])];
+    const repeats = Math.max(1, Math.trunc(Number(multiplier) || 1));
     let knownMilliseconds = 0;
     let knownCount = 0;
     let directWorkCount = 0;
@@ -6164,22 +6308,23 @@
       requiresCwi ||= timing.requiresCwi;
     }
     return {
-      count: ids.length,
-      knownMilliseconds,
-      knownCount,
-      directWorkCount,
-      observedCount,
-      calibratedCount,
-      lowerBoundCount,
-      nominalMilliseconds,
-      operationalAllowanceMilliseconds,
+      count: ids.length * repeats,
+      knownMilliseconds: knownMilliseconds * repeats,
+      knownCount: knownCount * repeats,
+      directWorkCount: directWorkCount * repeats,
+      observedCount: observedCount * repeats,
+      calibratedCount: calibratedCount * repeats,
+      lowerBoundCount: lowerBoundCount * repeats,
+      nominalMilliseconds: nominalMilliseconds * repeats,
+      operationalAllowanceMilliseconds: operationalAllowanceMilliseconds * repeats,
       complete,
       requiresCwi,
     };
   }
 
-  function plannerWorkloadSummary(stepIds, timingByStep) {
+  function plannerWorkloadSummary(stepIds, timingByStep, multiplier = 1) {
     const ids = [...new Set(stepIds || [])];
+    const repeats = BigInt(Math.max(1, Math.trunc(Number(multiplier) || 1)));
     let powExpectedAttempts = 0n;
     let vdfIterations = 0n;
     let readableStepCount = 0;
@@ -6195,7 +6340,13 @@
       if ((workload.pow?.knownCount || 0) + (workload.vdf?.knownCount || 0) > 0) readableStepCount += 1;
       if (!workload.complete) complete = false;
     }
-    return { count: ids.length, powExpectedAttempts, vdfIterations, readableStepCount, complete };
+    return {
+      count: ids.length * Number(repeats),
+      powExpectedAttempts: powExpectedAttempts * repeats,
+      vdfIterations: vdfIterations * repeats,
+      readableStepCount: readableStepCount * Number(repeats),
+      complete,
+    };
   }
 
   function plannerWorkloadLabel(summary) {
@@ -6350,13 +6501,51 @@
     if (result.status === "unreachable") return blockedRoot("blocked");
     if (result.status === "search-limit") return blockedRoot("search-limit");
     if (result.status === "invalid-goal") return blockedRoot("blocked");
-    const goalTokenId = result.goalTokenIds[0];
-    const root = goalTokenId ? buildToken(goalTokenId) : blockedRoot(result.status === "satisfied" ? "inventory" : "blocked");
+    const goalTokenIdList = result.goalTokenIds || [];
+    const repeatedUnit = result.execution?.mode === "repeat-unit" && result.goal.quantity > 1;
+    let root;
+    if (repeatedUnit && goalTokenIdList.length) {
+      const child = buildToken(goalTokenIdList[0]);
+      child.inputRole = "output";
+      child.label = `One ${result.goal.label}`;
+      root = {
+        id: "goal:quantity",
+        kind: "object",
+        label: `${result.goal.quantity} × ${result.goal.label}`,
+        state: "planned",
+        aggregate: true,
+        repeatQuantity: result.goal.quantity,
+        stepIds: new Set(result.steps.map((step) => step.id)),
+        children: [child],
+      };
+    } else if (goalTokenIdList.length > 1) {
+      const children = goalTokenIdList.map((tokenId) => {
+        const child = buildToken(tokenId);
+        child.inputRole = "output";
+        return child;
+      });
+      root = {
+        id: "goal:quantity",
+        kind: "object",
+        label: `${result.goal.quantity} × ${result.goal.label}`,
+        state: "planned",
+        aggregate: true,
+        stepIds: new Set(result.steps.map((step) => step.id)),
+        children,
+      };
+    } else {
+      const goalTokenId = goalTokenIdList[0];
+      root = goalTokenId ? buildToken(goalTokenId) : blockedRoot(result.status === "satisfied" ? "inventory" : "blocked");
+    }
     root.isRoot = true;
-    root.label = result.goal.label;
+    if (!root.aggregate) root.label = result.goal.label;
     // The target reports the complete action-set estimate even when UPDATE/tool
     // turnover is presented as a compact reference elsewhere in the visual.
-    root.timing = plannerTimingSummary(result.steps.map((step) => step.id), timingByStep);
+    root.timing = plannerTimingSummary(
+      result.steps.map((step) => step.id),
+      timingByStep,
+      plannerExecutionMultiplier(result),
+    );
     return root;
   }
 
@@ -6423,7 +6612,6 @@
   function plannerTreeViewKey(layout) {
     return JSON.stringify([
       state.planner.goalClassId,
-      state.planner.goalSemantics,
       state.planner.goalQuantity,
       layout.nodes.map((node) => [node.id, node.kind, node.state, node.depth, node.x, node.y]),
       layout.edges.map((edge) => [edge.source.id, edge.target.id, edge.role]),
@@ -6464,6 +6652,7 @@
 
   function plannerObjectDifficulty(node, timingByStep) {
     if (node.kind !== "object") return null;
+    if (node.aggregate) return null;
     if (node.state === "inventory") return proofDifficultySummary([], { inventory: true });
     const producerStepId = node.token?.producedByStepId || node.aliasStep?.id || "";
     const workload = producerStepId ? timingByStep.get(producerStepId)?.workload : null;
@@ -6546,7 +6735,7 @@
         </g>`;
     }).join("");
     const accessibleDifficulty = layout.nodes
-      .filter((node) => node.kind === "object")
+      .filter((node) => node.kind === "object" && !node.aggregate)
       .map((node) => {
         const difficulty = plannerObjectDifficulty(node, timingByStep);
         return `<li>${escapeHtml(`${node.label}: ${difficulty?.text || "PoW unknown, VDF unknown"}`)}</li>`;
@@ -6587,9 +6776,13 @@
   function plannerStepListMarkup(context, timingByStep) {
     const steps = context.result?.steps || [];
     if (!steps.length) return "";
+    const repeatQuantity = plannerExecutionMultiplier(context.result);
+    const executionLabel = context.result?.execution?.mode === "repeat-unit"
+      ? `One goal-batch path / ~${repeatQuantity} live-replanned batches`
+      : "Execution order";
     return `
       <section class="game-panel planner-step-panel" aria-labelledby="planner-steps-title">
-        <div class="game-panel-header"><h2 id="planner-steps-title">Action set</h2><span>Execution order</span></div>
+        <div class="game-panel-header"><h2 id="planner-steps-title">Action set</h2><span>${escapeHtml(executionLabel)}</span></div>
         <div class="planner-step-list">
           ${steps.map((step) => {
             const timing = timingByStep.get(step.id);
@@ -6634,6 +6827,7 @@
       context?.result?.status || "",
       context?.result?.steps?.length || 0,
       context?.result?.goal?.classId || "",
+      context?.result?.goal?.quantity || 0,
     ]);
   }
 
@@ -6645,9 +6839,10 @@
     const fingerprint = escapeHtml(plannerGoalWorkflowFingerprint(context));
     if (blockingWorkflow) {
       const completed = goalWorkflowCompletedCount(workflow);
+      const actionTotalLabel = goalWorkflowActionTotalLabel(workflow);
       return `
         <section class="planner-workflow-launch is-active" data-goal-workflow-launch data-goal-workflow-fingerprint="${fingerprint}" aria-label="Goal workflow">
-          <div><span>Action flow</span><strong>${escapeHtml(goalWorkflowStatusLabel(workflow))}</strong><small>${escapeHtml(workflow.goal?.label || "Goal")} / ${completed} of ${workflow.steps.length} actions verified</small></div>
+          <div><span>Action flow</span><strong>${escapeHtml(goalWorkflowStatusLabel(workflow))}</strong><small>${escapeHtml(goalWorkflowGoalLabel(workflow))} / ${completed} of ${actionTotalLabel} actions verified</small></div>
           <button class="game-button game-button-primary" type="button" data-command="manage-goal-workflow">Open workflow</button>
         </section>`;
     }
@@ -6688,8 +6883,9 @@
       const action = plannerActionForStep(step, context.catalog);
       timingByStep.set(step.id, action ? estimateActionProofTiming(action) : null);
     }
-    const totalTiming = plannerTimingSummary(result.steps.map((step) => step.id), timingByStep);
-    const totalWorkload = plannerWorkloadSummary(result.steps.map((step) => step.id), timingByStep);
+    const executionMultiplier = plannerExecutionMultiplier(result);
+    const totalTiming = plannerTimingSummary(result.steps.map((step) => step.id), timingByStep, executionMultiplier);
+    const totalWorkload = plannerWorkloadSummary(result.steps.map((step) => step.id), timingByStep, executionMultiplier);
     const cwi = currentHardwareIndex();
     const hasExecutablePlan = result.status === "planned" || result.status === "satisfied";
     const totalLabel = hasExecutablePlan ? plannerTimingLabel(totalTiming) : "No plan";
@@ -6724,7 +6920,9 @@
         : totalTiming.directWorkCount
           ? "Timing coverage incomplete"
           : "No readable timed gates";
-    const actionSetBasis = result.strategy === "goal-directed-fallback"
+    const actionSetBasis = result.execution?.mode === "repeat-unit"
+      ? `${result.totals.unitActionCount} action${result.totals.unitActionCount === 1 ? "" : "s"} in the first goal batch / live replan until ${result.goal.quantity} objects are verified`
+      : result.strategy === "goal-directed-fallback"
       ? `${result.totals.expandedStates.toLocaleString()} shortest-search states / valid fallback`
       : result.strategy === "inventory"
         ? "No actions required"
@@ -6747,12 +6945,12 @@
     const inventoryKey = startingItems.length
       ? `<span title="${escapeHtml(`Current live Driver objects used by this plan: ${startingItems.join(", ")}`)}"><i class="planner-key-inventory" aria-hidden="true"></i>LIVE DRIVER / ${escapeHtml(visibleStartingItems.join(", "))}</span>`
       : "";
-    const treeGuide = result.steps.length > 40
+    const treeGuide = result.execution?.mode === "repeat-unit"
+      ? `One exact goal-batch path is shown; the ${result.goal.quantity}-object total is scaled here, and the controller replans from live inventory between batches.`
+      : result.steps.length > 40
       ? "The complete path is fitted; zoom for detail and drag to pan. UPDATE tools remain compact references."
       : "The complete path is fitted. Read down for requirements; arrows flow up toward the target.";
-    const goalRule = result.goal.semantics === "additional"
-      ? `make +${result.goal.quantity} / ${result.goal.initialCount} on hand / finish with ${result.goal.targetCount}`
-      : `have ${result.goal.targetCount}+ / ${result.goal.initialCount} on hand`;
+    const goalRule = `craft ${result.goal.quantity} new / ${result.goal.initialCount} on hand / finish with at least ${result.goal.targetCount}`;
     const diagnosticMarkup = (result.diagnostics || []).map((diagnostic) => {
       const classIds = [...new Set(diagnostic.classIds || [])];
       const actionIds = [...new Set(diagnostic.actionIds || [])];
@@ -6773,9 +6971,6 @@
       ...(result.warnings || []),
       ...result.steps.flatMap((step) => step.warnings || []),
     ])].filter(Boolean).map((message) => `<li><span>${escapeHtml(message)}</span></li>`);
-    const inventorySatisfiedNote = result.status === "satisfied" && result.goal.semantics === "target-total"
-      ? '<div class="terminal-note planner-mode-note"><strong>This object is already on hand.</strong> Choose <em>Make one more</em> above to build its component tree, action set, and total-time estimate.</div>'
-      : "";
     return `
       <div class="planner-summary" aria-label="Plan summary">
         <div class="planner-summary-item"><span>Goal state</span><strong>${escapeHtml(stateLabel)}</strong><small>${escapeHtml(result.goal.label)} / ${escapeHtml(shortText(result.goal.hash, 6, 4))} / ${escapeHtml(goalRule)}</small></div>
@@ -6784,7 +6979,6 @@
         <div class="planner-summary-item"><span>Grounding</span><strong>${cwi ? `${HARDWARE_INDEX_LABEL} ${formatProofDuration(cwi.durationMs)}` : "No CWI"}</strong><small>${escapeHtml(groundingNote)}</small>${cwiControl}</div>
       </div>
       ${plannerGoalWorkflowMarkup(context)}
-      ${inventorySatisfiedNote}
       <div class="planner-flow-key" aria-label="Plan relationship legend"><span><i class="planner-key-input" aria-hidden="true"></i>USE / consumed input</span><span><i class="planner-key-output" aria-hidden="true"></i>MAKE / created output</span><span><i class="planner-key-update" aria-hidden="true"></i>UPDATE / paired turnover</span>${inventoryKey}${hasMissingBranches ? '<span><i class="planner-key-missing" aria-hidden="true"></i>MISSING / unresolved prerequisite</span>' : ""}<span class="work-gate-key"><b class="gate-symbol" aria-hidden="true">⛏</b>PoW <b class="gate-symbol" aria-hidden="true">⌛</b>VDF <small><i class="gate-tone is-green" aria-hidden="true"></i>low <i class="gate-tone is-yellow" aria-hidden="true"></i>mid/? <i class="gate-tone is-red" aria-hidden="true"></i>high</small></span><span>${escapeHtml(treeGuide)}</span></div>
       ${plannerTreeSvg(tree, timingByStep, context.cartridge.name)}
       ${plannerStepListMarkup(context, timingByStep)}
@@ -6792,7 +6986,7 @@
   }
 
   function plannerGoalOptionsMarkup(context) {
-    return `<option value="">Choose a goal output</option>${context.options.map((option) => {
+    return `<option value="">Choose an object to craft</option>${context.options.map((option) => {
       const selected = option.classId === state.planner.goalClassId ? " selected" : "";
       const plugin = option.qualified?.pluginName && option.qualified.pluginName !== context.cartridge?.id
         ? ` / ${option.qualified.pluginName}`
@@ -6817,12 +7011,12 @@
         ${screenHeading(
           `${cartridge.name} cartridge`,
           "Goal Planner",
-          "Choose an output and whether to make another or accept one already on hand. Existing live objects remain available as inputs.",
-          `${backButton("Play")}${gameButton("Play", "actions")}${gameButton("Full Tech Tree", "tree")}${gameButton("Objects", "objects")}`,
+          "Choose the object you want to craft, and the quantity you need",
         )}
+        ${cartridgeNavigation("planner")}
         <div class="planner-toolbar">
           <label for="planner-goal-select"><span>Target object</span><select id="planner-goal-select" class="game-select"${context.options.length ? "" : " disabled"}>${plannerGoalOptionsMarkup(context)}</select></label>
-          <label for="planner-goal-semantics"><span>Plan for</span><select id="planner-goal-semantics" class="game-select"${context.options.length ? "" : " disabled"}><option value="additional"${state.planner.goalSemantics === "additional" ? " selected" : ""}>Make one more</option><option value="target-total"${state.planner.goalSemantics === "target-total" ? " selected" : ""}>Have at least one</option></select></label>
+          <label for="planner-goal-quantity"><span>Quantity</span><input id="planner-goal-quantity" class="game-input planner-quantity-input" type="number" min="1" max="${PLANNER_MAX_QUANTITY}" step="1" inputmode="numeric" value="${state.planner.goalQuantity}"${context.options.length ? "" : " disabled"} aria-describedby="planner-quantity-help" /><small id="planner-quantity-help" class="sr-only">Whole number from 1 to ${PLANNER_MAX_QUANTITY}.</small></label>
         </div>
         <div data-catalog-region="planner" data-planner-result>${plannerResultMarkup(context)}</div>
       </section>`;
@@ -7166,10 +7360,10 @@
       select.value = state.planner.goalClassId;
       select.disabled = !context.options.length;
     }
-    const semanticsSelect = byId("planner-goal-semantics");
-    if (semanticsSelect) {
-      semanticsSelect.value = state.planner.goalSemantics;
-      semanticsSelect.disabled = !context.options.length;
+    const quantityInput = byId("planner-goal-quantity");
+    if (quantityInput) {
+      quantityInput.value = String(state.planner.goalQuantity);
+      quantityInput.disabled = !context.options.length;
     }
     if (!region) return;
     cancelPlannerTreePan();
@@ -7647,7 +7841,6 @@
         ${rating("VDF / literal chain", workload.vdf)}
       </div>
       ${actionProofCwiCalloutMarkup(timing)}
-      <p class="action-proof-note">CWI measures the MineIron proof window from <code>generateProof/running</code> “Generating proof” through <code>generateProof/done</code> “Proof generation complete”. The estimate scales that hardware baseline using readable PoW targets, VDF iterations, and I/O size, then adds ${escapeHtml(formatProofDuration(ACTION_COMMIT_ALLOWANCE_MS))} for commit and ${Math.round(ACTION_OPERATIONAL_CONTINGENCY * 100)}% for retries, errors, and slow settlement. It is a planning estimate, not a guarantee.</p>
       ${actionProofCwiSourceMarkup(timing)}`;
   }
 
@@ -7889,8 +8082,29 @@
     return Boolean(current && new Set(["submitting", "running", "verifying", "needs-review"]).has(current.status));
   }
 
-  function goalWorkflowCompletedCount(workflow = state.goalWorkflow) {
+  function goalWorkflowCurrentBatchCompletedCount(workflow = state.goalWorkflow) {
     return workflow?.stepStates?.filter((step) => step.status === "complete").length || 0;
+  }
+
+  function goalWorkflowCompletedCount(workflow = state.goalWorkflow) {
+    return (Number(workflow?.completedActionCount) || 0) + goalWorkflowCurrentBatchCompletedCount(workflow);
+  }
+
+  function goalWorkflowEstimatedActionCount(workflow = state.goalWorkflow) {
+    if (!workflow) return 0;
+    if (workflow.executionMode !== "repeat-unit") return workflow.steps?.length || 0;
+    const completedQuantity = Math.max(0, Number(workflow.completedQuantity) || 0);
+    const remainingQuantity = Math.max(0, (Number(workflow.goal?.quantity) || 1) - completedQuantity);
+    const remainingBatches = Math.ceil(remainingQuantity / Math.max(1, Number(workflow.batchGoalIncrease) || 1));
+    return Math.max(
+      goalWorkflowCompletedCount(workflow),
+      (Number(workflow.completedActionCount) || 0) + (workflow.steps?.length || 0) * remainingBatches,
+    );
+  }
+
+  function goalWorkflowActionTotalLabel(workflow = state.goalWorkflow) {
+    const total = goalWorkflowEstimatedActionCount(workflow);
+    return workflow?.executionMode === "repeat-unit" ? `~${total}` : String(total);
   }
 
   function goalWorkflowCurrentStepState(workflow = state.goalWorkflow) {
@@ -7917,6 +8131,12 @@
     })[workflow.status] || workflow.status || "Unknown";
   }
 
+  function goalWorkflowGoalLabel(workflow = state.goalWorkflow) {
+    const label = workflow?.goal?.label || "Goal";
+    const quantity = Number(workflow?.goal?.quantity) || 1;
+    return quantity > 1 ? `${quantity} × ${label}` : label;
+  }
+
   function goalWorkflowElapsedMilliseconds(workflow = state.goalWorkflow) {
     const started = new Date(workflow?.startedAt || 0).valueOf();
     if (!Number.isFinite(started) || started <= 0) return 0;
@@ -7933,6 +8153,21 @@
       const value = Number(rawValue);
       if (!Number.isFinite(value) || value < 0) return null;
       total += value;
+    }
+    if (workflow.executionMode === "repeat-unit") {
+      const completedQuantity = Math.max(0, Number(workflow.completedQuantity) || 0);
+      const batchGoalIncrease = Math.max(1, Number(workflow.batchGoalIncrease) || 1);
+      const futureQuantity = Math.max(0, (Number(workflow.goal?.quantity) || 1) - completedQuantity - batchGoalIncrease);
+      const futureBatches = Math.ceil(futureQuantity / batchGoalIncrease);
+      if (futureBatches) {
+        let unitTotal = 0;
+        for (const step of workflow.steps) {
+          const value = Number(step?.estimatedMilliseconds);
+          if (!Number.isFinite(value) || value < 0) return null;
+          unitTotal += value;
+        }
+        total += unitTotal * futureBatches;
+      }
     }
     return total;
   }
@@ -7961,6 +8196,7 @@
     button.hidden = !workflow;
     if (!workflow) return;
     const completed = goalWorkflowCompletedCount(workflow);
+    const actionTotal = goalWorkflowEstimatedActionCount(workflow);
     const label = byId("workflow-monitor-label");
     const icon = button.querySelector(".workflow-hud-icon");
     const iconByStatus = {
@@ -7980,12 +8216,13 @@
       : new Set(["error", "needs-review"]).has(workflow.status)
         ? "Flow alert"
         : workflow.status === "paused"
-          ? `Paused ${completed}/${workflow.steps.length}`
-          : `Flow ${completed}/${workflow.steps.length}`;
+          ? `Paused ${completed}/${actionTotal}`
+          : `Flow ${completed}/${actionTotal}`;
     button.dataset.workflowStatus = workflow.status;
     button.classList.toggle("is-alert", new Set(["error", "needs-review"]).has(workflow.status));
     button.classList.toggle("is-complete", workflow.status === "complete");
-    const description = `${goalWorkflowStatusLabel(workflow)}. ${workflow.goal?.label || "Goal"}. ${completed} of ${workflow.steps.length} actions verified.`;
+    const totalPhrase = workflow.executionMode === "repeat-unit" ? `approximately ${actionTotal}` : String(actionTotal);
+    const description = `${goalWorkflowStatusLabel(workflow)}. ${goalWorkflowGoalLabel(workflow)}. ${completed} of ${totalPhrase} actions verified.`;
     button.setAttribute("aria-label", `Open goal workflow monitor. ${description}`);
     button.title = description;
   }
@@ -8078,10 +8315,16 @@
     };
   }
 
-  function createGoalWorkflowSnapshot(context, connection) {
+  function createGoalWorkflowPlanBatch(context) {
     const result = context?.result;
     if (result?.status !== "planned" || !result.steps?.length) {
       throw new Error("The refreshed goal does not have an executable action set.");
+    }
+    if (result.steps.length > GOAL_WORKFLOW_MAX_STEPS) {
+      throw new Error(`This plan needs ${result.steps.length} actions; the safe workflow limit is ${GOAL_WORKFLOW_MAX_STEPS}. Reduce the quantity and try again.`);
+    }
+    if (!Array.isArray(result.goalTokenIds) || result.goalTokenIds.length !== 1) {
+      throw new Error("The refreshed craft batch did not materialize one distinct goal object.");
     }
     const timingByStep = new Map();
     const steps = result.steps.map((step) => {
@@ -8140,10 +8383,53 @@
         contentHash: token.contentHash || "",
       };
     }
-    const now = new Date().toISOString();
-    if (!(result.goalTokenIds || []).length) {
-      throw new Error("The refreshed plan did not materialize a final goal token.");
+    return {
+      goalTokenIds: [...result.goalTokenIds],
+      goalIncrease: Math.max(
+        1,
+        Number(result.execution?.unitGoalIncrease) ||
+          ((Number(result.goal?.finalCount) || 0) - (Number(result.goal?.initialCount) || 0)),
+      ),
+      steps,
+      stepStates: steps.map((step) => ({
+        stepId: step.id,
+        status: "pending",
+        runId: "",
+        runStatus: "",
+        runSnapshot: null,
+        inputObjectPaths: [],
+        outputFiles: [],
+        startedAt: "",
+        completedAt: "",
+        error: "",
+        retryable: true,
+        outcomeUnknown: false,
+      })),
+      tokenBindings,
+      estimatedMilliseconds: totalTiming.knownCount === steps.length ? totalTiming.knownMilliseconds : null,
+      estimateComplete: totalTiming.complete,
+    };
+  }
+
+  function createGoalWorkflowSnapshot(context, connection) {
+    const result = context?.result;
+    if (
+      !Number.isInteger(result?.goal?.quantity) ||
+      result.goal.quantity < 1 ||
+      result.goal.quantity > GOAL_WORKFLOW_MAX_QUANTITY
+    ) {
+      throw new Error("The refreshed plan does not have a valid craft quantity.");
     }
+    const repeatUnit = result.execution?.mode === "repeat-unit";
+    if (result.goal.quantity > 1 && !repeatUnit) {
+      throw new Error("Multi-object workflows must use recoverable live-replan batches.");
+    }
+    const batch = createGoalWorkflowPlanBatch(context);
+    const now = new Date().toISOString();
+    const estimatedBatchCount = Math.ceil(result.goal.quantity / batch.goalIncrease);
+    const estimatedTotalMilliseconds = batch.estimatedMilliseconds == null
+      ? null
+      : batch.estimatedMilliseconds * estimatedBatchCount;
     return {
       version: GOAL_WORKFLOW_VERSION,
       id: newId("goal-flow"),
@@ -8165,26 +8451,18 @@
         initialCount: result.goal.initialCount,
         targetCount: result.goal.targetCount,
       },
-      goalTokenIds: [...(result.goalTokenIds || [])],
-      steps,
-      stepStates: steps.map((step) => ({
-        stepId: step.id,
-        status: "pending",
-        runId: "",
-        runStatus: "",
-        runSnapshot: null,
-        inputObjectPaths: [],
-        outputFiles: [],
-        startedAt: "",
-        completedAt: "",
-        error: "",
-        retryable: true,
-        outcomeUnknown: false,
-      })),
-      tokenBindings,
+      executionMode: repeatUnit ? "repeat-unit" : "fixed-plan",
+      completedQuantity: 0,
+      completedActionCount: 0,
+      batchGoalIncrease: batch.goalIncrease,
+      estimatedActionCount: batch.steps.length * estimatedBatchCount,
+      goalTokenIds: batch.goalTokenIds,
+      steps: batch.steps,
+      stepStates: batch.stepStates,
+      tokenBindings: batch.tokenBindings,
       currentStepIndex: 0,
-      estimatedTotalMilliseconds: totalTiming.knownCount === steps.length ? totalTiming.knownMilliseconds : null,
-      estimateComplete: totalTiming.complete,
+      estimatedTotalMilliseconds,
+      estimateComplete: batch.estimateComplete,
       pauseRequested: false,
       exitRequested: false,
       recoveryRequired: false,
@@ -8329,7 +8607,10 @@
         : await prepareWhileLocked({ name: goalWorkflowLockName(connection) });
       if (!workflow) throw new Error("The workflow preparation lock was not available.");
       openGoalWorkflowManager();
-      toast("Workflow ready", `${workflow.steps.length} actions frozen for ${workflow.goal.label}. Press Play when ready.`, "success", 6500);
+      const readyDetail = workflow.executionMode === "repeat-unit"
+        ? `${workflow.steps.length} actions frozen for the first goal batch; the controller will replan live until ${workflow.goal.quantity} objects are verified.`
+        : `${workflow.steps.length} actions frozen for ${goalWorkflowGoalLabel(workflow)}.`;
+      toast("Workflow ready", `${readyDetail} Press Play when ready.`, "success", 6500);
     } catch (error) {
       if (state.goalWorkflow?.id === createdWorkflowId || !goalWorkflowBlocksNewPlan(state.goalWorkflow)) {
         state.goalWorkflow = previousWorkflow;
@@ -8650,7 +8931,7 @@
         stepState.error = "";
         workflow.currentStepIndex += 1;
         workflow.recoveryRequired = false;
-        workflow.message = `${step.label} verified. ${goalWorkflowCompletedCount(workflow)} of ${workflow.steps.length} actions complete.`;
+        workflow.message = `${step.label} verified. ${goalWorkflowCompletedCount(workflow)} of ${goalWorkflowActionTotalLabel(workflow)} actions complete.`;
         try {
           persistGoalWorkflow(true);
         } catch (error) {
@@ -8674,12 +8955,27 @@
   }
 
   async function verifyGoalWorkflowGoal(workflow) {
-    workflow.message = `All actions are complete. Verifying the final ${workflow.goal.label} token${workflow.goalTokenIds.length === 1 ? "" : "s"}.`;
-    persistGoalWorkflow();
-    const objects = await driverRequest(workflow.connection, "/objects", { timeout: 30000 });
-    if (!Array.isArray(objects)) {
-      throw goalWorkflowError("The final object inventory response is incompatible.", { needsReview: true, retryable: false });
+    const quantity = Number(workflow.goal?.quantity);
+    const repeatUnit = workflow.executionMode === "repeat-unit";
+    const expectedGoalTokens = repeatUnit ? 1 : quantity;
+    if (
+      !Number.isInteger(quantity) ||
+      quantity < 1 ||
+      quantity > GOAL_WORKFLOW_MAX_QUANTITY ||
+      workflow.goalTokenIds.length !== expectedGoalTokens
+    ) {
+      throw goalWorkflowError("The workflow goal-token count no longer matches the requested craft quantity.", { needsReview: true, retryable: false });
     }
+    const goalLabel = goalWorkflowGoalLabel(workflow);
+    const nextCompletedQuantity = repeatUnit
+      ? Math.min(quantity, (Number(workflow.completedQuantity) || 0) + Math.max(1, Number(workflow.batchGoalIncrease) || 1))
+      : quantity;
+    workflow.message = repeatUnit
+      ? `Verifying goal-object progress: ${nextCompletedQuantity} of ${quantity}.`
+      : `All actions are complete. Verifying ${goalLabel}.`;
+    persistGoalWorkflow();
+    const snapshot = await fetchGoalWorkflowDriverSnapshot(workflow);
+    const objects = snapshot.objects;
     const usedGoalFiles = new Set();
     const usedGoalHashes = new Set();
     for (const tokenId of workflow.goalTokenIds) {
@@ -8687,7 +8983,7 @@
       const object = workflowObjectForBinding(objects, binding);
       if (!binding || !object || object.status !== "live" || workflowObjectClassId(object) !== workflow.goal.classId) {
         throw goalWorkflowError(
-          `The final ${workflow.goal.label} output is not live at the exact planned class version. Review the completed runs before replanning.`,
+          `A final ${workflow.goal.label} output is not live at the exact planned class version. Review the completed runs before replanning.`,
           { needsReview: true, retryable: false },
         );
       }
@@ -8703,12 +8999,64 @@
       if (object.fileName) usedGoalFiles.add(object.fileName);
       if (object.contentHash) usedGoalHashes.add(object.contentHash);
     }
+    if (repeatUnit) {
+      const requiredLiveCount = (Number(workflow.goal.initialCount) || 0) + nextCompletedQuantity;
+      const liveGoalCount = objects.filter(
+        (object) => object.status === "live" && workflowObjectClassId(object) === workflow.goal.classId,
+      ).length;
+      if (liveGoalCount < requiredLiveCount) {
+        throw goalWorkflowError(
+          `The current batch was verified, but only ${liveGoalCount} live ${workflow.goal.label} objects remain; at least ${requiredLiveCount} are required for this quantity.`,
+          { needsReview: true, retryable: false },
+        );
+      }
+      const completedBatchActions = workflow.steps.length;
+      if (nextCompletedQuantity < quantity) {
+        const cartridge = selectedCartridge();
+        if (!cartridge || cartridge.id !== workflow.cartridgeId) {
+          throw goalWorkflowError(`Select the ${workflow.cartridgeName} cartridge before the next craft is planned.`, { retryable: true });
+        }
+        const catalog = buildPlannerCatalog(cartridge, state.workspace);
+        const inventory = buildPlannerInventory(objects);
+        const result = planGoalOutput(catalog, inventory, {
+          classId: workflow.goal.classId,
+          quantity: 1,
+          semantics: "additional",
+          maxSteps: GOAL_WORKFLOW_MAX_STEPS,
+        });
+        if (result.status !== "planned" || !result.steps.length) {
+          throw goalWorkflowError(
+            `${nextCompletedQuantity} of ${quantity} goal objects are complete, but the next batch could not be planned from live inventory (${result.status || "no plan"}). Retry to recheck live state.`,
+            { retryable: true },
+          );
+        }
+        const batch = createGoalWorkflowPlanBatch({ result, catalog });
+        workflow.completedQuantity = nextCompletedQuantity;
+        workflow.completedActionCount = (Number(workflow.completedActionCount) || 0) + completedBatchActions;
+        workflow.goalTokenIds = batch.goalTokenIds;
+        workflow.steps = batch.steps;
+        workflow.stepStates = batch.stepStates;
+        workflow.tokenBindings = batch.tokenBindings;
+        workflow.batchGoalIncrease = batch.goalIncrease;
+        workflow.currentStepIndex = 0;
+        workflow.estimatedActionCount = goalWorkflowEstimatedActionCount(workflow);
+        workflow.estimateComplete &&= batch.estimateComplete;
+        workflow.recoveryRequired = false;
+        workflow.error = "";
+        workflow.message = `${nextCompletedQuantity} of ${quantity} goal objects verified. The next batch was replanned from live inventory.`;
+        persistGoalWorkflow(true);
+        return false;
+      }
+      workflow.completedQuantity = nextCompletedQuantity;
+      workflow.estimatedActionCount = (Number(workflow.completedActionCount) || 0) + completedBatchActions;
+    }
     workflow.status = "complete";
     workflow.completedAt = new Date().toISOString();
-    workflow.message = `${workflow.goal.label} is live and verified.`;
+    workflow.message = `${goalLabel} is live and verified.`;
     workflow.error = "";
     persistGoalWorkflow();
-    toast("Goal workflow complete", `${workflow.goal.label} / ${workflow.steps.length} actions verified`, "success", 9000);
+    toast("Goal workflow complete", `${goalLabel} / ${goalWorkflowCompletedCount(workflow)} actions verified`, "success", 9000);
+    return true;
   }
 
   function stopGoalWorkflowBetweenSteps(workflow, reason) {
@@ -8758,8 +9106,9 @@
       while (token === state.goalWorkflowLoopToken && state.goalWorkflow?.id === workflow.id) {
         if (workflow.currentStepIndex >= workflow.steps.length) {
           if (stopGoalWorkflowBetweenSteps(workflow, "All submitted actions finished; final goal verification was skipped because Exit was requested.")) return;
-          await verifyGoalWorkflowGoal(workflow);
-          return;
+          const complete = await verifyGoalWorkflowGoal(workflow);
+          if (complete) return;
+          continue;
         }
         const step = goalWorkflowCurrentStep(workflow);
         const stepState = goalWorkflowCurrentStepState(workflow);
@@ -8899,9 +9248,13 @@
       return;
     }
     if (workflow.status === "ready" && !options.skipConfirmation) {
+      const totalLabel = goalWorkflowActionTotalLabel(workflow);
+      const batching = workflow.executionMode === "repeat-unit"
+        ? ` The action total is initially estimated at ${totalLabel}; the controller replans from live inventory between goal batches until the requested quantity is verified.`
+        : "";
       const approved = globalThis.confirm(
-        `Start the ${workflow.goal.label} workflow on ${workflow.connection.name}?\n\n` +
-          `${workflow.steps.length} state-changing actions will be submitted sequentially. Inputs are consumed and completed steps cannot be undone. ` +
+        `Start the ${goalWorkflowGoalLabel(workflow)} workflow on ${workflow.connection.name}?\n\n` +
+          `${totalLabel} state-changing actions will be submitted sequentially.${batching} Inputs are consumed and completed steps cannot be undone. ` +
           "Pause or Exit takes effect before the next action; an accepted Driver action always finishes.",
       );
       if (!approved) return;
@@ -9009,13 +9362,18 @@
     const stepState = goalWorkflowCurrentStepState(workflow);
     if (!workflow || workflow.status !== "error" || state.goalWorkflowLoopPromise) return;
     if (!step && workflow.currentStepIndex >= workflow.steps.length) {
+      const awaitingNextCraft = workflow.executionMode === "repeat-unit" && workflow.completedQuantity < workflow.goal.quantity;
       const approved = globalThis.confirm(
-        `Retry final verification for ${workflow.goal.label}?\n\nNo action will be submitted. The console will only refresh live objects and verify the planned goal token.`,
+        awaitingNextCraft
+          ? `Retry the live check and next-batch plan for ${goalWorkflowGoalLabel(workflow)}?\n\nThe completed batch will be verified again. If a new exact plan is available, the workflow will continue toward the requested quantity.`
+          : `Retry final verification for ${goalWorkflowGoalLabel(workflow)}?\n\nNo action will be submitted. The console will only refresh live objects and verify the planned goal objects.`,
       );
       if (!approved) return;
       workflow.status = "paused";
       workflow.error = "";
-      workflow.message = `Retrying final live-object verification for ${workflow.goal.label}.`;
+      workflow.message = awaitingNextCraft
+        ? `Retrying the live goal check and next-batch plan for ${goalWorkflowGoalLabel(workflow)}.`
+        : `Retrying final live-object verification for ${goalWorkflowGoalLabel(workflow)}.`;
       persistGoalWorkflow();
       launchGoalWorkflowEngine({ skipConfirmation: true });
       return;
@@ -9050,7 +9408,7 @@
     const current = goalWorkflowCurrentStepState(workflow);
     const activeAction = Boolean(current?.runId && !TERMINAL_RUNS.has(current.runSnapshot?.status)) || current?.status === "submitting";
     const approved = globalThis.confirm(
-      `Exit the ${workflow.goal.label} workflow?\n\nNo later actions will be submitted. ` +
+      `Exit the ${goalWorkflowGoalLabel(workflow)} workflow?\n\nNo later actions will be submitted. ` +
         (activeAction
           ? "The current Driver action cannot be cancelled; the console will keep tracking and verifying it, then stop."
           : "Already completed actions remain committed and cannot be undone."),
@@ -9090,7 +9448,7 @@
     const step = goalWorkflowCurrentStep(workflow);
     const stepState = goalWorkflowCurrentStepState(workflow);
     const approved = globalThis.confirm(
-      `Clear the safety lock for ${workflow.goal.label}?\n\nOnly continue after checking Driver Activity and live objects for the uncertain run. Clearing this monitor does not undo any accepted action. The planner will refresh from live state before another workflow can be prepared.`,
+      `Clear the safety lock for ${goalWorkflowGoalLabel(workflow)}?\n\nOnly continue after checking Driver Activity and live objects for the uncertain run. Clearing this monitor does not undo any accepted action. The planner will refresh from live state before another workflow can be prepared.`,
     );
     if (!approved) return;
     if (step && stepState?.inputObjectPaths) {
@@ -9166,8 +9524,8 @@
           `${cartridge.name} cartridge`,
           "Objects",
           "Only objects belonging to the selected cartridge are shown.",
-          `${backButton("Play")}${gameButton("Play", "actions")}${gameButton("Goal Planner", "planner")}${gameButton("Tech Tree", "tree")}${gameButton("Activity", "activity")}${gameButton("Import .dobj", "import-object", { tone: "primary", disabled: connectionStatus(activeConnection()?.id).state !== "online" })}`,
         )}
+        ${cartridgeNavigation("objects", gameButton("Import .dobj", "import-object", { tone: "primary", disabled: connectionStatus(activeConnection()?.id).state !== "online" }))}
         <div class="game-toolbar">
           <input id="object-search" class="game-input game-search" type="search" placeholder="Search objects" value="${escapeHtml(state.objectSearch)}" aria-label="Search objects" />
           <div class="game-toolbar-group">
@@ -9333,14 +9691,17 @@
 
   function renderActivity() {
     const runs = sortedRuns();
+    const cartridge = selectedCartridge();
+    const refreshButton = gameButton("Refresh runs", "refresh-runs");
     return `
       <section class="game-screen game-screen-wide" aria-labelledby="activity-title">
         ${screenHeading(
-          "Driver telemetry",
+          cartridge ? `${cartridge.name} cartridge` : "Driver telemetry",
           "Activity",
           "Retained runs come from dobjd; the live event list exists only in this browser tab.",
-          `${backButton("Play")}${gameButton("Play", "actions")}${gameButton("Tech Tree", "tree")}${gameButton("Objects", "objects")}${gameButton("Refresh runs", "refresh-runs")}`,
+          cartridge ? "" : `${backButton()}${refreshButton}`,
         )}
+        ${cartridge ? cartridgeNavigation("activity", refreshButton) : ""}
         <div data-runs-warning>${runsWarningMarkup()}</div>
         <div class="panel-grid">
           <div class="game-panel">
@@ -9599,11 +9960,14 @@
     const stepState = goalWorkflowCurrentStepState(workflow);
     if (!step || !stepState) {
       return `
-        <div class="workflow-current-copy"><span>Final check</span><strong>${escapeHtml(workflow.goal.label)}</strong><small>All planned actions have been processed.</small></div>
+        <div class="workflow-current-copy"><span>Final check</span><strong>${escapeHtml(goalWorkflowGoalLabel(workflow))}</strong><small>All planned actions have been processed.</small></div>
         <div class="terminal-note">${escapeHtml(workflow.message || "Verifying final goal output.")}</div>`;
     }
     const inputLabels = step.inputs.map((input) => input.classLabel).join(", ") || "None";
     const outputLabels = step.outputs.map((output) => output.classLabel).join(", ") || "None";
+    const craftLabel = workflow.executionMode === "repeat-unit"
+      ? `Goal objects ${Number(workflow.completedQuantity) || 0} of ${workflow.goal.quantity} / current batch / `
+      : "";
     const run = goalWorkflowCurrentRun(workflow);
     const canOpenRun = activeConnection()?.id === workflow.connection.id && state.workspace.connectionId === workflow.connection.id;
     let meter = "";
@@ -9629,7 +9993,7 @@
     }
     return `
       <div class="workflow-current-copy">
-        <span>Step ${step.order} of ${workflow.steps.length} / ${escapeHtml(goalWorkflowStepStatusLabel(stepState))}</span>
+        <span>${escapeHtml(craftLabel)}Step ${step.order} of ${workflow.steps.length} / ${escapeHtml(goalWorkflowStepStatusLabel(stepState))}</span>
         <strong>${escapeHtml(step.label)}</strong>
         <small>Use: ${escapeHtml(inputLabels)} / Make: ${escapeHtml(outputLabels)}</small>
       </div>
@@ -9669,7 +10033,12 @@
       controls.push(control(workflow.exitRequested ? "Resume tracking to exit" : stepState?.runId ? "Resume tracking" : "Resume flow", "workflow-resume", { primary: true, glyph: "\u25b6" }));
       controls.push(control("Exit flow", "workflow-exit", { danger: true, glyph: "\u25a0" }));
     } else if (workflow.status === "error") {
-      if (!stepState && workflow.currentStepIndex >= workflow.steps.length) controls.push(control("Retry goal check", "workflow-retry", { primary: true, glyph: "\u21bb" }));
+      if (!stepState && workflow.currentStepIndex >= workflow.steps.length) {
+        const label = workflow.executionMode === "repeat-unit" && workflow.completedQuantity < workflow.goal.quantity
+          ? "Retry live replan"
+          : "Retry goal check";
+        controls.push(control(label, "workflow-retry", { primary: true, glyph: "\u21bb" }));
+      }
       else if (stepState?.retryable) controls.push(control("Retry live check", "workflow-retry", { primary: true, glyph: "\u21bb" }));
       controls.push(control("View activity", "workflow-activity"));
       controls.push(control("Exit flow", "workflow-exit", { danger: true, glyph: "\u25a0" }));
@@ -9693,6 +10062,9 @@
       workflow.status,
       workflow.currentStepIndex,
       goalWorkflowCompletedCount(workflow),
+      workflow.completedQuantity || 0,
+      goalWorkflowEstimatedActionCount(workflow),
+      workflow.steps?.[0]?.actionId || "",
       stepState?.status || "",
       stepState?.runStatus || "",
       stepState?.error || "",
@@ -9707,7 +10079,10 @@
 
   function renderGoalWorkflowDrawer(workflow) {
     const completed = goalWorkflowCompletedCount(workflow);
-    const currentNumber = Math.min(workflow.steps.length, workflow.currentStepIndex + 1);
+    const actionTotal = goalWorkflowEstimatedActionCount(workflow);
+    const actionTotalLabel = goalWorkflowActionTotalLabel(workflow);
+    const hasCurrentAction = workflow.currentStepIndex < workflow.steps.length;
+    const currentNumber = Math.min(actionTotal, completed + (hasCurrentAction ? 1 : 0));
     const remaining = goalWorkflowRemainingMilliseconds(workflow);
     const estimate = workflow.estimatedTotalMilliseconds == null
       ? "Unknown"
@@ -9717,21 +10092,21 @@
       : "";
     return `
       <div data-workflow-drawer data-workflow-fingerprint="${escapeHtml(goalWorkflowDrawerFingerprint(workflow))}">
-        <p id="workflow-dialog-description" class="sr-only">Sequential Driver actions for ${escapeHtml(workflow.goal.label)}. Completed steps cannot be undone, and Pause or Exit takes effect only before the next action.</p>
+        <p id="workflow-dialog-description" class="sr-only">Sequential Driver actions for ${escapeHtml(goalWorkflowGoalLabel(workflow))}. Completed steps cannot be undone, and Pause or Exit takes effect only before the next action.</p>
         <div class="drawer-header workflow-drawer-header">
-          <div><p class="screen-kicker">Goal workflow</p><h2 class="drawer-title" id="drawer-title" data-workflow-focus tabindex="-1">${escapeHtml(workflow.goal.label)}</h2><small>${escapeHtml(workflow.connection.name)} / ${escapeHtml(workflow.cartridgeName)}</small></div>
+          <div><p class="screen-kicker">Goal workflow</p><h2 class="drawer-title" id="drawer-title" data-workflow-focus tabindex="-1">${escapeHtml(goalWorkflowGoalLabel(workflow))}</h2><small>${escapeHtml(workflow.connection.name)} / ${escapeHtml(workflow.cartridgeName)}</small></div>
           <div class="drawer-header-actions"><span data-workflow-badge>${goalWorkflowBadgeMarkup(workflow)}</span><button class="game-button" type="button" data-command="close-drawer">Close</button></div>
         </div>
         <div class="drawer-body workflow-drawer-body" aria-describedby="workflow-safety-note">
           <div class="summary-strip workflow-summary">
             <div class="summary-stat"><span>Status</span><strong data-workflow-status>${escapeHtml(goalWorkflowStatusLabel(workflow))}</strong></div>
-            <div class="summary-stat"><span>Action</span><strong data-workflow-step>${currentNumber} / ${workflow.steps.length}</strong></div>
+            <div class="summary-stat"><span>Action</span><strong data-workflow-step>${currentNumber} / ${actionTotalLabel}</strong></div>
             <div class="summary-stat"><span>Elapsed</span><strong data-workflow-elapsed>${escapeHtml(formatProofDuration(goalWorkflowElapsedMilliseconds(workflow)))}</strong></div>
             <div class="summary-stat"><span>Plan estimate</span><strong>${escapeHtml(estimate)}</strong></div>
           </div>
           <section class="workflow-overall" aria-labelledby="workflow-overall-title">
-            <div><span id="workflow-overall-title">Verified action progress</span><strong data-workflow-count>${completed} of ${workflow.steps.length}</strong></div>
-            <progress data-workflow-progress aria-labelledby="workflow-overall-title" max="${workflow.steps.length}" value="${completed}">${completed} of ${workflow.steps.length}</progress>
+            <div><span id="workflow-overall-title">Verified action progress</span><strong data-workflow-count>${completed} of ${actionTotalLabel}</strong></div>
+            <progress data-workflow-progress aria-labelledby="workflow-overall-title" max="${actionTotal}" value="${completed}">${completed} of ${actionTotal}</progress>
             <small><span data-workflow-remaining>${remaining == null ? "Remaining time unknown" : `~${formatProofDuration(remaining)} planned work remaining`}</span> / action count is authoritative; time is an estimate.</small>
           </section>
           <p class="workflow-message" data-workflow-message aria-live="polite" aria-atomic="true">${escapeHtml(workflow.message || "")}</p>
@@ -9767,15 +10142,22 @@
       if (element && element.textContent !== String(value ?? "")) element.textContent = String(value ?? "");
     };
     const completed = goalWorkflowCompletedCount(workflow);
+    const actionTotal = goalWorkflowEstimatedActionCount(workflow);
+    const actionTotalLabel = goalWorkflowActionTotalLabel(workflow);
+    const hasCurrentAction = workflow.currentStepIndex < workflow.steps.length;
+    const currentNumber = Math.min(actionTotal, completed + (hasCurrentAction ? 1 : 0));
     const remaining = goalWorkflowRemainingMilliseconds(workflow);
     setText("[data-workflow-status]", goalWorkflowStatusLabel(workflow));
-    setText("[data-workflow-step]", `${Math.min(workflow.steps.length, workflow.currentStepIndex + 1)} / ${workflow.steps.length}`);
+    setText("[data-workflow-step]", `${currentNumber} / ${actionTotalLabel}`);
     setText("[data-workflow-elapsed]", formatProofDuration(goalWorkflowElapsedMilliseconds(workflow)));
-    setText("[data-workflow-count]", `${completed} of ${workflow.steps.length}`);
+    setText("[data-workflow-count]", `${completed} of ${actionTotalLabel}`);
     setText("[data-workflow-remaining]", remaining == null ? "Remaining time unknown" : `~${formatProofDuration(remaining)} planned work remaining`);
     setText("[data-workflow-message]", workflow.message || "");
     const progress = root.querySelector("[data-workflow-progress]");
-    if (progress) progress.value = completed;
+    if (progress) {
+      progress.max = actionTotal;
+      progress.value = completed;
+    }
     const run = goalWorkflowCurrentRun(workflow);
     if (run && root.querySelector("[data-run-meter-shell]")) {
       patchRunMeter(run);
@@ -10049,6 +10431,7 @@
   }
 
   function navigate(screen) {
+    state.cartridgeNavOpen = false;
     if (location.hash !== `#/${screen}`) {
       location.hash = `#/${screen}`;
     } else {
@@ -10063,7 +10446,7 @@
       connections: "home",
       "connection-edit": "connections",
       cartridges: "home",
-      actions: "home",
+      actions: "cartridges",
       planner: "actions",
       tree: "actions",
       objects: "actions",
@@ -10152,6 +10535,15 @@
       case "back":
         navigateBack();
         break;
+      case "toggle-cartridge-nav": {
+        state.cartridgeNavOpen = !state.cartridgeNavOpen;
+        const nav = element.closest(".cartridge-nav");
+        nav?.classList.toggle("is-open", state.cartridgeNavOpen);
+        element.setAttribute("aria-expanded", String(state.cartridgeNavOpen));
+        const symbol = element.querySelector("[data-cartridge-nav-symbol]");
+        if (symbol) symbol.textContent = state.cartridgeNavOpen ? "−" : "+";
+        break;
+      }
       case "refresh":
         await refreshEverything();
         break;
@@ -10208,9 +10600,10 @@
           state.techTree.selectedNodeId = "";
           state.techTree.viewBox = null;
           state.techTree.viewKey = "";
+          clearTimeout(state.planner.quantityTimer);
           state.planner.goalClassId = "";
-          state.planner.goalSemantics = "additional";
           state.planner.goalQuantity = 1;
+          state.planner.quantityTimer = null;
           state.planner.result = null;
           state.planner.viewBox = null;
           state.planner.viewKey = "";
@@ -10236,6 +10629,19 @@
         navigate("tree");
         break;
       case "planner":
+        navigate("planner");
+        break;
+      case "plan-goal":
+        clearTimeout(state.planner.quantityTimer);
+        state.planner.goalClassId = id || "";
+        state.planner.goalQuantity = 1;
+        state.planner.quantityTimer = null;
+        state.planner.result = null;
+        state.planner.viewBox = null;
+        state.planner.viewKey = "";
+        state.planner.layout = null;
+        state.planner.drag = null;
+        state.planner.viewMode = "fit";
         navigate("planner");
         break;
       case "prepare-goal-workflow":
@@ -10439,6 +10845,18 @@
       state.objectLimit = 90;
       patchCatalogScreen();
     }
+    if (event.target.id === "planner-goal-quantity") {
+      const rawQuantity = Number(event.target.value);
+      if (Number.isInteger(rawQuantity) && rawQuantity >= 1 && rawQuantity <= PLANNER_MAX_QUANTITY) {
+        state.planner.goalQuantity = rawQuantity;
+        state.planner.result = null;
+        clearTimeout(state.planner.quantityTimer);
+        state.planner.quantityTimer = setTimeout(() => {
+          state.planner.quantityTimer = null;
+          if (state.screen === "planner") patchPlanner();
+        }, 250);
+      }
+    }
   });
 
   main.addEventListener("change", (event) => {
@@ -10455,12 +10873,18 @@
       render();
     }
     if (event.target.id === "planner-goal-select") {
+      clearTimeout(state.planner.quantityTimer);
+      state.planner.quantityTimer = null;
       state.planner.goalClassId = event.target.value || "";
       state.planner.result = null;
       patchPlanner();
     }
-    if (event.target.id === "planner-goal-semantics") {
-      state.planner.goalSemantics = event.target.value === "target-total" ? "target-total" : "additional";
+    if (event.target.id === "planner-goal-quantity") {
+      const quantity = normalizePlannerQuantity(event.target.value);
+      clearTimeout(state.planner.quantityTimer);
+      state.planner.quantityTimer = null;
+      event.target.value = String(quantity);
+      state.planner.goalQuantity = quantity;
       state.planner.result = null;
       patchPlanner();
     }
@@ -10580,6 +11004,7 @@
     }
   });
   window.addEventListener("hashchange", () => {
+    state.cartridgeNavOpen = false;
     state.screen = screenFromHash();
     state.config.ui.lastScreen = state.screen;
     persistConfig();
@@ -10625,6 +11050,17 @@
         state.planner.fullscreenFallback = false;
         state.planner.fullscreenRequestPending = false;
         syncPlannerTreeFullscreenUi();
+        return;
+      }
+      if (!state.drawer && state.cartridgeNavOpen) {
+        state.cartridgeNavOpen = false;
+        const nav = main.querySelector(".cartridge-nav");
+        const toggle = nav?.querySelector(".cartridge-nav-toggle");
+        nav?.classList.remove("is-open");
+        toggle?.setAttribute("aria-expanded", "false");
+        const symbol = toggle?.querySelector("[data-cartridge-nav-symbol]");
+        if (symbol) symbol.textContent = "+";
+        toggle?.focus({ preventScroll: true });
         return;
       }
       if (!state.drawer && state.screen === "tree" && clearTechTreeRelationshipFocus()) return;
