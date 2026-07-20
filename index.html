@@ -42,10 +42,16 @@
           </div>
         </div>
 
-        <button id="refresh-button" class="hud-button" type="button" aria-label="Refresh console">
-          <span class="refresh-icon" aria-hidden="true"></span>
-          <span>Refresh</span>
-        </button>
+        <div class="hud-actions">
+          <button id="workflow-monitor" class="hud-button workflow-hud-button" type="button" aria-label="Open goal workflow monitor" title="Open goal workflow monitor" hidden>
+            <span class="workflow-hud-icon" aria-hidden="true">&#9654;</span>
+            <span id="workflow-monitor-label">Flow</span>
+          </button>
+          <button id="refresh-button" class="hud-button" type="button" aria-label="Refresh console">
+            <span class="refresh-icon" aria-hidden="true"></span>
+            <span>Refresh</span>
+          </button>
+        </div>
       </header>
 
       <main id="main-content" class="game-stage" tabindex="-1">

@@ -8,6 +8,12 @@
 
   const CONFIG_VERSION = 1;
   const STORAGE_KEY = "don.lightConsole.config.v1";
+  const GOAL_WORKFLOW_STORAGE_KEY = "don.lightConsole.goalWorkflow.v1";
+  const GOAL_WORKFLOW_VERSION = 1;
+  const GOAL_WORKFLOW_POLL_MS = 1_200;
+  const GOAL_WORKFLOW_MAX_POLL_ERRORS = 50;
+  const GOAL_WORKFLOW_OUTPUT_ATTEMPTS = 30;
+  const GOAL_WORKFLOW_OUTPUT_POLL_MS = 2_000;
   const HARDWARE_INDEX_VERSION = 4;
   const HARDWARE_INDEX_LABEL = "CWI-4";
   const HARDWARE_INDEX_BENCHMARK_ID = "driver-craft-rocket-mineiron-proof-window-v1";
@@ -596,9 +602,70 @@
     return key ? normalizeHardwareIndex(config?.clientWorkIndexes?.[key]) : null;
   }
 
+  function loadGoalWorkflowSnapshot(options = {}) {
+    try {
+      const raw = localStorage.getItem(GOAL_WORKFLOW_STORAGE_KEY);
+      if (!raw) return null;
+      const workflow = JSON.parse(raw);
+      if (
+        !workflow ||
+        workflow.version !== GOAL_WORKFLOW_VERSION ||
+        !workflow.id ||
+        !workflow.connection?.id ||
+        !workflow.connection?.driverUrl ||
+        !workflow.cartridgeId ||
+        !workflow.goal?.classId ||
+        !Array.isArray(workflow.steps) ||
+        !Array.isArray(workflow.stepStates) ||
+        workflow.steps.length !== workflow.stepStates.length ||
+        workflow.steps.length > 256 ||
+        !workflow.tokenBindings ||
+        typeof workflow.tokenBindings !== "object"
+      ) return null;
+      workflow.currentStepIndex = Math.max(0, Math.min(workflow.steps.length, Number(workflow.currentStepIndex) || 0));
+      if (options.recoverInterrupted === false) return workflow;
+      const exitWasRequested = Boolean(workflow.exitRequested || workflow.status === "stopping");
+      workflow.pauseRequested = false;
+      const current = workflow.stepStates[workflow.currentStepIndex] || null;
+      const interruptedSubmission = current?.status === "submitting" && !current.runId;
+      if (interruptedSubmission) {
+        current.status = "needs-review";
+        current.outcomeUnknown = true;
+        current.retryable = false;
+        workflow.status = "needs-review";
+        workflow.error = "The page closed while an action request was awaiting its run id. The Driver may have accepted it, so this step cannot be retried automatically.";
+        workflow.message = "Review Driver Activity before clearing this safety lock.";
+      } else if (exitWasRequested && !current?.runId && current?.status !== "submitting") {
+        workflow.status = "stopped";
+        workflow.exitRequested = true;
+        workflow.stoppedAt ||= new Date().toISOString();
+        workflow.message = "Exit was completed during reload recovery. No further action will be submitted.";
+      } else if (new Set(["running", "pausing", "stopping"]).has(workflow.status)) {
+        workflow.status = "paused";
+        workflow.exitRequested = exitWasRequested;
+        workflow.recoveryRequired = Boolean(current?.runId);
+        workflow.message = current?.runId
+          ? exitWasRequested
+            ? `Exit recovery is paused after reload. Resume tracking retained run ${current.runId}; it will be verified and then the flow will stop.`
+            : `Automation paused after reload. Resume to reconcile retained run ${current.runId} before any new action is submitted.`
+          : "Automation paused after reload. Resume to repeat the live preflight before the next action.";
+      } else {
+        workflow.exitRequested = exitWasRequested;
+      }
+      return workflow;
+    } catch (error) {
+      console.warn("Could not restore the saved goal workflow", error);
+      return null;
+    }
+  }
+
   const initialConfig = loadConfig();
   const initialConnection = initialConfig.connections.find((item) => item.id === initialConfig.activeConnectionId) || initialConfig.connections[0];
   const savedHardwareIndex = hardwareIndexForConnection(initialConfig, initialConnection);
+  const goalWorkflowTabId = newId("flow-tab");
+  // Active checkpoints are loaded verbatim. Startup recovery is performed only
+  // after this tab proves that no other tab still owns the Driver Web Lock.
+  const savedGoalWorkflow = loadGoalWorkflowSnapshot({ recoverInterrupted: false });
 
   const state = {
     config: initialConfig,
@@ -616,6 +683,11 @@
     watchingRuns: new Set(),
     inFlightActionSubmissions: new Set(),
     ambiguousActionSubmissions: new Set(),
+    goalWorkflow: savedGoalWorkflow,
+    goalWorkflowPreparing: false,
+    goalWorkflowLoopPromise: null,
+    goalWorkflowLoopToken: 0,
+    goalWorkflowTabId,
     hardwareIndex: {
       status: savedHardwareIndex ? "ready" : "idle",
       result: savedHardwareIndex,
@@ -1246,6 +1318,7 @@
     const refreshButton = byId("refresh-button");
     refreshButton.setAttribute("aria-busy", String(state.refreshing));
     refreshButton.disabled = state.refreshing;
+    updateGoalWorkflowHud();
   }
 
   async function probeConnection(connection, generation) {
@@ -1349,6 +1422,7 @@
       if (patchConnections) patchConnectionStatuses();
       if (patchActivityScreen) patchActivity();
       for (const id of runIds) patchRunDrawer(id);
+      if (runIds.length) patchGoalWorkflowDrawer();
       if (patchCatalog) patchCatalogScreen();
     });
   }
@@ -1452,6 +1526,13 @@
   }
 
   function resetWorkspace() {
+    if (goalWorkflowAutomationActive() && !goalWorkflowOwnedByOtherTab()) {
+      state.goalWorkflow.pauseRequested = true;
+      state.goalWorkflow.exitRequested = false;
+      state.goalWorkflow.status = "pausing";
+      state.goalWorkflow.message = "Connection context changed. The current accepted action will be reconciled, then automation will pause.";
+      persistGoalWorkflow();
+    }
     cleanupTechTreeFullscreen();
     cleanupPlannerTreeFullscreen();
     state.workspaceGeneration += 1;
@@ -4543,6 +4624,10 @@
 
   async function runHardwareIndex() {
     if (hardwareIndexUiIsActive()) return;
+    if (goalWorkflowOwnsSubmissions()) {
+      toast("Goal workflow is active", "Pause or exit the automated flow before starting a CWI action.", "warning", 7000);
+      return;
+    }
     if (document.activeElement?.closest?.('[data-command="run-hardware-index"]')) state.hardwareIndex.restoreFocus = true;
     const connection = activeConnection();
     if (!connection) return;
@@ -6537,6 +6622,63 @@
       </section>`;
   }
 
+  function plannerGoalWorkflowFingerprint(context) {
+    const workflow = state.goalWorkflow;
+    return JSON.stringify([
+      workflow?.id || "",
+      workflow?.status || "",
+      goalWorkflowCompletedCount(workflow),
+      Boolean(state.goalWorkflowPreparing),
+      connectionStatus(activeConnection()?.id).state,
+      hardwareIndexUiIsActive(),
+      context?.result?.status || "",
+      context?.result?.steps?.length || 0,
+      context?.result?.goal?.classId || "",
+    ]);
+  }
+
+  function plannerGoalWorkflowMarkup(context) {
+    const result = context?.result;
+    const workflow = state.goalWorkflow;
+    const blockingWorkflow = goalWorkflowBlocksNewPlan(workflow);
+    const online = connectionStatus(activeConnection()?.id).state === "online";
+    const fingerprint = escapeHtml(plannerGoalWorkflowFingerprint(context));
+    if (blockingWorkflow) {
+      const completed = goalWorkflowCompletedCount(workflow);
+      return `
+        <section class="planner-workflow-launch is-active" data-goal-workflow-launch data-goal-workflow-fingerprint="${fingerprint}" aria-label="Goal workflow">
+          <div><span>Action flow</span><strong>${escapeHtml(goalWorkflowStatusLabel(workflow))}</strong><small>${escapeHtml(workflow.goal?.label || "Goal")} / ${completed} of ${workflow.steps.length} actions verified</small></div>
+          <button class="game-button game-button-primary" type="button" data-command="manage-goal-workflow">Open workflow</button>
+        </section>`;
+    }
+    if (state.goalWorkflowPreparing) {
+      return `
+        <section class="planner-workflow-launch" data-goal-workflow-launch data-goal-workflow-fingerprint="${fingerprint}" aria-label="Goal workflow" aria-busy="true">
+          <div><span>Action flow</span><strong>Refreshing live plan</strong><small>Rechecking the selected Driver before the workflow is frozen.</small></div>
+          <button class="game-button game-button-primary" type="button" disabled>Preparing...</button>
+        </section>`;
+    }
+    if (result?.status === "planned" && result.steps?.length) {
+      const disabled = !online || hardwareIndexUiIsActive();
+      const reason = !online
+        ? "The selected Driver must be online."
+        : hardwareIndexUiIsActive()
+          ? "Wait for the CWI action to finish before starting an automated flow."
+          : "Open a preflight manager, then press Play to submit the action set one step at a time.";
+      return `
+        <section class="planner-workflow-launch" data-goal-workflow-launch data-goal-workflow-fingerprint="${fingerprint}" aria-label="Goal workflow">
+          <div><span>Action flow</span><strong>Run this plan</strong><small>${escapeHtml(reason)}</small></div>
+          <button class="game-button game-button-primary" type="button" data-command="prepare-goal-workflow"${disabled ? " disabled" : ""}><span aria-hidden="true">&#9654;</span> <span>Run action set</span></button>
+        </section>`;
+    }
+    const satisfied = result?.status === "satisfied";
+    return `
+      <section class="planner-workflow-launch is-disabled" data-goal-workflow-launch data-goal-workflow-fingerprint="${fingerprint}" aria-label="Goal workflow">
+        <div><span>Action flow</span><strong>${satisfied ? "Goal already available" : "No executable flow"}</strong><small>${satisfied ? "This plan needs no Driver actions." : "Resolve the planner diagnostics before starting a workflow."}</small></div>
+        <button class="game-button" type="button" disabled>${satisfied ? "Already complete" : "Flow unavailable"}</button>
+      </section>`;
+  }
+
   function plannerResultMarkup(context) {
     if (context.error) return `<div class="terminal-note error" role="alert">${escapeHtml(context.error)}</div>`;
     const result = context.result;
@@ -6641,6 +6783,7 @@
         <div class="planner-summary-item"><span>Action set</span><strong>${result.totals.actionCount}</strong><small>${escapeHtml(actionSetBasis)}</small></div>
         <div class="planner-summary-item"><span>Grounding</span><strong>${cwi ? `${HARDWARE_INDEX_LABEL} ${formatProofDuration(cwi.durationMs)}` : "No CWI"}</strong><small>${escapeHtml(groundingNote)}</small>${cwiControl}</div>
       </div>
+      ${plannerGoalWorkflowMarkup(context)}
       ${inventorySatisfiedNote}
       <div class="planner-flow-key" aria-label="Plan relationship legend"><span><i class="planner-key-input" aria-hidden="true"></i>USE / consumed input</span><span><i class="planner-key-output" aria-hidden="true"></i>MAKE / created output</span><span><i class="planner-key-update" aria-hidden="true"></i>UPDATE / paired turnover</span>${inventoryKey}${hasMissingBranches ? '<span><i class="planner-key-missing" aria-hidden="true"></i>MISSING / unresolved prerequisite</span>' : ""}<span class="work-gate-key"><b class="gate-symbol" aria-hidden="true">⛏</b>PoW <b class="gate-symbol" aria-hidden="true">⌛</b>VDF <small><i class="gate-tone is-green" aria-hidden="true"></i>low <i class="gate-tone is-yellow" aria-hidden="true"></i>mid/? <i class="gate-tone is-red" aria-hidden="true"></i>high</small></span><span>${escapeHtml(treeGuide)}</span></div>
       ${plannerTreeSvg(tree, timingByStep, context.cartridge.name)}
@@ -7535,7 +7678,8 @@
     const submissionKey = actionSubmissionKey(activeConnection(), action, model.selections);
     const submissionInFlight = state.inFlightActionSubmissions.has(submissionKey);
     const outcomeUnknown = model.outcomeUnknown || state.ambiguousActionSubmissions.has(submissionKey);
-    const submissionLocked = submissionInFlight || outcomeUnknown;
+    const workflowLocked = goalWorkflowOwnsSubmissions();
+    const submissionLocked = submissionInFlight || outcomeUnknown || workflowLocked;
     const used = new Set(model.selections.filter(Boolean));
     const slots = (action.totalInputs || []).map((required, index) => {
       const usedElsewhere = new Set([...used].filter((fileName) => fileName !== model.selections[index]));
@@ -7573,7 +7717,7 @@
         <p class="screen-copy">${escapeHtml(action.description || "")}</p>
         ${model.loading ? '<div class="terminal-note">Checking feasibility with the Driver...</div>' : ""}
         ${model.error ? `<div class="terminal-note error">${escapeHtml(model.error)}</div>` : ""}
-        <div data-action-submit-error aria-live="polite" aria-atomic="true">${model.submitError ? `<div class="terminal-note ${outcomeUnknown ? "warning" : "error"}" tabindex="-1">${escapeHtml(model.submitError)}</div>` : outcomeUnknown ? '<div class="terminal-note warning" tabindex="-1">A matching submission had an unknown outcome in this browser session. Review Activity before retrying; choose different input objects or reload only after you have reconciled the prior request.</div>' : submissionInFlight ? '<div class="terminal-note" tabindex="-1">A matching request is already in flight in this browser session. You can close this drawer safely; duplicate submission remains locked.</div>' : ""}</div>
+        <div data-action-submit-error aria-live="polite" aria-atomic="true">${model.submitError ? `<div class="terminal-note ${outcomeUnknown ? "warning" : "error"}" tabindex="-1">${escapeHtml(model.submitError)}</div>` : outcomeUnknown ? '<div class="terminal-note warning" tabindex="-1">A matching submission had an unknown outcome in this browser session. Review Activity before retrying; choose different input objects or reload only after you have reconciled the prior request.</div>' : submissionInFlight ? '<div class="terminal-note" tabindex="-1">A matching request is already in flight in this browser session. You can close this drawer safely; duplicate submission remains locked.</div>' : workflowLocked ? '<div class="terminal-note warning">A Goal Planner workflow currently owns sequential Driver submissions. Pause or exit that flow before running a manual action.</div>' : ""}</div>
         <form id="action-run-form" class="game-form">
           ${(action.totalInputs || []).length ? slots : '<div class="terminal-note">This action requires no input objects.</div>'}
           ${showProofRequirements ? actionProofRequirementsMarkup(action) : ""}
@@ -7587,7 +7731,7 @@
           <div class="terminal-note warning">Submitting starts a state-changing action directly on the selected Driver. If the browser loses the response, check Activity before retrying.</div>
           <div data-action-submit-meter aria-live="polite" aria-atomic="true">${model.submitting ? runSubmissionProgressMarkup() : ""}</div>
           <div class="game-form-actions">
-            <button id="action-run-submit" class="game-button game-button-primary" type="submit"${canRun ? "" : " disabled"}>${model.submitting ? "Starting..." : outcomeUnknown ? "Session safety lock" : submissionInFlight ? "Request in flight" : "Run action"}</button>
+            <button id="action-run-submit" class="game-button game-button-primary" type="submit"${canRun ? "" : " disabled"}>${model.submitting ? "Starting..." : outcomeUnknown ? "Session safety lock" : submissionInFlight ? "Request in flight" : workflowLocked ? "Workflow active" : "Run action"}</button>
           </div>
         </form>
         ${renderActionTechTreePortal(action, { canRun, loading: model.loading, error: Boolean(model.error), feasible: model.report?.feasible })}
@@ -7597,6 +7741,10 @@
   async function submitActionRun() {
     const model = state.drawer;
     if (model?.type !== "action" || model.submitting) return;
+    if (goalWorkflowOwnsSubmissions()) {
+      toast("Goal workflow is active", "Pause or exit the automated flow before starting a manual action.", "warning", 7000);
+      return;
+    }
     const action = actionByKey(model.key);
     const connection = activeConnection();
     const generation = state.workspaceGeneration;
@@ -7705,6 +7853,1266 @@
         });
       }
     }
+  }
+
+  const GOAL_WORKFLOW_BLOCKING_STATUSES = new Set([
+    "ready",
+    "running",
+    "pausing",
+    "paused",
+    "error",
+    "needs-review",
+    "stopping",
+  ]);
+  const GOAL_WORKFLOW_AUTOMATION_STATUSES = new Set(["running", "pausing", "stopping"]);
+
+  function goalWorkflowBlocksNewPlan(workflow = state.goalWorkflow) {
+    return Boolean(workflow && GOAL_WORKFLOW_BLOCKING_STATUSES.has(workflow.status));
+  }
+
+  function goalWorkflowAutomationActive(workflow = state.goalWorkflow) {
+    return Boolean(workflow && GOAL_WORKFLOW_AUTOMATION_STATUSES.has(workflow.status));
+  }
+
+  function goalWorkflowOwnedByOtherTab(workflow = state.goalWorkflow) {
+    return Boolean(
+      workflow &&
+      goalWorkflowAutomationActive(workflow) &&
+      workflow.ownerTabId !== state.goalWorkflowTabId &&
+      !state.goalWorkflowLoopPromise
+    );
+  }
+
+  function goalWorkflowOwnsSubmissions(workflow = state.goalWorkflow) {
+    if (!workflow) return false;
+    if (goalWorkflowAutomationActive(workflow) || workflow.status === "needs-review") return true;
+    const current = goalWorkflowCurrentStepState(workflow);
+    return Boolean(current && new Set(["submitting", "running", "verifying", "needs-review"]).has(current.status));
+  }
+
+  function goalWorkflowCompletedCount(workflow = state.goalWorkflow) {
+    return workflow?.stepStates?.filter((step) => step.status === "complete").length || 0;
+  }
+
+  function goalWorkflowCurrentStepState(workflow = state.goalWorkflow) {
+    return workflow?.stepStates?.[workflow.currentStepIndex] || null;
+  }
+
+  function goalWorkflowCurrentStep(workflow = state.goalWorkflow) {
+    return workflow?.steps?.[workflow.currentStepIndex] || null;
+  }
+
+  function goalWorkflowStatusLabel(workflow = state.goalWorkflow) {
+    if (!workflow) return "No workflow";
+    if (goalWorkflowOwnedByOtherTab(workflow)) return "Active in another tab";
+    return ({
+      ready: "Ready to play",
+      running: "Running",
+      pausing: "Pausing after step",
+      paused: "Paused",
+      error: "Action stopped",
+      "needs-review": "Review required",
+      stopping: "Stopping after step",
+      stopped: "Exited",
+      complete: "Goal complete",
+    })[workflow.status] || workflow.status || "Unknown";
+  }
+
+  function goalWorkflowElapsedMilliseconds(workflow = state.goalWorkflow) {
+    const started = new Date(workflow?.startedAt || 0).valueOf();
+    if (!Number.isFinite(started) || started <= 0) return 0;
+    const ended = new Date(workflow?.completedAt || workflow?.stoppedAt || 0).valueOf();
+    return Math.max(0, (Number.isFinite(ended) && ended > 0 ? ended : Date.now()) - started);
+  }
+
+  function goalWorkflowRemainingMilliseconds(workflow = state.goalWorkflow) {
+    if (!workflow?.steps?.length) return 0;
+    let total = 0;
+    for (let index = workflow.currentStepIndex; index < workflow.steps.length; index += 1) {
+      const rawValue = workflow.steps[index]?.estimatedMilliseconds;
+      if (rawValue == null || rawValue === "") return null;
+      const value = Number(rawValue);
+      if (!Number.isFinite(value) || value < 0) return null;
+      total += value;
+    }
+    return total;
+  }
+
+  function goalWorkflowRunIds(workflow = state.goalWorkflow) {
+    return new Set((workflow?.stepStates || []).map((step) => step.runId).filter(Boolean));
+  }
+
+  function compactGoalWorkflowRun(run) {
+    if (!run) return null;
+    const progress = Array.isArray(run.progress) ? run.progress.slice(-8) : [];
+    return {
+      runId: String(run.runId || ""),
+      action: run.action || null,
+      status: String(run.status || "queued"),
+      result: run.result || null,
+      error: run.error || null,
+      progress,
+    };
+  }
+
+  function updateGoalWorkflowHud() {
+    const button = byId("workflow-monitor");
+    if (!button) return;
+    const workflow = state.goalWorkflow;
+    button.hidden = !workflow;
+    if (!workflow) return;
+    const completed = goalWorkflowCompletedCount(workflow);
+    const label = byId("workflow-monitor-label");
+    const icon = button.querySelector(".workflow-hud-icon");
+    const iconByStatus = {
+      ready: "\u25b7",
+      running: "\u25b6",
+      pausing: "\u2016",
+      paused: "\u2016",
+      error: "!",
+      "needs-review": "!",
+      stopping: "\u25a0",
+      stopped: "\u25a0",
+      complete: "\u2713",
+    };
+    if (icon) icon.textContent = iconByStatus[workflow.status] || "\u25b7";
+    if (label) label.textContent = workflow.status === "complete"
+      ? "Goal ready"
+      : new Set(["error", "needs-review"]).has(workflow.status)
+        ? "Flow alert"
+        : workflow.status === "paused"
+          ? `Paused ${completed}/${workflow.steps.length}`
+          : `Flow ${completed}/${workflow.steps.length}`;
+    button.dataset.workflowStatus = workflow.status;
+    button.classList.toggle("is-alert", new Set(["error", "needs-review"]).has(workflow.status));
+    button.classList.toggle("is-complete", workflow.status === "complete");
+    const description = `${goalWorkflowStatusLabel(workflow)}. ${workflow.goal?.label || "Goal"}. ${completed} of ${workflow.steps.length} actions verified.`;
+    button.setAttribute("aria-label", `Open goal workflow monitor. ${description}`);
+    button.title = description;
+  }
+
+  function patchGoalWorkflowLauncher() {
+    if (state.screen !== "planner") return;
+    const launch = main.querySelector("[data-goal-workflow-launch]");
+    if (!launch) return;
+    const context = plannerContext(selectedCartridge(), { reuseResult: true });
+    if (launch.dataset.goalWorkflowFingerprint === plannerGoalWorkflowFingerprint(context)) return;
+    const focusToken = captureFocus(launch);
+    const drawerReturnToken = launch.contains(state.drawerReturnFocus)
+      ? focusTokenForElement(state.drawerReturnFocus)
+      : null;
+    launch.outerHTML = plannerGoalWorkflowMarkup(context);
+    const replacement = main.querySelector("[data-goal-workflow-launch]");
+    if (drawerReturnToken) {
+      state.drawerReturnFocus = findCapturedFocus(replacement, drawerReturnToken)
+        || replacement?.querySelector("button:not(:disabled)")
+        || byId("workflow-monitor");
+    }
+    if (focusToken) {
+      requestAnimationFrame(() => {
+        const target = findCapturedFocus(replacement, focusToken)
+          || replacement?.querySelector("button:not(:disabled)");
+        target?.focus({ preventScroll: true });
+      });
+    }
+  }
+
+  function notifyGoalWorkflowChange(options = {}) {
+    updateGoalWorkflowHud();
+    if (options.structure !== false) patchGoalWorkflowLauncher();
+    patchGoalWorkflowDrawer();
+  }
+
+  function persistGoalWorkflow(required = false) {
+    const workflow = state.goalWorkflow;
+    try {
+      if (workflow) {
+        workflow.revision = Math.max(0, Number(workflow.revision) || 0) + 1;
+        workflow.updatedAt = new Date().toISOString();
+        localStorage.setItem(GOAL_WORKFLOW_STORAGE_KEY, JSON.stringify(workflow));
+      } else {
+        localStorage.removeItem(GOAL_WORKFLOW_STORAGE_KEY);
+      }
+      notifyGoalWorkflowChange();
+      return true;
+    } catch (error) {
+      notifyGoalWorkflowChange();
+      if (required) {
+        throw new Error(`The workflow recovery checkpoint could not be saved, so no new action was sent. ${error.message}`);
+      }
+      toast("Workflow checkpoint not saved", error.message, "error", 9000);
+      return false;
+    }
+  }
+
+  function readGoalWorkflowStorageRecord() {
+    const raw = localStorage.getItem(GOAL_WORKFLOW_STORAGE_KEY);
+    if (!raw) return null;
+    const record = JSON.parse(raw);
+    return record && record.version === GOAL_WORKFLOW_VERSION && record.id ? record : null;
+  }
+
+  function adoptPersistedGoalWorkflow(recoverInterrupted = false) {
+    state.goalWorkflow = loadGoalWorkflowSnapshot({ recoverInterrupted });
+    notifyGoalWorkflowChange();
+    return state.goalWorkflow;
+  }
+
+  function assertNoPersistedBlockingWorkflow() {
+    const persisted = readGoalWorkflowStorageRecord();
+    if (!persisted || !GOAL_WORKFLOW_BLOCKING_STATUSES.has(persisted.status)) return;
+    const adopted = adoptPersistedGoalWorkflow();
+    throw new Error(
+      adopted
+        ? `A saved ${goalWorkflowStatusLabel(adopted).toLowerCase()} workflow already owns this console. Open its monitor before preparing another plan.`
+        : "Another tab saved an active workflow. Reload this console before preparing another plan.",
+    );
+  }
+
+  function plannerRefSnapshot(ref) {
+    return {
+      class: {
+        pluginName: String(ref?.class?.pluginName || ""),
+        name: String(ref?.class?.name || ""),
+      },
+      hash: String(ref?.hash || ""),
+    };
+  }
+
+  function createGoalWorkflowSnapshot(context, connection) {
+    const result = context?.result;
+    if (result?.status !== "planned" || !result.steps?.length) {
+      throw new Error("The refreshed goal does not have an executable action set.");
+    }
+    const timingByStep = new Map();
+    const steps = result.steps.map((step) => {
+      const normalized = context.catalog?.actionById?.get(step.actionId);
+      if (!normalized?.raw || normalized.id !== step.actionId) {
+        throw new Error(`The exact action version for ${step.label} is no longer installed.`);
+      }
+      const timing = estimateActionProofTiming(normalized.raw);
+      timingByStep.set(step.id, timing);
+      return {
+        id: step.id,
+        index: step.index,
+        order: step.order,
+        actionId: step.actionId,
+        actionKey: step.actionKey,
+        action: {
+          pluginName: normalized.qualified.pluginName,
+          name: normalized.qualified.name,
+        },
+        actionHash: normalized.hash,
+        label: step.label,
+        emoji: step.emoji,
+        inputs: step.inputs.map((input) => ({
+          tokenId: input.tokenId,
+          classId: input.classId,
+          slotIndex: input.slotIndex,
+          classLabel: input.classLabel,
+          sourceKind: input.sourceKind,
+          sourceStepId: input.sourceStepId || null,
+          fileName: input.fileName || null,
+          contentHash: input.contentHash || null,
+        })),
+        outputs: step.outputs.map((output) => ({
+          tokenId: output.tokenId,
+          classId: output.classId,
+          slotIndex: output.slotIndex,
+          classLabel: output.classLabel,
+          sourceKind: output.sourceKind,
+          sourceStepId: output.sourceStepId || null,
+        })),
+        totalInputs: (normalized.raw.totalInputs || []).map(plannerRefSnapshot),
+        totalOutputs: (normalized.raw.totalOutputs || []).map(plannerRefSnapshot),
+        warnings: [...(step.warnings || [])],
+        estimatedMilliseconds: timing.totalMilliseconds,
+        estimateLowerBound: timing.lowerBound,
+      };
+    });
+    const totalTiming = plannerTimingSummary(result.steps.map((step) => step.id), timingByStep);
+    const tokenBindings = {};
+    for (const token of result.tokens || []) {
+      if (token.kind !== "inventory") continue;
+      tokenBindings[token.tokenId] = {
+        tokenId: token.tokenId,
+        classId: token.classId,
+        fileName: token.fileName || "",
+        contentHash: token.contentHash || "",
+      };
+    }
+    const now = new Date().toISOString();
+    if (!(result.goalTokenIds || []).length) {
+      throw new Error("The refreshed plan did not materialize a final goal token.");
+    }
+    return {
+      version: GOAL_WORKFLOW_VERSION,
+      id: newId("goal-flow"),
+      status: "ready",
+      connection: {
+        id: connection.id,
+        name: connection.name,
+        driverUrl: connection.driverUrl,
+      },
+      driverVersion: String(state.workspace.health?.version || ""),
+      cartridgeId: context.cartridge.id,
+      cartridgeName: context.cartridge.name,
+      goal: {
+        classId: result.goal.classId,
+        label: result.goal.label,
+        hash: result.goal.hash,
+        quantity: result.goal.quantity,
+        semantics: result.goal.semantics,
+        initialCount: result.goal.initialCount,
+        targetCount: result.goal.targetCount,
+      },
+      goalTokenIds: [...(result.goalTokenIds || [])],
+      steps,
+      stepStates: steps.map((step) => ({
+        stepId: step.id,
+        status: "pending",
+        runId: "",
+        runStatus: "",
+        runSnapshot: null,
+        inputObjectPaths: [],
+        outputFiles: [],
+        startedAt: "",
+        completedAt: "",
+        error: "",
+        retryable: true,
+        outcomeUnknown: false,
+      })),
+      tokenBindings,
+      currentStepIndex: 0,
+      estimatedTotalMilliseconds: totalTiming.knownCount === steps.length ? totalTiming.knownMilliseconds : null,
+      estimateComplete: totalTiming.complete,
+      pauseRequested: false,
+      exitRequested: false,
+      recoveryRequired: false,
+      ownerTabId: "",
+      message: "Review the preflight, then press Play to begin sequential Driver submissions.",
+      error: "",
+      createdAt: now,
+      updatedAt: now,
+      startedAt: "",
+      completedAt: "",
+      stoppedAt: "",
+    };
+  }
+
+  function openGoalWorkflowManager() {
+    if (!state.goalWorkflow) {
+      toast("No saved workflow", "Build an action set in Goal Planner first.", "warning");
+      return;
+    }
+    const fallbackReturnFocus = main.querySelector("[data-goal-workflow-launch] button:not(:disabled)")
+      || byId("workflow-monitor");
+    state.drawer = { type: "workflow" };
+    openDrawer();
+    if (
+      !state.drawerReturnFocus ||
+      !state.drawerReturnFocus.isConnected ||
+      state.drawerReturnFocus === document.body ||
+      state.drawerReturnFocus === document.documentElement
+    ) {
+      state.drawerReturnFocus = fallbackReturnFocus;
+    }
+    renderDrawer();
+  }
+
+  function goalWorkflowLockName(connection) {
+    return `don-goal-workflow:${normalizedDriverUrl(connection?.driverUrl)}`;
+  }
+
+  async function recoverInterruptedGoalWorkflowAtStartup() {
+    const initial = state.goalWorkflow;
+    if (!goalWorkflowAutomationActive(initial)) return;
+    if (!globalThis.navigator?.locks?.request) {
+      initial.message = "A saved workflow may still be active in another tab. Safe takeover requires browser Web Locks; manage it in its owning tab.";
+      notifyGoalWorkflowChange();
+      return;
+    }
+    const initialId = initial.id;
+    try {
+      await navigator.locks.request(goalWorkflowLockName(initial.connection), { ifAvailable: true }, async (lock) => {
+        if (!lock) {
+          notifyGoalWorkflowChange();
+          return;
+        }
+        const persisted = readGoalWorkflowStorageRecord();
+        if (!persisted) {
+          state.goalWorkflow = null;
+          notifyGoalWorkflowChange();
+          return;
+        }
+        if (persisted.id !== initialId || !goalWorkflowAutomationActive(persisted)) {
+          state.goalWorkflow = loadGoalWorkflowSnapshot({ recoverInterrupted: false });
+          notifyGoalWorkflowChange();
+          return;
+        }
+        const recovered = loadGoalWorkflowSnapshot();
+        if (!recovered || recovered.id !== initialId) {
+          state.goalWorkflow = recovered;
+          notifyGoalWorkflowChange();
+          return;
+        }
+        recovered.ownerTabId = "";
+        state.goalWorkflow = recovered;
+        persistGoalWorkflow(true);
+        toast(
+          "Workflow recovered",
+          recovered.status === "paused"
+            ? "The prior tab released its Driver lock. The flow is paused and will not submit until you resume it."
+            : recovered.message,
+          recovered.status === "needs-review" ? "warning" : "success",
+          8000,
+        );
+      });
+    } catch (error) {
+      if (state.goalWorkflow?.id === initialId) {
+        state.goalWorkflow.message = `Safe workflow recovery could not be checked. No action was submitted. ${error.message}`;
+        notifyGoalWorkflowChange();
+      }
+    }
+  }
+
+  async function prepareGoalWorkflow() {
+    if (goalWorkflowBlocksNewPlan()) {
+      openGoalWorkflowManager();
+      return;
+    }
+    if (state.goalWorkflowPreparing) return;
+    const connection = activeConnection();
+    const cartridge = selectedCartridge();
+    const generation = state.workspaceGeneration;
+    if (!connection || !cartridge || connectionStatus(connection.id).state !== "online") {
+      toast("Workflow unavailable", "Choose an online Driver and cartridge first.", "error");
+      return;
+    }
+    if (hardwareIndexUiIsActive()) {
+      toast("CWI action is active", "Wait for the benchmark action to settle before starting a workflow.", "warning");
+      return;
+    }
+    try {
+      assertNoPersistedBlockingWorkflow();
+    } catch (error) {
+      toast("Workflow already active", error.message, "warning", 8500);
+      if (state.goalWorkflow) openGoalWorkflowManager();
+      return;
+    }
+    state.goalWorkflowPreparing = true;
+    patchGoalWorkflowLauncher();
+    const previousWorkflow = state.goalWorkflow;
+    let createdWorkflowId = "";
+    try {
+      const prepareWhileLocked = async (lock) => {
+        if (!lock && globalThis.navigator?.locks) {
+          throw new Error("Another browser tab currently owns this Driver workflow. Open that tab or wait for it to finish.");
+        }
+        assertNoPersistedBlockingWorkflow();
+        const refreshed = await refreshCatalogAndObjects(connection, generation);
+        if (
+          !refreshed ||
+          !isCurrentWorkspace(connection, generation) ||
+          activeCartridgeId() !== cartridge.id
+        ) throw new Error("The selected Driver or cartridge changed while the workflow was being prepared.");
+        const context = plannerContext(selectedCartridge(), { reuseResult: false });
+        if (context.error) throw new Error(context.error);
+        const workflow = createGoalWorkflowSnapshot(context, connection);
+        assertNoPersistedBlockingWorkflow();
+        createdWorkflowId = workflow.id;
+        state.goalWorkflow = workflow;
+        persistGoalWorkflow(true);
+        return workflow;
+      };
+      const workflow = globalThis.navigator?.locks?.request
+        ? await navigator.locks.request(goalWorkflowLockName(connection), { ifAvailable: true }, prepareWhileLocked)
+        : await prepareWhileLocked({ name: goalWorkflowLockName(connection) });
+      if (!workflow) throw new Error("The workflow preparation lock was not available.");
+      openGoalWorkflowManager();
+      toast("Workflow ready", `${workflow.steps.length} actions frozen for ${workflow.goal.label}. Press Play when ready.`, "success", 6500);
+    } catch (error) {
+      if (state.goalWorkflow?.id === createdWorkflowId || !goalWorkflowBlocksNewPlan(state.goalWorkflow)) {
+        state.goalWorkflow = previousWorkflow;
+      }
+      notifyGoalWorkflowChange();
+      toast("Workflow was not prepared", error.message, "error", 9000);
+    } finally {
+      state.goalWorkflowPreparing = false;
+      patchGoalWorkflowLauncher();
+    }
+  }
+
+  function goalWorkflowError(message, options = {}) {
+    const error = new Error(message);
+    error.workflowNeedsReview = Boolean(options.needsReview);
+    error.workflowRetryable = options.retryable !== false;
+    return error;
+  }
+
+  function goalWorkflowContextError(workflow = state.goalWorkflow) {
+    const connection = activeConnection();
+    if (
+      !connection ||
+      connection.id !== workflow?.connection?.id ||
+      normalizedDriverUrl(connection.driverUrl) !== normalizedDriverUrl(workflow?.connection?.driverUrl)
+    ) return `Switch back to ${workflow?.connection?.name || "the workflow Driver"} before continuing.`;
+    if (activeCartridgeId() !== workflow.cartridgeId) {
+      return `Select the ${workflow.cartridgeName || workflow.cartridgeId} cartridge before continuing.`;
+    }
+    if (connectionStatus(connection.id).state !== "online") return "The workflow Driver is offline.";
+    if (state.workspace.connectionId !== connection.id || state.workspace.loading) {
+      return "Wait for the selected Driver workspace to finish loading.";
+    }
+    if (hardwareIndexUiIsActive()) return "Wait for the CWI action to finish before continuing this flow.";
+    return "";
+  }
+
+  function workflowRefsMatch(actual, expected) {
+    if (!Array.isArray(actual) || !Array.isArray(expected) || actual.length !== expected.length) return false;
+    return actual.every((ref, index) => classRefKey(ref) === classRefKey(expected[index]));
+  }
+
+  function applyGoalWorkflowDriverSnapshot(workflow, snapshot) {
+    const current = activeConnection();
+    if (
+      !current ||
+      current.id !== workflow.connection.id ||
+      normalizedDriverUrl(current.driverUrl) !== normalizedDriverUrl(workflow.connection.driverUrl) ||
+      state.workspace.connectionId !== current.id
+    ) return;
+    state.workspace.health = snapshot.health;
+    state.workspace.actions = snapshot.actions;
+    state.workspace.objects = snapshot.objects;
+    delete state.workspace.errors.health;
+    delete state.workspace.errors.actions;
+    delete state.workspace.errors.objects;
+    state.statuses.set(current.id, {
+      state: snapshot.health?.ok === false ? "offline" : "online",
+      checkedAt: new Date(),
+      health: snapshot.health,
+      error: null,
+    });
+    scheduleLivePatch({ catalog: true });
+    updateHeader();
+  }
+
+  async function fetchGoalWorkflowDriverSnapshot(workflow) {
+    const connection = workflow.connection;
+    const [health, actions, objects] = await Promise.all([
+      driverRequest(connection, "/healthz", { timeout: 8000 }),
+      driverRequest(connection, "/actions", { timeout: 15000 }),
+      driverRequest(connection, "/objects", { timeout: 30000 }),
+    ]);
+    if (!Array.isArray(actions) || !Array.isArray(objects)) {
+      throw goalWorkflowError("The Driver returned an incompatible action catalog or object inventory.", { retryable: true });
+    }
+    if (health?.ok === false) throw goalWorkflowError("The Driver reported that it is not ready.", { retryable: true });
+    if (workflow.driverVersion && health?.version && String(health.version) !== workflow.driverVersion) {
+      throw goalWorkflowError(
+        `The Driver version changed from ${workflow.driverVersion} to ${health.version}. Replan before submitting another action.`,
+        { retryable: false },
+      );
+    }
+    const snapshot = { health, actions, objects };
+    applyGoalWorkflowDriverSnapshot(workflow, snapshot);
+    return snapshot;
+  }
+
+  function workflowObjectForBinding(objects, binding) {
+    if (!binding?.contentHash && !binding?.fileName) return null;
+    return objects.find((object) =>
+      (!binding.contentHash || object.contentHash === binding.contentHash) &&
+      (!binding.fileName || object.fileName === binding.fileName)) || null;
+  }
+
+  function workflowObjectClassId(object) {
+    return classRefKey({ class: object?.class, hash: object?.classHash });
+  }
+
+  function goalWorkflowUnrelatedActiveRun(workflow) {
+    if (state.workspace.connectionId !== workflow.connection.id) return null;
+    const owned = goalWorkflowRunIds(workflow);
+    return [...state.workspace.runs.values()].find(
+      (run) => run?.runId && !owned.has(run.runId) && !TERMINAL_RUNS.has(run.status),
+    ) || null;
+  }
+
+  async function preflightGoalWorkflowStep(workflow, step, stepState) {
+    const contextError = goalWorkflowContextError(workflow);
+    if (contextError) throw goalWorkflowError(contextError, { retryable: true });
+    const unrelatedRun = goalWorkflowUnrelatedActiveRun(workflow);
+    if (unrelatedRun) {
+      throw goalWorkflowError(
+        `Driver run ${shortText(unrelatedRun.runId)} is still active outside this workflow. Wait for it to finish, then retry the live check.`,
+        { retryable: true },
+      );
+    }
+    stepState.status = "preflight";
+    stepState.error = "";
+    workflow.error = "";
+    workflow.message = `Checking exact action and token bindings for step ${step.order}: ${step.label}.`;
+    persistGoalWorkflow();
+    const snapshot = await fetchGoalWorkflowDriverSnapshot(workflow);
+    const action = snapshot.actions.find((candidate) => plannerActionId(candidate) === step.actionId);
+    if (!action || action.hash !== step.actionHash || !sameQualified(action.action, step.action)) {
+      throw goalWorkflowError(
+        `${step.label} no longer matches the action hash frozen in this plan. Rebuild the plan from the live catalog.`,
+        { retryable: false },
+      );
+    }
+    if (!workflowRefsMatch(action.totalInputs || [], step.totalInputs) || !workflowRefsMatch(action.totalOutputs || [], step.totalOutputs)) {
+      throw goalWorkflowError(
+        `${step.label} changed its flattened input or output slots. Rebuild the plan before continuing.`,
+        { retryable: false },
+      );
+    }
+    const orderedInputs = [...step.inputs].sort((left, right) => left.slotIndex - right.slotIndex);
+    if (orderedInputs.length !== (action.totalInputs || []).length) {
+      throw goalWorkflowError(`${step.label} has an incomplete materialized input map. Replan this goal.`, { retryable: false });
+    }
+    const objects = [];
+    for (const input of orderedInputs) {
+      const binding = workflow.tokenBindings[input.tokenId];
+      if (!binding) {
+        throw goalWorkflowError(`The planned ${input.classLabel} input is not bound to a verified object. Replan from live inventory.`, { retryable: false });
+      }
+      const object = workflowObjectForBinding(snapshot.objects, binding);
+      if (!object || object.status !== "live" || workflowObjectClassId(object) !== input.classId) {
+        throw goalWorkflowError(
+          `${input.classLabel} for input slot ${input.slotIndex + 1} is no longer live at the exact planned class version.`,
+          { retryable: true },
+        );
+      }
+      if (!binding.fileName) binding.fileName = object.fileName || "";
+      if (!binding.contentHash) binding.contentHash = object.contentHash || "";
+      binding.classId = input.classId;
+      objects.push(object);
+    }
+    const inputObjectPaths = objects.map((object) => object.fileName);
+    if (inputObjectPaths.some((fileName) => !fileName) || new Set(inputObjectPaths).size !== inputObjectPaths.length) {
+      throw goalWorkflowError(`${step.label} could not resolve distinct file paths for every input slot.`, { retryable: true });
+    }
+    const report = await driverRequest(
+      workflow.connection,
+      `/actions/${encodeURIComponent(step.actionKey)}/feasibility`,
+      { timeout: 15000 },
+    );
+    const available = new Set((report?.availableInputs || []).map((candidate) => candidate.fileName));
+    if (report?.feasible !== true || inputObjectPaths.some((fileName) => !available.has(fileName))) {
+      throw goalWorkflowError(
+        `${step.label} is not feasible with the exact objects reserved by this plan. Refresh inventory or replan before retrying.`,
+        { retryable: true },
+      );
+    }
+    stepState.inputObjectPaths = inputObjectPaths;
+    persistGoalWorkflow(true);
+    return { action, inputObjectPaths };
+  }
+
+  function mergeGoalWorkflowRun(workflow, run) {
+    const current = activeConnection();
+    if (
+      current?.id !== workflow.connection.id ||
+      normalizedDriverUrl(current.driverUrl) !== normalizedDriverUrl(workflow.connection.driverUrl) ||
+      state.workspace.connectionId !== current.id
+    ) return;
+    if (mergeRun(run)) scheduleLivePatch({ activity: true, runId: run.runId });
+  }
+
+  async function waitForGoalWorkflowRun(workflow, step, stepState, token) {
+    let pollErrors = 0;
+    let checkpointFingerprint = "";
+    while (token === state.goalWorkflowLoopToken && state.goalWorkflow?.id === workflow.id) {
+      try {
+        const run = await driverRequest(
+          workflow.connection,
+          `/actions/runs/${encodeURIComponent(stepState.runId)}`,
+          { timeout: 10000 },
+        );
+        pollErrors = 0;
+        if (!run?.runId || run.runId !== stepState.runId) {
+          throw goalWorkflowError("The Driver returned a mismatched retained run while this step was being tracked.", { needsReview: true, retryable: false });
+        }
+        mergeGoalWorkflowRun(workflow, run);
+        stepState.runStatus = String(run.status || "queued");
+        stepState.runSnapshot = compactGoalWorkflowRun(run);
+        const latest = Array.isArray(run.progress) && run.progress.length ? run.progress[run.progress.length - 1] : null;
+        const fingerprint = JSON.stringify([run.status, latest?.phase || "", latest?.status || "", latest?.message || ""]);
+        workflow.message = latest?.message || `Driver run ${shortText(run.runId)} is ${run.status || "active"}.`;
+        if (fingerprint !== checkpointFingerprint || TERMINAL_RUNS.has(run.status)) {
+          checkpointFingerprint = fingerprint;
+          persistGoalWorkflow();
+        } else {
+          notifyGoalWorkflowChange({ structure: false });
+        }
+        if (TERMINAL_RUNS.has(run.status)) return run;
+      } catch (error) {
+        if (error.workflowNeedsReview) throw error;
+        if (error.status === 404) {
+          throw goalWorkflowError(
+            `Retained run ${shortText(stepState.runId)} is no longer available. Its outcome cannot be inferred or safely retried.`,
+            { needsReview: true, retryable: false },
+          );
+        }
+        pollErrors += 1;
+        workflow.message = `Run tracking interrupted (${pollErrors}/${GOAL_WORKFLOW_MAX_POLL_ERRORS}). No new action will be submitted.`;
+        notifyGoalWorkflowChange({ structure: false });
+        if (pollErrors >= GOAL_WORKFLOW_MAX_POLL_ERRORS) {
+          workflow.status = "paused";
+          workflow.recoveryRequired = true;
+          workflow.error = `Tracking ${shortText(stepState.runId)} failed repeatedly. The accepted action remains locked to this run id.`;
+          workflow.message = workflow.exitRequested
+            ? "Exit remains armed. Resume tracking after the Driver connection is stable; the run will be reconciled and then the flow will stop."
+            : "Resume tracking after the Driver connection is stable. The action will not be submitted again.";
+          persistGoalWorkflow();
+          toast("Run tracking paused", workflow.error, "warning", 9000);
+          return null;
+        }
+      }
+      await new Promise((resolve) => setTimeout(resolve, GOAL_WORKFLOW_POLL_MS));
+    }
+    return null;
+  }
+
+  function goalWorkflowRunResultError(run, step, inputObjectPaths) {
+    if (!run || run.status !== "succeeded") return run?.error || `${step.label} did not succeed.`;
+    if (!run.action || !sameQualified(run.action, step.action)) return "The retained run does not report the exact planned action.";
+    const outputFiles = run.result?.outputFiles;
+    const nullifiedFiles = run.result?.nullifiedFiles;
+    if (!Array.isArray(outputFiles) || outputFiles.length !== step.totalOutputs.length) {
+      return `The Driver returned ${Array.isArray(outputFiles) ? outputFiles.length : "no"} output files; ${step.totalOutputs.length} were expected.`;
+    }
+    if (!Array.isArray(nullifiedFiles)) return "The Driver did not return its consumed-object list.";
+    const expectedConsumed = [...inputObjectPaths].sort();
+    const actualConsumed = [...nullifiedFiles].sort();
+    if (JSON.stringify(expectedConsumed) !== JSON.stringify(actualConsumed)) {
+      return "The Driver's consumed-object list does not exactly match the submitted input slots.";
+    }
+    if (new Set(outputFiles).size !== outputFiles.length) return "The Driver returned duplicate output file paths.";
+    return "";
+  }
+
+  async function verifyGoalWorkflowStep(workflow, step, stepState, run, token) {
+    const resultError = goalWorkflowRunResultError(run, step, stepState.inputObjectPaths || []);
+    if (resultError) {
+      throw goalWorkflowError(`${step.label}: ${resultError}`, {
+        needsReview: run?.status === "succeeded",
+        retryable: run?.status !== "succeeded",
+      });
+    }
+    if (run.status === "failed") {
+      throw goalWorkflowError(`${step.label} failed: ${run.error || "The Driver rejected the action."}`, { retryable: true });
+    }
+    stepState.status = "verifying";
+    stepState.runStatus = run.status;
+    stepState.runSnapshot = compactGoalWorkflowRun(run);
+    workflow.message = `Verifying ${step.label} outputs as live exact-version objects.`;
+    persistGoalWorkflow();
+    let lastError = "The Driver inventory did not expose the committed outputs.";
+    for (let attempt = 0; attempt < GOAL_WORKFLOW_OUTPUT_ATTEMPTS; attempt += 1) {
+      if (token !== state.goalWorkflowLoopToken || state.goalWorkflow?.id !== workflow.id) return false;
+      try {
+        const objects = await driverRequest(workflow.connection, "/objects", { timeout: 30000 });
+        if (!Array.isArray(objects)) throw new Error("The object inventory response is incompatible.");
+        const outputFiles = run.result.outputFiles;
+        const orderedOutputs = [...step.outputs].sort((left, right) => left.slotIndex - right.slotIndex);
+        const boundOutputs = [];
+        for (const output of orderedOutputs) {
+          const fileName = outputFiles[output.slotIndex];
+          const object = objects.find((candidate) => candidate.fileName === fileName);
+          if (!object) throw new Error(`${output.classLabel} output ${fileName || output.slotIndex + 1} is not in inventory yet.`);
+          if (object.status !== "live") throw new Error(`${fileName} is ${object.status || "not live"}.`);
+          if (workflowObjectClassId(object) !== output.classId) {
+            throw new Error(`${fileName} does not match the exact ${output.classLabel} class version.`);
+          }
+          boundOutputs.push({ output, object });
+        }
+        const stillLiveInput = (stepState.inputObjectPaths || []).find((fileName) =>
+          objects.some((object) => object.fileName === fileName && object.status === "live"));
+        if (stillLiveInput) throw new Error(`Consumed input ${stillLiveInput} is still reported live.`);
+        for (const { output, object } of boundOutputs) {
+          workflow.tokenBindings[output.tokenId] = {
+            tokenId: output.tokenId,
+            classId: output.classId,
+            fileName: object.fileName || "",
+            contentHash: object.contentHash || "",
+          };
+        }
+        const current = activeConnection();
+        if (current?.id === workflow.connection.id && state.workspace.connectionId === current.id) {
+          state.workspace.objects = objects;
+          delete state.workspace.errors.objects;
+          scheduleLivePatch({ catalog: true });
+        }
+        stepState.status = "complete";
+        stepState.outputFiles = [...outputFiles];
+        stepState.completedAt = new Date().toISOString();
+        stepState.error = "";
+        workflow.currentStepIndex += 1;
+        workflow.recoveryRequired = false;
+        workflow.message = `${step.label} verified. ${goalWorkflowCompletedCount(workflow)} of ${workflow.steps.length} actions complete.`;
+        try {
+          persistGoalWorkflow(true);
+        } catch (error) {
+          throw goalWorkflowError(error.message, { needsReview: true, retryable: false });
+        }
+        return true;
+      } catch (error) {
+        if (error.workflowNeedsReview) throw error;
+        lastError = error.message || lastError;
+        workflow.message = `Verifying outputs (${attempt + 1}/${GOAL_WORKFLOW_OUTPUT_ATTEMPTS}): ${lastError}`;
+        notifyGoalWorkflowChange({ structure: false });
+        if (attempt + 1 < GOAL_WORKFLOW_OUTPUT_ATTEMPTS) {
+          await new Promise((resolve) => setTimeout(resolve, GOAL_WORKFLOW_OUTPUT_POLL_MS));
+        }
+      }
+    }
+    throw goalWorkflowError(
+      `${step.label} succeeded, but its outputs could not be verified: ${lastError} The action must not be retried.`,
+      { needsReview: true, retryable: false },
+    );
+  }
+
+  async function verifyGoalWorkflowGoal(workflow) {
+    workflow.message = `All actions are complete. Verifying the final ${workflow.goal.label} token${workflow.goalTokenIds.length === 1 ? "" : "s"}.`;
+    persistGoalWorkflow();
+    const objects = await driverRequest(workflow.connection, "/objects", { timeout: 30000 });
+    if (!Array.isArray(objects)) {
+      throw goalWorkflowError("The final object inventory response is incompatible.", { needsReview: true, retryable: false });
+    }
+    const usedGoalFiles = new Set();
+    const usedGoalHashes = new Set();
+    for (const tokenId of workflow.goalTokenIds) {
+      const binding = workflow.tokenBindings[tokenId];
+      const object = workflowObjectForBinding(objects, binding);
+      if (!binding || !object || object.status !== "live" || workflowObjectClassId(object) !== workflow.goal.classId) {
+        throw goalWorkflowError(
+          `The final ${workflow.goal.label} output is not live at the exact planned class version. Review the completed runs before replanning.`,
+          { needsReview: true, retryable: false },
+        );
+      }
+      if (
+        (object.fileName && usedGoalFiles.has(object.fileName)) ||
+        (object.contentHash && usedGoalHashes.has(object.contentHash))
+      ) {
+        throw goalWorkflowError(
+          `Multiple planned goal tokens resolve to the same ${workflow.goal.label} object. The requested quantity was not verified.`,
+          { needsReview: true, retryable: false },
+        );
+      }
+      if (object.fileName) usedGoalFiles.add(object.fileName);
+      if (object.contentHash) usedGoalHashes.add(object.contentHash);
+    }
+    workflow.status = "complete";
+    workflow.completedAt = new Date().toISOString();
+    workflow.message = `${workflow.goal.label} is live and verified.`;
+    workflow.error = "";
+    persistGoalWorkflow();
+    toast("Goal workflow complete", `${workflow.goal.label} / ${workflow.steps.length} actions verified`, "success", 9000);
+  }
+
+  function stopGoalWorkflowBetweenSteps(workflow, reason) {
+    if (workflow.exitRequested) {
+      workflow.status = "stopped";
+      workflow.stoppedAt = new Date().toISOString();
+      workflow.message = reason || "Workflow exited before another action was submitted.";
+      workflow.error = "";
+      persistGoalWorkflow();
+      toast("Workflow exited", "No further actions will be submitted.", "warning", 6500);
+      return true;
+    }
+    if (workflow.pauseRequested) {
+      workflow.status = "paused";
+      workflow.message = reason || "Paused between actions. Press Play to continue from a fresh live preflight.";
+      persistGoalWorkflow();
+      toast("Workflow paused", "No new action will be submitted until you resume.", "info", 5000);
+      return true;
+    }
+    return false;
+  }
+
+  function failGoalWorkflow(workflow, stepState, error) {
+    const needsReview = Boolean(error?.workflowNeedsReview);
+    const exitRequested = Boolean(workflow.exitRequested);
+    workflow.status = needsReview ? "needs-review" : "error";
+    workflow.pauseRequested = false;
+    workflow.exitRequested = exitRequested;
+    workflow.error = error?.message || "The workflow stopped unexpectedly.";
+    workflow.message = exitRequested
+      ? "Exit remains armed. No later action will be submitted. Review this result, then acknowledge the stopped flow."
+      : needsReview
+        ? "Automation is safety-locked. No later action will be submitted."
+        : "The workflow is stopped. Retry performs a fresh live preflight and never skips this step.";
+    if (stepState) {
+      stepState.status = needsReview ? "needs-review" : "failed";
+      stepState.error = workflow.error;
+      stepState.retryable = !exitRequested && !needsReview && error?.workflowRetryable !== false;
+      stepState.outcomeUnknown ||= needsReview && !stepState.runId;
+    }
+    persistGoalWorkflow();
+    toast(needsReview ? "Workflow needs review" : "Workflow stopped", workflow.error, "error", 10000);
+  }
+
+  async function runGoalWorkflowLoop(workflow, token) {
+    try {
+      while (token === state.goalWorkflowLoopToken && state.goalWorkflow?.id === workflow.id) {
+        if (workflow.currentStepIndex >= workflow.steps.length) {
+          if (stopGoalWorkflowBetweenSteps(workflow, "All submitted actions finished; final goal verification was skipped because Exit was requested.")) return;
+          await verifyGoalWorkflowGoal(workflow);
+          return;
+        }
+        const step = goalWorkflowCurrentStep(workflow);
+        const stepState = goalWorkflowCurrentStepState(workflow);
+        if (!step || !stepState) {
+          throw goalWorkflowError("The saved workflow step map is incomplete.", { needsReview: true, retryable: false });
+        }
+        if (stepState.status === "complete") {
+          workflow.currentStepIndex += 1;
+          persistGoalWorkflow();
+          continue;
+        }
+        if (!stepState.runId && stopGoalWorkflowBetweenSteps(workflow)) return;
+        let run = stepState.runSnapshot && TERMINAL_RUNS.has(stepState.runSnapshot.status)
+          ? stepState.runSnapshot
+          : null;
+        if (!run && stepState.runId) {
+          workflow.recoveryRequired = true;
+          workflow.message = `Reconciling retained run ${shortText(stepState.runId)} before any new submission.`;
+          persistGoalWorkflow();
+          run = await waitForGoalWorkflowRun(workflow, step, stepState, token);
+          if (!run) return;
+        }
+        if (!run) {
+          const preflight = await preflightGoalWorkflowStep(workflow, step, stepState);
+          if (stopGoalWorkflowBetweenSteps(workflow)) return;
+          const postPreflightContextError = goalWorkflowContextError(workflow);
+          if (postPreflightContextError) {
+            throw goalWorkflowError(`${postPreflightContextError} No action was submitted.`, { retryable: true });
+          }
+          const submissionKey = actionSubmissionKey(workflow.connection, preflight.action, preflight.inputObjectPaths);
+          if (state.inFlightActionSubmissions.has(submissionKey) || state.ambiguousActionSubmissions.has(submissionKey)) {
+            throw goalWorkflowError(
+              "A matching action submission is already in flight or has an unknown outcome in this browser session.",
+              { needsReview: state.ambiguousActionSubmissions.has(submissionKey), retryable: false },
+            );
+          }
+          state.inFlightActionSubmissions.add(submissionKey);
+          stepState.status = "submitting";
+          stepState.startedAt ||= new Date().toISOString();
+          stepState.error = "";
+          workflow.message = `Submitting step ${step.order}: ${step.label}.`;
+          try {
+            persistGoalWorkflow(true);
+          } catch (error) {
+            state.inFlightActionSubmissions.delete(submissionKey);
+            throw goalWorkflowError(error.message, { retryable: true });
+          }
+          let accepted;
+          try {
+            accepted = await driverRequest(
+              workflow.connection,
+              "/actions/run",
+              jsonOptions("POST", { input: { action: step.action, inputObjectPaths: preflight.inputObjectPaths } }, 30000),
+            );
+            if (!accepted?.runId) {
+              throw goalWorkflowError(
+                "The Driver accepted the request without a run id. Its outcome is unknown and the action cannot be retried safely.",
+                { needsReview: true, retryable: false },
+              );
+            }
+          } catch (error) {
+            state.inFlightActionSubmissions.delete(submissionKey);
+            const status = Number(error?.status) || 0;
+            const explicitDeterministicRejection = status >= 400 && status < 500 && !new Set([408, 425, 429]).has(status);
+            const ambiguous = error.workflowNeedsReview || !explicitDeterministicRejection;
+            if (ambiguous) state.ambiguousActionSubmissions.add(submissionKey);
+            throw ambiguous
+              ? goalWorkflowError(
+                  `${error.message} The request may have reached the Driver; no retry or later step will be attempted.`,
+                  { needsReview: true, retryable: false },
+                )
+              : goalWorkflowError(error.message, { retryable: true });
+          }
+          state.inFlightActionSubmissions.delete(submissionKey);
+          stepState.runId = accepted.runId;
+          stepState.runStatus = String(accepted.status || "queued");
+          stepState.status = "running";
+          stepState.runSnapshot = compactGoalWorkflowRun({
+            ...accepted,
+            action: step.action,
+            result: null,
+            error: null,
+            progress: [],
+          });
+          workflow.recoveryRequired = true;
+          workflow.status = workflow.exitRequested ? "stopping" : workflow.pauseRequested ? "pausing" : "running";
+          workflow.message = `${step.label} accepted as run ${shortText(accepted.runId)}.`;
+          try {
+            persistGoalWorkflow(true);
+          } catch (error) {
+            throw goalWorkflowError(
+              `${error.message} Run ${shortText(accepted.runId)} was accepted; keep this tab open and review Activity if tracking stops.`,
+              { needsReview: true, retryable: false },
+            );
+          }
+          rememberRun(workflow.connection.id, accepted.runId);
+          mergeGoalWorkflowRun(workflow, stepState.runSnapshot);
+          run = await waitForGoalWorkflowRun(workflow, step, stepState, token);
+          if (!run) return;
+        }
+        if (run.status === "failed" && workflow.exitRequested) {
+          stopGoalWorkflowBetweenSteps(workflow, `${step.label} reached terminal failure after Exit was requested. No later action was submitted.`);
+          return;
+        }
+        if (run.status === "failed") {
+          throw goalWorkflowError(`${step.label} failed: ${run.error || "The Driver reported a terminal failure."}`, { retryable: true });
+        }
+        await verifyGoalWorkflowStep(workflow, step, stepState, run, token);
+        if (stopGoalWorkflowBetweenSteps(workflow)) return;
+        const contextError = goalWorkflowContextError(workflow);
+        if (contextError) {
+          workflow.status = "paused";
+          workflow.message = `${contextError} The completed action is saved; no next step was submitted.`;
+          persistGoalWorkflow();
+          toast("Workflow paused", contextError, "warning", 7500);
+          return;
+        }
+      }
+    } catch (error) {
+      if (token !== state.goalWorkflowLoopToken || state.goalWorkflow?.id !== workflow.id) return;
+      failGoalWorkflow(workflow, goalWorkflowCurrentStepState(workflow), error);
+    }
+  }
+
+  function launchGoalWorkflowEngine(options = {}) {
+    const workflow = state.goalWorkflow;
+    if (!workflow || state.goalWorkflowLoopPromise) return;
+    if (workflow.status === "needs-review") {
+      toast("Review required", "This workflow cannot submit another action until the unknown outcome is reconciled.", "warning", 7500);
+      return;
+    }
+    const contextError = goalWorkflowContextError(workflow);
+    const currentState = goalWorkflowCurrentStepState(workflow);
+    const hasRetainedRun = Boolean(currentState?.runId);
+    if (contextError && !hasRetainedRun) {
+      toast("Workflow cannot continue", contextError, "error", 7500);
+      return;
+    }
+    if (workflow.status === "ready" && !options.skipConfirmation) {
+      const approved = globalThis.confirm(
+        `Start the ${workflow.goal.label} workflow on ${workflow.connection.name}?\n\n` +
+          `${workflow.steps.length} state-changing actions will be submitted sequentially. Inputs are consumed and completed steps cannot be undone. ` +
+          "Pause or Exit takes effect before the next action; an accepted Driver action always finishes.",
+      );
+      if (!approved) return;
+    }
+    const token = ++state.goalWorkflowLoopToken;
+    const execute = async (lock) => {
+      if (!lock && globalThis.navigator?.locks) {
+        toast("Workflow is active in another tab", "Use the tab that owns the Driver workflow, or wait for it to close before resuming here.", "warning", 9000);
+        return;
+      }
+      if (state.goalWorkflow?.id !== workflow.id) return;
+      let persisted;
+      try {
+        persisted = readGoalWorkflowStorageRecord();
+      } catch (error) {
+        toast("Workflow recovery check failed", `No action was sent. ${error.message}`, "error", 9000);
+        return;
+      }
+      if (
+        !persisted ||
+        persisted.id !== workflow.id ||
+        (Number(persisted.revision) || 0) !== (Number(workflow.revision) || 0)
+      ) {
+        adoptPersistedGoalWorkflow();
+        toast("Workflow changed in another tab", "The latest saved workflow was loaded. No action was sent from this stale copy.", "warning", 9000);
+        return;
+      }
+      if (
+        !globalThis.navigator?.locks &&
+        GOAL_WORKFLOW_AUTOMATION_STATUSES.has(persisted.status) &&
+        persisted.ownerTabId &&
+        persisted.ownerTabId !== state.goalWorkflowTabId
+      ) {
+        adoptPersistedGoalWorkflow();
+        toast("Workflow is owned by another tab", "This browser cannot safely take over without Web Locks. No action was sent.", "warning", 9000);
+        return;
+      }
+      if (!options.preserveExitRequest) workflow.exitRequested = false;
+      workflow.pauseRequested = false;
+      workflow.ownerTabId = state.goalWorkflowTabId;
+      workflow.status = workflow.exitRequested ? "stopping" : "running";
+      workflow.startedAt ||= new Date().toISOString();
+      workflow.error = "";
+      workflow.message = hasRetainedRun
+        ? `Resuming retained run ${shortText(currentState.runId)}. No duplicate action will be submitted.`
+        : "Workflow running. Performing a fresh Driver preflight before each action.";
+      try {
+        persistGoalWorkflow(true);
+      } catch (error) {
+        failGoalWorkflow(workflow, currentState, goalWorkflowError(error.message, { retryable: true }));
+        return;
+      }
+      await runGoalWorkflowLoop(workflow, token);
+    };
+    const lockName = goalWorkflowLockName(workflow.connection);
+    const promise = globalThis.navigator?.locks?.request
+      ? navigator.locks.request(lockName, { ifAvailable: true }, execute)
+      : execute({ name: lockName });
+    state.goalWorkflowLoopPromise = Promise.resolve(promise)
+      .catch((error) => {
+        if (state.goalWorkflow?.id === workflow.id) {
+          failGoalWorkflow(workflow, goalWorkflowCurrentStepState(workflow), goalWorkflowError(error.message, { retryable: true }));
+        }
+      })
+      .finally(() => {
+        if (token === state.goalWorkflowLoopToken) state.goalWorkflowLoopPromise = null;
+        notifyGoalWorkflowChange();
+      });
+  }
+
+  function pauseGoalWorkflow() {
+    const workflow = state.goalWorkflow;
+    if (goalWorkflowOwnedByOtherTab(workflow)) {
+      toast("Workflow is active in another tab", "Use the tab that owns this flow to pause it.", "warning", 7000);
+      return;
+    }
+    if (!workflow || !new Set(["running", "stopping"]).has(workflow.status)) return;
+    workflow.pauseRequested = true;
+    workflow.exitRequested = false;
+    workflow.status = "pausing";
+    const current = goalWorkflowCurrentStepState(workflow);
+    workflow.message = current?.runId || current?.status === "submitting"
+      ? "Pause requested. The current accepted/requested Driver action will be reconciled, then automation will pause."
+      : "Pause requested. No action will be submitted after the current live preflight.";
+    persistGoalWorkflow();
+  }
+
+  function resumeGoalWorkflow() {
+    const workflow = state.goalWorkflow;
+    if (!workflow) return;
+    if (state.goalWorkflowLoopPromise && workflow.status === "pausing") {
+      workflow.pauseRequested = false;
+      workflow.status = "running";
+      workflow.message = "Pause request cancelled. The workflow will continue after the current action.";
+      persistGoalWorkflow();
+      return;
+    }
+    if (!new Set(["ready", "paused"]).has(workflow.status)) return;
+    launchGoalWorkflowEngine({ preserveExitRequest: Boolean(workflow.exitRequested) });
+  }
+
+  function retryGoalWorkflowStep() {
+    const workflow = state.goalWorkflow;
+    const step = goalWorkflowCurrentStep(workflow);
+    const stepState = goalWorkflowCurrentStepState(workflow);
+    if (!workflow || workflow.status !== "error" || state.goalWorkflowLoopPromise) return;
+    if (!step && workflow.currentStepIndex >= workflow.steps.length) {
+      const approved = globalThis.confirm(
+        `Retry final verification for ${workflow.goal.label}?\n\nNo action will be submitted. The console will only refresh live objects and verify the planned goal token.`,
+      );
+      if (!approved) return;
+      workflow.status = "paused";
+      workflow.error = "";
+      workflow.message = `Retrying final live-object verification for ${workflow.goal.label}.`;
+      persistGoalWorkflow();
+      launchGoalWorkflowEngine({ skipConfirmation: true });
+      return;
+    }
+    if (!step || !stepState?.retryable) return;
+    const approved = globalThis.confirm(
+      `Retry ${step.label}?\n\nThe console will discard only this failed attempt's local step state, perform a fresh exact-object feasibility check, and submit again only if that check succeeds. Earlier completed actions remain committed.`,
+    );
+    if (!approved) return;
+    stepState.status = "pending";
+    stepState.runId = "";
+    stepState.runStatus = "";
+    stepState.runSnapshot = null;
+    stepState.inputObjectPaths = [];
+    stepState.outputFiles = [];
+    stepState.error = "";
+    stepState.outcomeUnknown = false;
+    workflow.status = "paused";
+    workflow.error = "";
+    workflow.message = `Retry armed for ${step.label}; a fresh live preflight is required.`;
+    persistGoalWorkflow();
+    launchGoalWorkflowEngine({ skipConfirmation: true });
+  }
+
+  function exitGoalWorkflow() {
+    const workflow = state.goalWorkflow;
+    if (goalWorkflowOwnedByOtherTab(workflow)) {
+      toast("Workflow is active in another tab", "Use the tab that owns this flow to exit it.", "warning", 7000);
+      return;
+    }
+    if (!workflow || new Set(["complete", "stopped"]).has(workflow.status)) return;
+    const current = goalWorkflowCurrentStepState(workflow);
+    const activeAction = Boolean(current?.runId && !TERMINAL_RUNS.has(current.runSnapshot?.status)) || current?.status === "submitting";
+    const approved = globalThis.confirm(
+      `Exit the ${workflow.goal.label} workflow?\n\nNo later actions will be submitted. ` +
+        (activeAction
+          ? "The current Driver action cannot be cancelled; the console will keep tracking and verifying it, then stop."
+          : "Already completed actions remain committed and cannot be undone."),
+    );
+    if (!approved) return;
+    if (workflow.status === "needs-review") {
+      workflow.exitRequested = true;
+      workflow.message = "Automation is exited, but the unknown action outcome remains safety-locked for review.";
+      persistGoalWorkflow();
+      return;
+    }
+    workflow.exitRequested = true;
+    workflow.pauseRequested = false;
+    if (state.goalWorkflowLoopPromise || activeAction) {
+      workflow.status = "stopping";
+      workflow.message = activeAction
+        ? "Exit requested. Tracking and output verification continue for the current action; no next action will start."
+        : "Exit requested. The workflow will stop before the next submission.";
+      persistGoalWorkflow();
+      if (!state.goalWorkflowLoopPromise) launchGoalWorkflowEngine({ skipConfirmation: true, preserveExitRequest: true });
+      return;
+    }
+    stopGoalWorkflowBetweenSteps(workflow, "Workflow exited before another action was submitted.");
+  }
+
+  function dismissGoalWorkflow() {
+    const workflow = state.goalWorkflow;
+    if (!workflow || !new Set(["complete", "stopped"]).has(workflow.status)) return;
+    state.goalWorkflow = null;
+    persistGoalWorkflow();
+    if (state.drawer?.type === "workflow") closeDrawer();
+  }
+
+  async function acknowledgeGoalWorkflowReview() {
+    const workflow = state.goalWorkflow;
+    if (!workflow || workflow.status !== "needs-review") return;
+    const step = goalWorkflowCurrentStep(workflow);
+    const stepState = goalWorkflowCurrentStepState(workflow);
+    const approved = globalThis.confirm(
+      `Clear the safety lock for ${workflow.goal.label}?\n\nOnly continue after checking Driver Activity and live objects for the uncertain run. Clearing this monitor does not undo any accepted action. The planner will refresh from live state before another workflow can be prepared.`,
+    );
+    if (!approved) return;
+    if (step && stepState?.inputObjectPaths) {
+      const submissionKey = actionSubmissionKey(
+        workflow.connection,
+        { action: step.action, hash: step.actionHash },
+        stepState.inputObjectPaths,
+      );
+      state.ambiguousActionSubmissions.delete(submissionKey);
+    }
+    workflow.status = "stopped";
+    workflow.exitRequested = true;
+    workflow.stoppedAt = new Date().toISOString();
+    workflow.reviewAcknowledgedAt = new Date().toISOString();
+    workflow.message = "Review acknowledged. Automation is stopped; refresh/replan from live Driver state before continuing.";
+    workflow.error = "";
+    persistGoalWorkflow();
+    closeDrawer();
+    await refreshEverything();
+    if (selectedCartridge()?.id === workflow.cartridgeId) navigate("planner");
+    toast("Workflow review acknowledged", "Live Driver state was refreshed. Replan before starting another action set.", "warning", 8000);
   }
 
   function objectCatalogMarkup(cartridge = selectedCartridge()) {
@@ -8014,7 +9422,7 @@
     ].filter(Boolean).join(" ");
   }
 
-  function runProgressMeterMarkup(run) {
+  function runProgressMeterMarkup(run, options = {}) {
     const view = runStageView(run);
     const segments = RUN_STAGE_LABELS.map((label, index) => {
       return `<li class="${runStageClasses(view, index)}" data-run-stage-index="${index}"><span aria-hidden="true">${index + 1}</span><b>${label}</b></li>`;
@@ -8028,7 +9436,7 @@
         </div>
         <ol class="run-meter-track" data-run-meter-track role="progressbar" aria-label="Action pipeline stage" aria-valuemin="0" aria-valuemax="4" aria-valuenow="${view.value}" aria-valuetext="${escapeHtml(view.label)}">${segments}</ol>
         <p data-run-meter-message>${escapeHtml(view.message)}</p>
-        <span class="sr-only" data-run-meter-announcement aria-live="polite" aria-atomic="true">${escapeHtml(`${view.label}. ${view.message}`)}</span>
+        ${options.announce === false ? "" : `<span class="sr-only" data-run-meter-announcement aria-live="polite" aria-atomic="true">${escapeHtml(`${view.label}. ${view.message}`)}</span>`}
       </div>`;
   }
 
@@ -8125,6 +9533,256 @@
     patchRunMeter(run);
     setHtml("[data-run-progress]", runProgressMarkup(run));
     setHtml("[data-run-result]", runResultMarkup(run));
+  }
+
+  function goalWorkflowBadgeMarkup(workflow) {
+    const tone = workflow.status === "complete"
+      ? "badge-success"
+      : new Set(["error", "needs-review"]).has(workflow.status)
+        ? "badge-failed"
+        : new Set(["running", "pausing", "stopping"]).has(workflow.status)
+          ? "badge-running"
+          : "badge-neutral";
+    return `<span class="badge ${tone}">${escapeHtml(goalWorkflowStatusLabel(workflow))}</span>`;
+  }
+
+  function goalWorkflowStepStatusLabel(stepState) {
+    return ({
+      pending: "Queued",
+      preflight: "Live check",
+      submitting: "Submitting",
+      running: stepState.runStatus || "Driver active",
+      verifying: "Verifying outputs",
+      complete: "Verified",
+      failed: "Stopped",
+      "needs-review": "Review",
+    })[stepState?.status] || stepState?.status || "Queued";
+  }
+
+  function goalWorkflowCurrentRun(workflow) {
+    const stepState = goalWorkflowCurrentStepState(workflow);
+    if (!stepState?.runId) return null;
+    const current = activeConnection();
+    const workspaceRun = current?.id === workflow.connection.id && state.workspace.connectionId === current.id
+      ? state.workspace.runs.get(stepState.runId)
+      : null;
+    return workspaceRun || stepState.runSnapshot || null;
+  }
+
+  function goalWorkflowQueueMarkup(workflow) {
+    const current = Math.min(workflow.currentStepIndex, Math.max(0, workflow.steps.length - 1));
+    const start = Math.max(0, current - 3);
+    const end = Math.min(workflow.steps.length, Math.max(current + 7, 8));
+    const hiddenBefore = start;
+    const hiddenAfter = workflow.steps.length - end;
+    const rows = [];
+    if (hiddenBefore) rows.push(`<li class="workflow-queue-summary">${hiddenBefore} earlier verified action${hiddenBefore === 1 ? "" : "s"}</li>`);
+    for (let index = start; index < end; index += 1) {
+      const step = workflow.steps[index];
+      const stepState = workflow.stepStates[index];
+      const currentAttribute = index === workflow.currentStepIndex ? ' aria-current="step"' : "";
+      const timing = step.estimatedMilliseconds != null && step.estimatedMilliseconds !== "" && Number.isFinite(Number(step.estimatedMilliseconds))
+        ? `${step.estimateLowerBound ? ">= " : "~"}${formatProofDuration(Number(step.estimatedMilliseconds))}`
+        : "Time unknown";
+      rows.push(`
+        <li class="workflow-queue-row is-${escapeHtml(stepState.status)}"${currentAttribute}>
+          <span class="planner-step-number">${String(index + 1).padStart(2, "0")}</span>
+          <span><strong>${escapeHtml(step.label)}</strong><small>${escapeHtml(goalWorkflowStepStatusLabel(stepState))}</small></span>
+          <span class="workflow-queue-time">${escapeHtml(timing)}</span>
+        </li>`);
+    }
+    if (hiddenAfter) rows.push(`<li class="workflow-queue-summary">${hiddenAfter} later action${hiddenAfter === 1 ? "" : "s"}</li>`);
+    return `<ul class="workflow-queue-list">${rows.join("")}</ul>`;
+  }
+
+  function goalWorkflowCurrentActionMarkup(workflow) {
+    const step = goalWorkflowCurrentStep(workflow);
+    const stepState = goalWorkflowCurrentStepState(workflow);
+    if (!step || !stepState) {
+      return `
+        <div class="workflow-current-copy"><span>Final check</span><strong>${escapeHtml(workflow.goal.label)}</strong><small>All planned actions have been processed.</small></div>
+        <div class="terminal-note">${escapeHtml(workflow.message || "Verifying final goal output.")}</div>`;
+    }
+    const inputLabels = step.inputs.map((input) => input.classLabel).join(", ") || "None";
+    const outputLabels = step.outputs.map((output) => output.classLabel).join(", ") || "None";
+    const run = goalWorkflowCurrentRun(workflow);
+    const canOpenRun = activeConnection()?.id === workflow.connection.id && state.workspace.connectionId === workflow.connection.id;
+    let meter = "";
+    if (stepState.status === "submitting") meter = runSubmissionProgressMarkup();
+    else if (stepState.status === "preflight" || stepState.status === "pending") {
+      meter = `
+        <div class="workflow-check-meter">
+          <span>${stepState.status === "preflight" ? "LIVE PREFLIGHT" : "WAITING"}</span>
+          <strong>${escapeHtml(workflow.message)}</strong>
+          <div class="run-request-track" aria-hidden="true"><span></span></div>
+        </div>`;
+    } else if (stepState.status === "verifying") {
+      meter = `
+        <div class="workflow-check-meter is-verifying">
+          <span>OUTPUT RECONCILIATION</span>
+          <strong>${escapeHtml(workflow.message)}</strong>
+          <div class="run-request-track" aria-hidden="true"><span></span></div>
+        </div>`;
+    } else if (run) {
+      meter = `${runProgressMeterMarkup(run, { announce: false })}<div class="run-progress-log" data-workflow-run-progress>${runProgressMarkup(run)}</div>`;
+    } else {
+      meter = `<div class="terminal-note">${escapeHtml(workflow.message || goalWorkflowStepStatusLabel(stepState))}</div>`;
+    }
+    return `
+      <div class="workflow-current-copy">
+        <span>Step ${step.order} of ${workflow.steps.length} / ${escapeHtml(goalWorkflowStepStatusLabel(stepState))}</span>
+        <strong>${escapeHtml(step.label)}</strong>
+        <small>Use: ${escapeHtml(inputLabels)} / Make: ${escapeHtml(outputLabels)}</small>
+      </div>
+      <div class="workflow-run-stage" data-workflow-run-stage>${meter}</div>
+      ${stepState.runId ? canOpenRun
+        ? `<button class="game-button workflow-run-link" type="button" data-command="view-run" data-id="${escapeHtml(stepState.runId)}">Open run ${escapeHtml(shortText(stepState.runId))}</button>`
+        : `<div class="terminal-note">Run ${escapeHtml(shortText(stepState.runId))} belongs to ${escapeHtml(workflow.connection.name)}. Use View Activity to switch back safely.</div>`
+        : ""}`;
+  }
+
+  function goalWorkflowControlsMarkup(workflow) {
+    const stepState = goalWorkflowCurrentStepState(workflow);
+    const controls = [];
+    const control = (label, command, options = {}) => {
+      const classes = [
+        "game-button",
+        options.primary ? "game-button-primary" : "",
+        options.danger ? "game-button-danger" : "",
+      ].filter(Boolean).join(" ");
+      return `<button class="${classes}" type="button"${command ? ` data-command="${escapeHtml(command)}"` : ""}${options.primary ? " data-workflow-primary" : ""}${options.disabled ? " disabled" : ""}>${options.glyph ? `<span aria-hidden="true">${escapeHtml(options.glyph)}</span>` : ""}<span>${escapeHtml(label)}</span></button>`;
+    };
+    if (goalWorkflowOwnedByOtherTab(workflow)) {
+      controls.push(control("Active in another tab", "", { disabled: true }));
+      controls.push(control("Close monitor", "close-drawer"));
+      return controls.join("");
+    }
+    if (workflow.status === "ready") {
+      controls.push(control("Play", "workflow-resume", { primary: true, glyph: "\u25b6" }));
+      controls.push(control("Exit flow", "workflow-exit", { danger: true, glyph: "\u25a0" }));
+    } else if (workflow.status === "running") {
+      controls.push(control("Pause after step", "workflow-pause", { primary: true, glyph: "\u2016" }));
+      controls.push(control("Exit flow", "workflow-exit", { danger: true, glyph: "\u25a0" }));
+    } else if (workflow.status === "pausing") {
+      controls.push(control("Keep running", "workflow-resume", { primary: true, glyph: "\u25b6" }));
+      controls.push(control("Exit flow", "workflow-exit", { danger: true, glyph: "\u25a0" }));
+    } else if (workflow.status === "paused") {
+      controls.push(control(workflow.exitRequested ? "Resume tracking to exit" : stepState?.runId ? "Resume tracking" : "Resume flow", "workflow-resume", { primary: true, glyph: "\u25b6" }));
+      controls.push(control("Exit flow", "workflow-exit", { danger: true, glyph: "\u25a0" }));
+    } else if (workflow.status === "error") {
+      if (!stepState && workflow.currentStepIndex >= workflow.steps.length) controls.push(control("Retry goal check", "workflow-retry", { primary: true, glyph: "\u21bb" }));
+      else if (stepState?.retryable) controls.push(control("Retry live check", "workflow-retry", { primary: true, glyph: "\u21bb" }));
+      controls.push(control("View activity", "workflow-activity"));
+      controls.push(control("Exit flow", "workflow-exit", { danger: true, glyph: "\u25a0" }));
+    } else if (workflow.status === "needs-review") {
+      controls.push(control("View activity", "workflow-activity", { primary: true }));
+      if (!workflow.exitRequested) controls.push(control("Exit automation", "workflow-exit", { danger: true, glyph: "\u25a0" }));
+      controls.push(control("Acknowledge & replan", "workflow-acknowledge", { danger: true }));
+    } else if (workflow.status === "stopping") {
+      controls.push(control("Current action must finish", "", { disabled: true }));
+    } else if (new Set(["complete", "stopped"]).has(workflow.status)) {
+      controls.push(control("Clear monitor", "workflow-dismiss", { primary: true }));
+    }
+    controls.push(control("Close monitor", "close-drawer"));
+    return controls.join("");
+  }
+
+  function goalWorkflowDrawerFingerprint(workflow) {
+    const stepState = goalWorkflowCurrentStepState(workflow);
+    return JSON.stringify([
+      workflow.id,
+      workflow.status,
+      workflow.currentStepIndex,
+      goalWorkflowCompletedCount(workflow),
+      stepState?.status || "",
+      stepState?.runStatus || "",
+      stepState?.error || "",
+      Boolean(stepState?.retryable),
+      Boolean(stepState?.outcomeUnknown),
+      Boolean(workflow.pauseRequested),
+      Boolean(workflow.exitRequested),
+      workflow.error || "",
+      goalWorkflowOwnedByOtherTab(workflow),
+    ]);
+  }
+
+  function renderGoalWorkflowDrawer(workflow) {
+    const completed = goalWorkflowCompletedCount(workflow);
+    const currentNumber = Math.min(workflow.steps.length, workflow.currentStepIndex + 1);
+    const remaining = goalWorkflowRemainingMilliseconds(workflow);
+    const estimate = workflow.estimatedTotalMilliseconds == null
+      ? "Unknown"
+      : `${workflow.estimateComplete ? "~" : ">= "}${formatProofDuration(workflow.estimatedTotalMilliseconds)}`;
+    const errorMarkup = workflow.error
+      ? `<div class="terminal-note ${workflow.status === "needs-review" ? "warning" : "error"}" role="alert" tabindex="-1"><strong>${workflow.status === "needs-review" ? "Safety lock" : "Flow stopped"}</strong><br />${escapeHtml(workflow.error)}</div>`
+      : "";
+    return `
+      <div data-workflow-drawer data-workflow-fingerprint="${escapeHtml(goalWorkflowDrawerFingerprint(workflow))}">
+        <p id="workflow-dialog-description" class="sr-only">Sequential Driver actions for ${escapeHtml(workflow.goal.label)}. Completed steps cannot be undone, and Pause or Exit takes effect only before the next action.</p>
+        <div class="drawer-header workflow-drawer-header">
+          <div><p class="screen-kicker">Goal workflow</p><h2 class="drawer-title" id="drawer-title" data-workflow-focus tabindex="-1">${escapeHtml(workflow.goal.label)}</h2><small>${escapeHtml(workflow.connection.name)} / ${escapeHtml(workflow.cartridgeName)}</small></div>
+          <div class="drawer-header-actions"><span data-workflow-badge>${goalWorkflowBadgeMarkup(workflow)}</span><button class="game-button" type="button" data-command="close-drawer">Close</button></div>
+        </div>
+        <div class="drawer-body workflow-drawer-body" aria-describedby="workflow-safety-note">
+          <div class="summary-strip workflow-summary">
+            <div class="summary-stat"><span>Status</span><strong data-workflow-status>${escapeHtml(goalWorkflowStatusLabel(workflow))}</strong></div>
+            <div class="summary-stat"><span>Action</span><strong data-workflow-step>${currentNumber} / ${workflow.steps.length}</strong></div>
+            <div class="summary-stat"><span>Elapsed</span><strong data-workflow-elapsed>${escapeHtml(formatProofDuration(goalWorkflowElapsedMilliseconds(workflow)))}</strong></div>
+            <div class="summary-stat"><span>Plan estimate</span><strong>${escapeHtml(estimate)}</strong></div>
+          </div>
+          <section class="workflow-overall" aria-labelledby="workflow-overall-title">
+            <div><span id="workflow-overall-title">Verified action progress</span><strong data-workflow-count>${completed} of ${workflow.steps.length}</strong></div>
+            <progress data-workflow-progress aria-labelledby="workflow-overall-title" max="${workflow.steps.length}" value="${completed}">${completed} of ${workflow.steps.length}</progress>
+            <small><span data-workflow-remaining>${remaining == null ? "Remaining time unknown" : `~${formatProofDuration(remaining)} planned work remaining`}</span> / action count is authoritative; time is an estimate.</small>
+          </section>
+          <p class="workflow-message" data-workflow-message aria-live="polite" aria-atomic="true">${escapeHtml(workflow.message || "")}</p>
+          ${errorMarkup}
+          <div class="workflow-layout">
+            <section class="game-panel workflow-current-panel" aria-labelledby="workflow-current-title" aria-busy="${new Set(["running", "pausing", "stopping"]).has(workflow.status)}">
+              <div class="game-panel-header"><h3 id="workflow-current-title">Current action</h3><span>${escapeHtml(workflow.status === "ready" ? "Preflight" : "Driver lifecycle")}</span></div>
+              <div class="game-panel-body" data-workflow-current>${goalWorkflowCurrentActionMarkup(workflow)}</div>
+            </section>
+            <section class="game-panel workflow-queue-panel" aria-labelledby="workflow-queue-title">
+              <div class="game-panel-header"><h3 id="workflow-queue-title">Action queue</h3><span>Sequential</span></div>
+              <div class="game-panel-body flush" data-workflow-queue>${goalWorkflowQueueMarkup(workflow)}</div>
+            </section>
+          </div>
+          <div id="workflow-safety-note" class="terminal-note warning workflow-safety-note">
+            This flow is non-atomic: each verified step is already committed and consumes its selected inputs. Pause and Exit stop future submissions only; an accepted Driver action cannot be paused or cancelled. The planner models exact class-token flow, but predicate fields such as tool durability are not simulated, so the Driver may stop a structurally valid plan. Keep this tab open. Reload recovery never submits automatically.
+          </div>
+        </div>
+        <div class="drawer-footer workflow-controls" data-workflow-controls>${goalWorkflowControlsMarkup(workflow)}</div>
+      </div>`;
+  }
+
+  function patchGoalWorkflowDrawer() {
+    if (state.drawer?.type !== "workflow" || !state.goalWorkflow) return;
+    const workflow = state.goalWorkflow;
+    const root = drawerContent.querySelector("[data-workflow-drawer]");
+    if (!root || root.dataset.workflowFingerprint !== goalWorkflowDrawerFingerprint(workflow)) {
+      renderDrawer(false);
+      return;
+    }
+    const setText = (selector, value) => {
+      const element = root.querySelector(selector);
+      if (element && element.textContent !== String(value ?? "")) element.textContent = String(value ?? "");
+    };
+    const completed = goalWorkflowCompletedCount(workflow);
+    const remaining = goalWorkflowRemainingMilliseconds(workflow);
+    setText("[data-workflow-status]", goalWorkflowStatusLabel(workflow));
+    setText("[data-workflow-step]", `${Math.min(workflow.steps.length, workflow.currentStepIndex + 1)} / ${workflow.steps.length}`);
+    setText("[data-workflow-elapsed]", formatProofDuration(goalWorkflowElapsedMilliseconds(workflow)));
+    setText("[data-workflow-count]", `${completed} of ${workflow.steps.length}`);
+    setText("[data-workflow-remaining]", remaining == null ? "Remaining time unknown" : `~${formatProofDuration(remaining)} planned work remaining`);
+    setText("[data-workflow-message]", workflow.message || "");
+    const progress = root.querySelector("[data-workflow-progress]");
+    if (progress) progress.value = completed;
+    const run = goalWorkflowCurrentRun(workflow);
+    if (run && root.querySelector("[data-run-meter-shell]")) {
+      patchRunMeter(run);
+      const log = root.querySelector("[data-workflow-run-progress]");
+      if (log) log.innerHTML = runProgressMarkup(run);
+    }
   }
 
   function renderSettings() {
@@ -8267,6 +9925,8 @@
     state.drawer = null;
     state.drawerReturnFocus = null;
     drawer.hidden = true;
+    delete drawer.dataset.drawerType;
+    drawer.removeAttribute("aria-describedby");
     drawerBackdrop.hidden = true;
     drawerContent.innerHTML = "";
     if (appShell) appShell.inert = false;
@@ -8281,6 +9941,7 @@
   function renderDrawer(focusFirst = true) {
     if (!state.drawer) return closeDrawer();
     const focusToken = captureFocus(drawerContent);
+    const previousScrollTop = drawerContent.scrollTop;
     let html = "";
     if (state.drawer.type === "action") {
       const action = actionByKey(state.drawer.key);
@@ -8289,11 +9950,22 @@
       html = renderObjectDrawer(state.drawer);
     } else if (state.drawer.type === "run") {
       html = renderRunDrawer(state.drawer);
+    } else if (state.drawer.type === "workflow") {
+      html = state.goalWorkflow
+        ? renderGoalWorkflowDrawer(state.goalWorkflow)
+        : '<div class="drawer-body"><div class="game-error"><h2 id="drawer-title">Workflow unavailable</h2></div></div>';
     }
+    drawer.dataset.drawerType = state.drawer.type;
     drawerContent.innerHTML = html;
+    if (state.drawer.type === "workflow") drawer.setAttribute("aria-describedby", "workflow-dialog-description");
+    else drawer.removeAttribute("aria-describedby");
+    if (!focusFirst) drawerContent.scrollTop = previousScrollTop;
     requestAnimationFrame(() => {
       const captured = !focusFirst ? findCapturedFocus(drawerContent, focusToken) : null;
-      const target = captured || drawerContent.querySelector("button, select, input");
+      const workflowTarget = state.drawer?.type === "workflow"
+        ? drawerContent.querySelector("[data-workflow-primary], [data-workflow-focus]")
+        : null;
+      const target = captured || workflowTarget || drawerContent.querySelector("button, select, input");
       target?.focus({ preventScroll: true });
     });
   }
@@ -8520,6 +10192,13 @@
         if (!connection) break;
         const cartridge = connectGroups().find((item) => item.id === id);
         const changed = state.config.activeCartridgeByConnection[connection.id] !== id;
+        if (changed && goalWorkflowAutomationActive() && !goalWorkflowOwnedByOtherTab()) {
+          state.goalWorkflow.pauseRequested = true;
+          state.goalWorkflow.exitRequested = false;
+          state.goalWorkflow.status = "pausing";
+          state.goalWorkflow.message = "Cartridge selection changed. The current accepted action will be reconciled, then automation will pause.";
+          persistGoalWorkflow();
+        }
         state.config.activeCartridgeByConnection[connection.id] = id;
         if (changed) {
           state.actionSearch = "";
@@ -8559,6 +10238,12 @@
         break;
       case "planner":
         navigate("planner");
+        break;
+      case "prepare-goal-workflow":
+        await prepareGoalWorkflow();
+        break;
+      case "manage-goal-workflow":
+        openGoalWorkflowManager();
         break;
       case "tree-mode":
         state.techTree.mode = element.dataset.value === "object" ? "object" : "all";
@@ -8642,6 +10327,36 @@
         break;
       case "view-run":
         openRunDrawer(id);
+        break;
+      case "workflow-resume":
+        resumeGoalWorkflow();
+        break;
+      case "workflow-pause":
+        pauseGoalWorkflow();
+        break;
+      case "workflow-retry":
+        retryGoalWorkflowStep();
+        break;
+      case "workflow-exit":
+        exitGoalWorkflow();
+        break;
+      case "workflow-dismiss":
+        dismissGoalWorkflow();
+        break;
+      case "workflow-acknowledge":
+        await acknowledgeGoalWorkflowReview();
+        break;
+      case "workflow-activity":
+        {
+          const workflowConnectionId = state.goalWorkflow?.connection?.id;
+          closeDrawer();
+          if (workflowConnectionId && state.config.connections.some((connection) => connection.id === workflowConnectionId)) {
+            await selectConnection(workflowConnectionId, "activity");
+          } else {
+            navigate("activity");
+            toast("Workflow Driver profile is missing", "Activity can only be opened for a connection still saved in this console.", "warning", 7500);
+          }
+        }
         break;
       case "settings":
         navigate("settings");
@@ -8852,6 +10567,7 @@
     updateMusicUi();
   });
   byId("refresh-button").addEventListener("click", () => void refreshEverything());
+  byId("workflow-monitor").addEventListener("click", openGoalWorkflowManager);
   pexeInput.addEventListener("change", () => void installCartridgeFile(pexeInput.files?.[0]));
   dobjInput.addEventListener("change", () => void importObjectFile(dobjInput.files?.[0]));
   configInput.addEventListener("change", async () => {
@@ -8873,6 +10589,17 @@
 
   window.addEventListener("storage", (event) => {
     if (event.key === LEGACY_HARDWARE_INDEX_STORAGE_KEY) return;
+    if (event.key === GOAL_WORKFLOW_STORAGE_KEY) {
+      if (state.goalWorkflowLoopPromise) return;
+      const workflowDrawerWasOpen = state.drawer?.type === "workflow";
+      state.goalWorkflow = event.newValue ? loadGoalWorkflowSnapshot({ recoverInterrupted: false }) : null;
+      notifyGoalWorkflowChange();
+      if (!state.goalWorkflow && workflowDrawerWasOpen) {
+        closeDrawer();
+        toast("Workflow cleared", "The saved workflow was cleared in another tab.", "warning", 6500);
+      }
+      return;
+    }
     if (event.key !== STORAGE_KEY || !event.newValue) return;
     try {
       const incomingConfig = JSON.parse(event.newValue);
@@ -8940,6 +10667,7 @@
     state.screen = screenFromHash();
     if (!location.hash) history.replaceState(null, "", "#/home");
     render();
+    await recoverInterruptedGoalWorkflowAtStartup();
     await probeAllConnections();
     await loadWorkspace();
     setInterval(() => void probeAllConnections(), 15000);

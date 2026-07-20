@@ -806,6 +806,45 @@ button {
   justify-self: end;
 }
 
+.hud-actions {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-self: end;
+  gap: 8px;
+}
+
+.hud-actions .hud-button {
+  justify-self: auto;
+}
+
+.workflow-hud-button {
+  border-color: var(--amber);
+}
+
+.workflow-hud-button[data-workflow-status="running"],
+.workflow-hud-button[data-workflow-status="pausing"],
+.workflow-hud-button[data-workflow-status="stopping"] {
+  background: var(--amber);
+  color: var(--accent-ink);
+}
+
+.workflow-hud-button.is-alert {
+  border-color: var(--coral);
+  background: var(--coral);
+  color: var(--accent-ink);
+}
+
+.workflow-hud-button.is-complete {
+  border-color: var(--teal);
+  background: var(--teal);
+  color: var(--accent-ink);
+}
+
+.workflow-hud-icon {
+  line-height: 1;
+}
+
 .hud-button:hover:not(:disabled):not([aria-disabled="true"]),
 .breadcrumb-button:hover:not(:disabled):not([aria-disabled="true"]),
 .game-button:hover:not(:disabled):not([aria-disabled="true"]),
@@ -3787,6 +3826,10 @@ body.drawer-open {
   animation: drawer-step 150ms steps(3, end);
 }
 
+.drawer[data-drawer-type="workflow"] {
+  width: min(820px, calc(100vw - 24px));
+}
+
 .drawer-content {
   height: 100%;
   overflow-y: auto;
@@ -4031,6 +4074,341 @@ body.drawer-open {
   min-height: 32px;
   margin-top: 3px;
   padding-block: 5px;
+}
+
+.planner-workflow-launch {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 14px;
+  padding: 12px 14px;
+  margin: 0 0 13px;
+  border: 3px double var(--amber);
+  background:
+    repeating-linear-gradient(135deg, transparent 0 5px, var(--accent-hatch) 5px 10px),
+    var(--lcd-raised);
+  box-shadow: 4px 4px 0 var(--hard-shadow);
+}
+
+.planner-workflow-launch.is-active {
+  border-color: var(--teal);
+  background: var(--success-soft);
+}
+
+.planner-workflow-launch.is-disabled {
+  border-color: var(--lcd-line);
+  background: var(--lcd-raised);
+}
+
+.planner-workflow-launch > div {
+  display: grid;
+  min-width: 0;
+  gap: 4px;
+}
+
+.planner-workflow-launch > div > span,
+.planner-workflow-launch > div > small {
+  color: var(--lcd-muted);
+  font-size: 8px;
+  font-weight: 900;
+  letter-spacing: 0.07em;
+  line-height: 1.45;
+  text-transform: uppercase;
+}
+
+.planner-workflow-launch > div > span {
+  color: var(--amber);
+}
+
+.planner-workflow-launch > div > strong {
+  color: var(--lcd-text);
+  font-size: 14px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.planner-workflow-launch .game-button {
+  min-width: 170px;
+}
+
+.workflow-drawer-header small {
+  display: block;
+  margin-top: 6px;
+  color: var(--lcd-muted);
+  font-size: 8px;
+  font-weight: 900;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.workflow-drawer-header > div:first-child {
+  min-width: 0;
+}
+
+.workflow-drawer-header .drawer-title,
+.workflow-drawer-header small {
+  overflow-wrap: anywhere;
+}
+
+.workflow-drawer-body {
+  padding-bottom: 22px;
+}
+
+.workflow-summary {
+  margin-top: 0;
+}
+
+.workflow-overall {
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+  margin-top: 13px;
+  border: 2px solid var(--lcd-line);
+  background: var(--lcd-deep);
+  box-shadow: inset 3px 3px 0 var(--screen-inset-dark);
+}
+
+.workflow-overall > div {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.workflow-overall > div > span,
+.workflow-overall > small {
+  color: var(--lcd-muted);
+  font-size: 8px;
+  font-weight: 900;
+  letter-spacing: 0.06em;
+  line-height: 1.45;
+  text-transform: uppercase;
+}
+
+.workflow-overall > div > strong {
+  color: var(--teal);
+  font-size: 11px;
+}
+
+.workflow-overall progress {
+  width: 100%;
+  height: 18px;
+  overflow: hidden;
+  border: 2px solid var(--lcd-line);
+  border-radius: 0;
+  background: var(--lcd-raised);
+  accent-color: var(--teal);
+}
+
+.workflow-overall progress::-webkit-progress-bar {
+  background: var(--lcd-raised);
+}
+
+.workflow-overall progress::-webkit-progress-value {
+  background: repeating-linear-gradient(90deg, var(--teal) 0 8px, var(--teal-dark) 8px 12px);
+}
+
+.workflow-overall progress::-moz-progress-bar {
+  background: repeating-linear-gradient(90deg, var(--teal) 0 8px, var(--teal-dark) 8px 12px);
+}
+
+.workflow-message {
+  min-height: 18px;
+  margin: 11px 1px;
+  color: var(--lcd-muted);
+  font-size: 9px;
+  line-height: 1.5;
+}
+
+.workflow-layout {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: minmax(0, 1.15fr) minmax(260px, 0.85fr);
+  align-items: start;
+  gap: 12px;
+  margin-top: 13px;
+}
+
+.workflow-current-panel,
+.workflow-queue-panel {
+  min-width: 0;
+  margin: 0;
+}
+
+.workflow-current-panel .game-panel-header > span,
+.workflow-queue-panel .game-panel-header > span {
+  color: var(--amber);
+  font-size: 7px;
+  font-weight: 900;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+}
+
+.workflow-current-copy {
+  display: grid;
+  gap: 5px;
+  padding-bottom: 11px;
+  border-bottom: 2px dotted var(--lcd-line);
+}
+
+.workflow-current-copy > span,
+.workflow-current-copy > small {
+  color: var(--lcd-muted);
+  font-size: 8px;
+  font-weight: 900;
+  line-height: 1.5;
+  text-transform: uppercase;
+}
+
+.workflow-current-copy > span {
+  color: var(--amber);
+}
+
+.workflow-current-copy > strong {
+  color: var(--lcd-text);
+  font-size: 14px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.workflow-run-stage {
+  margin-top: 11px;
+}
+
+.workflow-check-meter {
+  padding: 11px;
+  border: 2px solid var(--lcd-line);
+  background: var(--lcd-deep);
+  box-shadow: inset 3px 3px 0 var(--screen-inset-dark);
+}
+
+.workflow-check-meter > span {
+  display: block;
+  color: var(--amber);
+  font-size: 8px;
+  font-weight: 900;
+  letter-spacing: 0.08em;
+}
+
+.workflow-check-meter > strong {
+  display: block;
+  margin-top: 5px;
+  color: var(--lcd-text);
+  font-size: 9px;
+  line-height: 1.5;
+}
+
+.workflow-check-meter.is-verifying .run-request-track span {
+  background: repeating-linear-gradient(90deg, var(--teal) 0 7px, var(--teal-dark) 7px 12px);
+}
+
+.workflow-run-link {
+  width: 100%;
+  margin-top: 10px;
+}
+
+.workflow-queue-list {
+  padding: 0;
+  margin: 0;
+  list-style: none;
+}
+
+.workflow-queue-row {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: 38px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 10px;
+  border-bottom: 1px solid var(--lcd-line);
+  background: var(--lcd-deep);
+}
+
+.workflow-queue-row:last-child {
+  border-bottom: 0;
+}
+
+.workflow-queue-row > span:nth-child(2) {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.workflow-queue-row > span > strong,
+.workflow-queue-row > span > small,
+.workflow-queue-row > .workflow-queue-time {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workflow-queue-row > span > strong {
+  color: var(--lcd-text);
+  font-size: 9px;
+  text-transform: uppercase;
+}
+
+.workflow-queue-row > span > small,
+.workflow-queue-row > .workflow-queue-time {
+  color: var(--lcd-muted);
+  font-size: 7px;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.workflow-queue-row > .workflow-queue-time {
+  color: var(--teal);
+  text-align: right;
+}
+
+.workflow-queue-row.is-complete {
+  background: var(--success-soft);
+}
+
+.workflow-queue-row.is-complete .planner-step-number {
+  border-color: var(--teal);
+  color: var(--teal);
+}
+
+.workflow-queue-row[aria-current="step"] {
+  background: var(--warning-soft);
+  box-shadow: inset 5px 0 0 var(--amber);
+}
+
+.workflow-queue-row.is-failed,
+.workflow-queue-row.is-needs-review {
+  background: var(--danger-soft);
+}
+
+.workflow-queue-row.is-failed .planner-step-number,
+.workflow-queue-row.is-needs-review .planner-step-number {
+  border-color: var(--coral);
+  color: var(--coral);
+}
+
+.workflow-queue-summary {
+  padding: 8px 10px;
+  border-bottom: 1px dotted var(--lcd-line);
+  color: var(--lcd-muted);
+  font-size: 7px;
+  font-weight: 900;
+  text-align: center;
+  text-transform: uppercase;
+}
+
+.workflow-safety-note {
+  margin-top: 13px;
+}
+
+.workflow-controls {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+  justify-content: stretch;
+}
+
+.workflow-controls .game-button {
+  width: 100%;
 }
 
 .planner-flow-key {
@@ -5041,6 +5419,73 @@ html.has-planner-tree-fullscreen .game-shell::after {
   }
 }
 
+@media (max-width: 700px) {
+  .hud-actions {
+    grid-column: 2;
+    grid-row: 1;
+    gap: 6px;
+  }
+
+  .hud-actions .hud-button {
+    width: 40px;
+    padding: 0;
+  }
+
+  .planner-workflow-launch {
+    grid-template-columns: minmax(0, 1fr);
+    align-items: stretch;
+  }
+
+  .planner-workflow-launch .game-button {
+    width: 100%;
+    min-width: 0;
+  }
+
+  .drawer[data-drawer-type="workflow"] {
+    width: calc(100vw - 16px);
+    height: calc(100vh - 16px);
+    height: calc(100dvh - 16px);
+    top: 8px;
+    right: 8px;
+  }
+
+  .workflow-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .workflow-controls {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    padding-inline: 10px;
+  }
+}
+
+@media (max-width: 420px) {
+  .workflow-drawer-header {
+    padding-inline: 12px;
+  }
+
+  .workflow-drawer-header .drawer-header-actions [data-workflow-badge] {
+    display: none;
+  }
+
+  .workflow-drawer-body {
+    padding: 13px;
+  }
+
+  .workflow-queue-row {
+    grid-template-columns: 36px minmax(0, 1fr);
+  }
+
+  .workflow-queue-row > .workflow-queue-time {
+    grid-column: 2;
+    text-align: left;
+  }
+
+  .workflow-controls {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,
@@ -5070,6 +5515,13 @@ html.has-planner-tree-fullscreen .game-shell::after {
     box-shadow: none;
   }
 
+  .workflow-overall progress {
+    appearance: auto;
+    border-color: CanvasText;
+    background: Canvas;
+    box-shadow: none;
+  }
+
   .game-shell,
   .game-stage,
   .menu-tile,
@@ -5079,6 +5531,8 @@ html.has-planner-tree-fullscreen .game-shell::after {
   .object-card,
   .game-panel,
   .home-cwi-prompt,
+  .planner-workflow-launch,
+  .workflow-overall,
   .drawer,
   .toast {
     box-shadow: none;

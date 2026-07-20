@@ -7,7 +7,7 @@ DO Console is a lightweight, retro-styled browser client for an existing Digital
 - Saved local and remote Driver connection profiles with live status
 - PEXE cartridge selection, installation, object browsing, and action execution
 - Full cartridge Petri-net tech tree and per-action I/O maps
-- Goal planner with dependency paths, action sets, and CWI-grounded time estimates
+- Goal planner with dependency paths, CWI-grounded estimates, and a persistent sequential workflow runner with play, pause, exit, and recovery controls
 - PoW/VDF difficulty indicators on object nodes
 - Client Work Index benchmark saved per Driver in browser storage
 - Multiple period-inspired screen palettes, background music, and optional UI sounds
