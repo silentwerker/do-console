@@ -19,6 +19,7 @@
   const HARDWARE_INDEX_PENDING_MAX_AGE_MS = 24 * 60 * 60_000;
   const HARDWARE_INDEX_POLL_MS = 1_200;
   const HARDWARE_INDEX_ACTION = Object.freeze({ pluginName: "craft-rocket", name: "MineIron" });
+  const ACTION_COMMIT_ALLOWANCE_MS = 60_000;
   const HARDWARE_INDEX_PROOF_START = Object.freeze({ phase: "generateProof", status: "running", message: "Generating proof" });
   const HARDWARE_INDEX_PROOF_STOP = Object.freeze({ phase: "generateProof", status: "done", message: "Proof generation complete" });
   const clearedHardwareIndexRunUrls = new Set();
@@ -3373,10 +3374,9 @@
     };
   }
 
-  // CWI-4 uses one transparent baseline: the observed selected-Driver Generate Proof
-  // event window for craft-rocket::MineIron. Commit is excluded. MineIron itself is
-  // observed; every other action is only a one-action average, never a fabricated
-  // PoW or VDF component rate.
+  // CWI-4 supplies the proof component. Every action estimate adds one fixed minute
+  // for average commit/settlement time. The stored CWI remains proof-only, and the
+  // planner sums this combined estimate once per unique action step.
   function estimateActionProofTiming(
     action,
     cwiResult = currentHardwareIndex(),
@@ -3390,7 +3390,9 @@
       String(action?.hash || "") === cwi.actionHash
     );
     const directWorkKnown = (workload.pow.knownCount || 0) + (workload.vdf.knownCount || 0) > 0;
-    const totalMilliseconds = hasCwi ? cwi.durationMs : null;
+    const proofMilliseconds = hasCwi ? cwi.durationMs : null;
+    const commitAllowanceMilliseconds = ACTION_COMMIT_ALLOWANCE_MS;
+    const totalMilliseconds = hasCwi ? proofMilliseconds + commitAllowanceMilliseconds : null;
     return {
       workload,
       cwi,
@@ -3404,6 +3406,8 @@
       coverage: hasCwi ? (benchmarkAction ? "observed" : "average") : "unknown",
       estimateKind: hasCwi ? (benchmarkAction ? "observed" : "average") : "unavailable",
       benchmarkAction,
+      proofMilliseconds,
+      commitAllowanceMilliseconds,
       totalMilliseconds,
       powMilliseconds: null,
       vdfMilliseconds: null,
@@ -3730,7 +3734,7 @@
         ${readout}
         ${buttonMarkup}
       </div>
-      <p class="hardware-index-note"><strong>${HARDWARE_INDEX_LABEL}</strong> measures one exact Driver event window: <code>generateProof/running</code> with message <code>Generating proof</code> through <code>generateProof/done</code> with message <code>Proof generation complete</code>. Transaction submission, commit, confirmation, and live-output verification are excluded. The submitted MineIron still settles and may create one retained Iron. Proof baselines/hr is one hour divided by the observed proof duration, so higher is faster when the Driver version and MineIron action hash match. Planner estimates reuse this proof-only baseline; other actions may differ substantially.</p>`;
+      <p class="hardware-index-note"><strong>${HARDWARE_INDEX_LABEL}</strong> measures one exact Driver event window: <code>generateProof/running</code> with message <code>Generating proof</code> through <code>generateProof/done</code> with message <code>Proof generation complete</code>. Transaction submission, commit, confirmation, and live-output verification are excluded. The submitted MineIron still settles and may create one retained Iron. Proof baselines/hr is one hour divided by the observed proof duration, so higher is faster when the Driver version and MineIron action hash match. Action and planner estimates use this proof baseline plus a fixed ${escapeHtml(formatProofDuration(ACTION_COMMIT_ALLOWANCE_MS))} average commit allowance per action; actual commit time can vary.</p>`;
   }
 
   function hardwareIndexAnnouncement() {
@@ -5958,15 +5962,15 @@
     if (!timing) return "Time unknown";
     if (timing.requiresCwi) return "Run CWI";
     if (timing.totalMilliseconds == null) return "Time unknown";
-    return timing.estimateKind === "observed"
-      ? `${formatProofDuration(timing.totalMilliseconds)} observed`
-      : `~${formatProofDuration(timing.totalMilliseconds)} avg`;
+    return `~${formatProofDuration(timing.totalMilliseconds)} total`;
   }
 
   function plannerDirectTimingBreakdown(timing) {
     if (!timing?.workload) return "PoW unknown / VDF unknown";
-    const source = timing.estimateKind === "observed" ? "MineIron observed" : timing.hasCwi ? "CWI average" : "No CWI";
-    return `PoW ${timing.workload.pow.level} / VDF ${timing.workload.vdf.level} / ${source}`;
+    if (timing.requiresCwi) return `PoW ${timing.workload.pow.level} / VDF ${timing.workload.vdf.level} / proof baseline requires CWI`;
+    const source = timing.estimateKind === "observed" ? "proof observed" : timing.hasCwi ? "proof average" : "no CWI";
+    const proof = timing.proofMilliseconds == null ? "proof unknown" : `${formatProofDuration(timing.proofMilliseconds)} ${source}`;
+    return `PoW ${timing.workload.pow.level} / VDF ${timing.workload.vdf.level} / ${proof} + ${formatProofDuration(timing.commitAllowanceMilliseconds)} commit`;
   }
 
   function buildPlannerDisplayTree(result, timingByStep, catalog) {
@@ -6368,7 +6372,7 @@
         ? "Already available / no actions"
         : totalTiming.requiresCwi
           ? "Run CWI to apply the MineIron proof-window baseline"
-          : `${totalTiming.count} action${totalTiming.count === 1 ? "" : "s"} × ${formatProofDuration(cwi?.durationMs)} MineIron proof baseline`;
+          : `${totalTiming.count} action${totalTiming.count === 1 ? "" : "s"} × (${formatProofDuration(cwi?.durationMs)} proof + ${formatProofDuration(ACTION_COMMIT_ALLOWANCE_MS)} average commit)`;
     const tree = buildPlannerDisplayTree(result, timingByStep, context.catalog);
     const stateLabel = {
       satisfied: "Already on hand",
@@ -6383,7 +6387,7 @@
         : gameButton("Run CWI", "run-hardware-index", { tone: "primary" })
       : "";
     const groundingNote = cwi
-      ? `Observed MineIron proof window ${formatProofDuration(cwi.durationMs)} / commit excluded / ${formatDate(cwi.measuredAt)}`
+      ? `Observed MineIron proof window ${formatProofDuration(cwi.durationMs)} / estimates add ${formatProofDuration(ACTION_COMMIT_ALLOWANCE_MS)} average commit per action / ${formatDate(cwi.measuredAt)}`
       : totalTiming.requiresCwi
         ? hardwareIndexUiIsActive()
           ? state.hardwareIndex.status === "settling"
@@ -6443,12 +6447,12 @@
       ...result.steps.flatMap((step) => step.warnings || []),
     ])].filter(Boolean).map((message) => `<li><span>${escapeHtml(message)}</span></li>`);
     const inventorySatisfiedNote = result.status === "satisfied" && result.goal.semantics === "target-total"
-      ? '<div class="terminal-note planner-mode-note"><strong>This object is already on hand.</strong> Choose <em>Make one more</em> above to build its component tree, action set, and proof-time estimate.</div>'
+      ? '<div class="terminal-note planner-mode-note"><strong>This object is already on hand.</strong> Choose <em>Make one more</em> above to build its component tree, action set, and total-time estimate.</div>'
       : "";
     return `
       <div class="planner-summary" aria-label="Plan summary">
         <div class="planner-summary-item"><span>Goal state</span><strong>${escapeHtml(stateLabel)}</strong><small>${escapeHtml(result.goal.label)} / ${escapeHtml(shortText(result.goal.hash, 6, 4))} / ${escapeHtml(goalRule)}</small></div>
-        <div class="planner-summary-item"><span>Total proof work</span><strong aria-live="polite" aria-atomic="true">${escapeHtml(totalLabel)}</strong><small>${escapeHtml(totalBasis)}<br />${escapeHtml(plannerWorkloadLabel(totalWorkload))}</small></div>
+        <div class="planner-summary-item"><span>Estimated total time</span><strong aria-live="polite" aria-atomic="true">${escapeHtml(totalLabel)}</strong><small>${escapeHtml(totalBasis)}<br />${escapeHtml(plannerWorkloadLabel(totalWorkload))}</small></div>
         <div class="planner-summary-item"><span>Action set</span><strong>${result.totals.actionCount}</strong><small>${escapeHtml(actionSetBasis)}</small></div>
         <div class="planner-summary-item"><span>Grounding</span><strong>${cwi ? `${HARDWARE_INDEX_LABEL} ${formatProofDuration(cwi.durationMs)}` : "No CWI"}</strong><small>${escapeHtml(groundingNote)}</small>${cwiControl}</div>
       </div>
@@ -6457,7 +6461,7 @@
       ${plannerTreeSvg(tree, timingByStep, context.cartridge.name)}
       ${plannerStepListMarkup(context, timingByStep)}
       ${diagnosticMarkup.length || warningMarkup.length ? `<div class="terminal-note warning planner-diagnostics"><strong>Plan limits</strong><ul>${[...diagnosticMarkup, ...warningMarkup].slice(0, 8).join("")}</ul></div>` : ""}
-      <div class="terminal-note planner-truth-note">CWI records the exact Driver window from <code>generateProof/running</code> with message <code>Generating proof</code> through <code>generateProof/done</code> with message <code>Proof generation complete</code>. Transaction submission, commit, confirmation, and live output are excluded. The planner total is action count × that proof-only baseline. MineIron with the measured action hash is observed; every other step is a CWI average, not an action-specific prediction. PoW/VDF labels describe readable gate severity only and do not add fabricated component seconds. Bounded shortest search is used first; any valid goal-directed fallback is labeled and may not be minimal. UPDATE arcs mark paired same-class turnover, not verified object identity or field results. Refresh or replan after every real action.</div>`;
+      <div class="terminal-note planner-truth-note">CWI records the exact Driver window from <code>generateProof/running</code> with message <code>Generating proof</code> through <code>generateProof/done</code> with message <code>Proof generation complete</code>. CWI itself excludes commit. Every action estimate adds a fixed ${escapeHtml(formatProofDuration(ACTION_COMMIT_ALLOWANCE_MS))} average commit allowance, so the planner total is the sum of proof baseline + commit allowance for each action step. Actual commit time can vary. MineIron with the measured action hash has an observed proof component; every other proof component is a CWI average, not an action-specific prediction. PoW/VDF labels describe readable gate severity only and do not add fabricated component seconds. Bounded shortest search is used first; any valid goal-directed fallback is labeled and may not be minimal. UPDATE arcs mark paired same-class turnover, not verified object identity or field results. Refresh or replan after every real action.</div>`;
   }
 
   function plannerGoalOptionsMarkup(context) {
@@ -7172,29 +7176,36 @@
 
   function actionProofTotalTimingLabel(timing) {
     if (timing.totalMilliseconds != null) {
-      return timing.estimateKind === "observed"
-        ? `${formatProofDuration(timing.totalMilliseconds)} OBSERVED`
-        : `~${formatProofDuration(timing.totalMilliseconds)} AVG`;
+      return `~${formatProofDuration(timing.totalMilliseconds)}`;
     }
     if (timing.requiresCwi) return hardwareIndexUiIsActive() ? "CWI ACTIVE" : "CWI REQUIRED";
     return "UNKNOWN";
   }
 
-  function actionProofEstimateSummary(timing) {
+  function actionEstimateTargetLabel(action) {
+    const outputs = [...new Set(
+      (Array.isArray(action?.totalOutputs) ? action.totalOutputs : [])
+        .map((output) => String(output?.class?.name || "").trim())
+        .filter(Boolean),
+    )];
+    return outputs.length === 1 ? `Estimated total / ${outputs[0]}` : "Estimated total action time";
+  }
+
+  function actionProofEstimateSummary(action, timing) {
     const stateLabel = timing.estimateKind === "observed"
-      ? "MINEIRON PROOF OBSERVED"
+      ? "OBSERVED PROOF + COMMIT ALLOWANCE"
       : timing.estimateKind === "average"
-        ? "CWI PROOF-WINDOW AVERAGE"
+        ? "PROOF AVERAGE + COMMIT ALLOWANCE"
         : "CALIBRATION REQUIRED";
     const detail = timing.estimateKind === "observed"
-      ? "This exact MineIron action hash was measured from the Generate Proof start sentinel to its done sentinel; commit was excluded."
+      ? `This MineIron proof component was observed; the total adds a fixed ${formatProofDuration(timing.commitAllowanceMilliseconds)} average commit allowance.`
       : timing.estimateKind === "average"
-        ? "The measured MineIron proof window is reused as a transparent average; it is not specific to this action."
-        : "Run one real MineIron Generate Proof window on the selected Driver to establish the baseline.";
+        ? `The CWI proof average is reused for this action, then a fixed ${formatProofDuration(timing.commitAllowanceMilliseconds)} average commit allowance is added.`
+        : "Run one real MineIron Generate Proof window on the selected Driver to establish the proof component.";
     const stateClass = timing.hasCwi ? "is-complete" : "is-unknown";
     return `
       <div class="proof-estimate-summary ${stateClass}">
-        <div><span>Selected-Driver proof baseline</span><strong>${escapeHtml(actionProofTotalTimingLabel(timing))}</strong></div>
+        <div><span>${escapeHtml(actionEstimateTargetLabel(action))}</span><strong>${escapeHtml(actionProofTotalTimingLabel(timing))}</strong></div>
         <div><span>${escapeHtml(stateLabel)}</span><small>${escapeHtml(detail)}</small></div>
       </div>`;
   }
@@ -7211,8 +7222,8 @@
         : "";
     return `
       <div class="proof-cwi-source">
-        <span><b>${HARDWARE_INDEX_LABEL} ${escapeHtml(formatProofDuration(cwi.durationMs))}</b> / ${escapeHtml(formatMineIronRate(cwi))}${escapeHtml(liveState)}</span>
-        <small>${escapeHtml(cwi.driverUrl)} / action ${escapeHtml(shortText(cwi.actionHash, 10, 7))} / measured ${escapeHtml(formatDate(cwi.measuredAt))}</small>
+        <span>Raw ${HARDWARE_INDEX_LABEL} proof baseline <b>${escapeHtml(formatProofDuration(cwi.durationMs))}</b>${escapeHtml(liveState)}</span>
+        <small>Proof only / estimates add ${escapeHtml(formatProofDuration(ACTION_COMMIT_ALLOWANCE_MS))} average commit / ${escapeHtml(cwi.driverUrl)} / ${escapeHtml(shortText(cwi.actionHash, 10, 7))} / ${escapeHtml(formatDate(cwi.measuredAt))}</small>
       </div>`;
   }
 
@@ -7277,14 +7288,14 @@
         <small>${escapeHtml(value.detail)}</small>
       </div>`;
     return `
-      ${actionProofEstimateSummary(timing)}
+      ${actionProofEstimateSummary(action, timing)}
       <div class="proof-rating-grid">
         ${rating("PoW / inferred search", workload.pow)}
         ${rating("VDF / literal chain", workload.vdf)}
       </div>
-      ${actionProofCwiSourceMarkup(timing)}
       ${actionProofCwiCalloutMarkup(timing)}
-      <p class="action-proof-note">PoW and VDF remain severity/workload labels only. CWI does not invent separate component rates: it measures the MineIron window from <code>generateProof/running</code> “Generating proof” through <code>generateProof/done</code> “Proof generation complete”, excluding commit, then uses that duration as the planner's per-action average. Only the measured MineIron action hash is an observed action-specific time.</p>`;
+      <p class="action-proof-note">PoW and VDF remain severity/workload labels only. CWI measures the MineIron proof window from <code>generateProof/running</code> “Generating proof” through <code>generateProof/done</code> “Proof generation complete”. Each action estimate uses that proof component and adds ${escapeHtml(formatProofDuration(ACTION_COMMIT_ALLOWANCE_MS))} for average commit time. Actual commit time can vary.</p>
+      ${actionProofCwiSourceMarkup(timing)}`;
   }
 
   function actionProofTimingAnnouncement(action) {
@@ -7293,8 +7304,8 @@
     if (timing.requiresCwi && state.hardwareIndex.status === "running") return "A real MineIron Generate Proof measurement is in progress.";
     if (timing.requiresCwi) return "Client work index is required for the selected-Driver proof-window baseline.";
     if (timing.totalMilliseconds == null) return "Action timing is unknown.";
-    const qualifier = timing.estimateKind === "observed" ? "Observed MineIron proof window, commit excluded" : "CWI proof-window average, not action-specific";
-    return `${qualifier}: ${formatProofDuration(timing.totalMilliseconds)}.`;
+    const proofSource = timing.estimateKind === "observed" ? "observed MineIron proof" : "CWI proof average";
+    return `Estimated total action time: ${formatProofDuration(timing.totalMilliseconds)}. Includes ${formatProofDuration(timing.proofMilliseconds)} ${proofSource} plus ${formatProofDuration(timing.commitAllowanceMilliseconds)} average commit allowance.`;
   }
 
   function actionProofRequirementsMarkup(action) {
@@ -7302,7 +7313,7 @@
     return `
       <section class="game-panel action-proof-panel" data-hardware-index data-hardware-index-view="action-proof" data-action-key="${escapeHtml(key)}" data-cwi-state="${escapeHtml(state.hardwareIndex.status)}" tabindex="-1" aria-labelledby="action-proof-title">
         <span class="sr-only" data-hardware-index-announcement aria-live="polite" aria-atomic="true">${escapeHtml(actionProofTimingAnnouncement(action))}</span>
-        <div class="game-panel-header"><h3 id="action-proof-title">Direct work gates</h3><span>CWI proof baseline</span></div>
+        <div class="game-panel-header"><h3 id="action-proof-title">Direct work gates</h3><span>Action estimate</span></div>
         <div class="game-panel-body" data-hardware-index-content>${actionProofRequirementsContentMarkup(action)}</div>
       </section>`;
   }
@@ -8014,7 +8025,7 @@
         <div class="game-panel hardware-index-panel">
           <div class="game-panel-header"><h2>Client work index</h2><span>Selected Driver proof baseline</span></div>
           <div class="game-panel-body">
-            <p class="screen-copy hardware-index-intro">Run one real zero-input <code>craft-rocket::MineIron</code> action and measure one exact Driver event window: <code>generateProof/running</code> with message <code>Generating proof</code> through <code>generateProof/done</code> with message <code>Proof generation complete</code>. The timer freezes at the stop event, and proof baselines/hr reports relative machine throughput: higher is faster when the Driver version and MineIron action hash match. Transaction submission, chain commit, confirmation, and live-output verification continue as settlement but are excluded from CWI. The submitted action may create one retained Iron and cannot be cancelled by closing this page. Allow several minutes on slower hardware. The run id is saved immediately, and completed proof measurements are stored locally per Driver URL, Driver version, and MineIron action hash for 30 days.</p>
+            <p class="screen-copy hardware-index-intro">Run one real zero-input <code>craft-rocket::MineIron</code> action and measure one exact Driver event window: <code>generateProof/running</code> with message <code>Generating proof</code> through <code>generateProof/done</code> with message <code>Proof generation complete</code>. The timer freezes at the stop event, and proof baselines/hr reports relative machine throughput: higher is faster when the Driver version and MineIron action hash match. Transaction submission, chain commit, confirmation, and live-output verification continue as settlement but are excluded from CWI. Action and planner estimates add a fixed ${escapeHtml(formatProofDuration(ACTION_COMMIT_ALLOWANCE_MS))} average commit allowance to this proof baseline for every action. The submitted action may create one retained Iron and cannot be cancelled by closing this page. Allow several minutes on slower hardware. The run id is saved immediately, and completed proof measurements are stored locally per Driver URL, Driver version, and MineIron action hash for 30 days.</p>
             <div class="hardware-index" id="config-cwi-panel" tabindex="-1" data-hardware-index data-hardware-index-view="full">
               <span class="sr-only" data-hardware-index-announcement aria-live="polite" aria-atomic="true">${escapeHtml(hardwareIndexAnnouncement())}</span>
               <div data-hardware-index-content>${hardwareIndexContentMarkup()}</div>

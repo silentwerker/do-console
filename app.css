@@ -3023,20 +3023,29 @@ html.has-tech-tree-fullscreen body {
 
 .proof-cwi-source {
   display: grid;
-  gap: 4px;
-  padding: 9px 11px;
+  gap: 2px;
+  padding: 6px 8px;
   margin-top: 10px;
-  border: 1px solid var(--teal-dark);
-  background: var(--success-soft);
+  border: 1px solid var(--lcd-line);
+  background: var(--lcd-deep);
 }
 
 .proof-cwi-source span {
-  color: var(--teal-dark);
+  color: var(--lcd-muted);
+  font-size: 7px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
 }
 
 .proof-cwi-source b {
-  color: var(--teal);
-  font-size: 9px;
+  color: var(--lcd-text);
+  font-size: 8px;
+}
+
+.proof-cwi-source small {
+  font-size: 7px;
+  font-weight: 700;
+  line-height: 1.35;
 }
 
 .proof-cwi-callout {
