@@ -8,17 +8,19 @@
 
   const CONFIG_VERSION = 1;
   const STORAGE_KEY = "don.lightConsole.config.v1";
-  const HARDWARE_INDEX_VERSION = 3;
-  const HARDWARE_INDEX_LABEL = "CWI-3";
-  const HARDWARE_INDEX_BENCHMARK_ID = "driver-craft-rocket-mineiron-v1";
-  const HARDWARE_INDEX_SCOPE = "selected-driver-committed-action-lifecycle";
-  const HARDWARE_INDEX_ALGORITHM = "craft-rocket::MineIron/request-to-live-verified-v1";
+  const HARDWARE_INDEX_VERSION = 4;
+  const HARDWARE_INDEX_LABEL = "CWI-4";
+  const HARDWARE_INDEX_BENCHMARK_ID = "driver-craft-rocket-mineiron-proof-window-v1";
+  const HARDWARE_INDEX_SCOPE = "selected-driver-generate-proof-window";
+  const HARDWARE_INDEX_ALGORITHM = "craft-rocket::MineIron/generateProof-running-to-done-v1";
   const LEGACY_HARDWARE_INDEX_STORAGE_KEY = "don.lightConsole.clientWorkIndex.v1";
   const HARDWARE_INDEX_MAX_AGE_MS = 30 * 24 * 60 * 60_000;
   const HARDWARE_INDEX_MAX_RUN_MS = 30 * 60_000;
   const HARDWARE_INDEX_PENDING_MAX_AGE_MS = 24 * 60 * 60_000;
   const HARDWARE_INDEX_POLL_MS = 1_200;
   const HARDWARE_INDEX_ACTION = Object.freeze({ pluginName: "craft-rocket", name: "MineIron" });
+  const HARDWARE_INDEX_PROOF_START = Object.freeze({ phase: "generateProof", status: "running", message: "Generating proof" });
+  const HARDWARE_INDEX_PROOF_STOP = Object.freeze({ phase: "generateProof", status: "done", message: "Proof generation complete" });
   const clearedHardwareIndexRunUrls = new Set();
   const HANDLE_DB = "don-light-console";
   const HANDLE_STORE = "handles";
@@ -227,23 +229,37 @@
     const reportedDurationMs = Number(value.durationMs);
     const requestedAt = String(value.requestedAt || "");
     const acceptedAt = String(value.acceptedAt || "");
-    const completedAt = String(value.completedAt || value.measuredAt || "");
-    const measuredAt = completedAt;
+    const proofStartedAt = String(value.proofStartedAt || "");
+    const proofCompletedAt = String(value.proofCompletedAt || value.measuredAt || "");
+    const measuredAt = proofCompletedAt;
     const requestedTimestamp = new Date(requestedAt).valueOf();
     const acceptedTimestamp = new Date(acceptedAt).valueOf();
+    const proofStartedTimestamp = new Date(proofStartedAt).valueOf();
     const measuredTimestamp = new Date(measuredAt).valueOf();
-    const durationMs = measuredTimestamp - requestedTimestamp;
-    const outputFiles = Array.isArray(value.outputFiles)
-      ? value.outputFiles.map(String).filter(Boolean).slice(0, 16)
-      : [];
+    const durationMs = measuredTimestamp - proofStartedTimestamp;
+    const timingSource = new Set(["live-run-sse", "resumed-client-clock", "poll-observed"]).has(value.timingSource)
+      ? value.timingSource
+      : "";
+    const proofStartProgressIndex = Number(value.proofStartProgressIndex);
+    const proofStopProgressIndex = Number(value.proofStopProgressIndex);
+    const settlementStatus = new Set(["pending", "succeeded", "failed"]).has(value.settlementStatus)
+      ? value.settlementStatus
+      : "pending";
+    const settledAt = String(value.settledAt || "");
+    const settledTimestamp = settledAt ? new Date(settledAt).valueOf() : NaN;
+    const settlementError = String(value.settlementError || "").slice(0, 1000);
     if (
       !driverUrl || !actionHash || !runId ||
       !Number.isFinite(reportedDurationMs) || Math.abs(reportedDurationMs - durationMs) > 1 ||
-      !Number.isFinite(durationMs) || durationMs <= 0 || durationMs > 24 * 60 * 60_000 || outputFiles.length !== 1 ||
-      !Number.isFinite(requestedTimestamp) || !Number.isFinite(acceptedTimestamp) || !Number.isFinite(measuredTimestamp) ||
-      acceptedTimestamp < requestedTimestamp || measuredTimestamp < acceptedTimestamp ||
+      !Number.isFinite(durationMs) || durationMs <= 0 || durationMs > 24 * 60 * 60_000 || !timingSource ||
+      !Number.isInteger(proofStartProgressIndex) || proofStartProgressIndex < 0 ||
+      !Number.isInteger(proofStopProgressIndex) || proofStopProgressIndex <= proofStartProgressIndex ||
+      !Number.isFinite(requestedTimestamp) || !Number.isFinite(acceptedTimestamp) ||
+      !Number.isFinite(proofStartedTimestamp) || !Number.isFinite(measuredTimestamp) ||
+      acceptedTimestamp < requestedTimestamp || proofStartedTimestamp < acceptedTimestamp || measuredTimestamp < proofStartedTimestamp ||
       measuredTimestamp > Date.now() + 5 * 60_000 ||
-      measuredTimestamp < Date.now() - HARDWARE_INDEX_MAX_AGE_MS
+      measuredTimestamp < Date.now() - HARDWARE_INDEX_MAX_AGE_MS ||
+      (settlementStatus !== "pending" && (!Number.isFinite(settledTimestamp) || settledTimestamp < measuredTimestamp))
     ) return null;
     return {
       version: HARDWARE_INDEX_VERSION,
@@ -258,10 +274,16 @@
       durationMs,
       requestedAt,
       acceptedAt,
-      completedAt,
+      proofStartedAt,
+      proofCompletedAt,
       measuredAt,
-      outputFiles,
-      mineIronPerHour: 3_600_000 / durationMs,
+      timingSource,
+      proofStartProgressIndex,
+      proofStopProgressIndex,
+      settlementStatus,
+      settledAt: settlementStatus === "pending" ? "" : settledAt,
+      settlementError: settlementStatus === "failed" ? settlementError : "",
+      mineIronProofsPerHour: 3_600_000 / durationMs,
     };
   }
 
@@ -276,33 +298,76 @@
   }
 
   function normalizeHardwareIndexRun(value) {
+    const legacyCwi3 = Boolean(
+      value?.version === 3 &&
+      value?.benchmarkId === "driver-craft-rocket-mineiron-v1" &&
+      sameQualified(value?.action, HARDWARE_INDEX_ACTION)
+    );
+    const source = legacyCwi3
+      ? {
+          ...value,
+          version: HARDWARE_INDEX_VERSION,
+          benchmarkId: HARDWARE_INDEX_BENCHMARK_ID,
+          scope: HARDWARE_INDEX_SCOPE,
+          algorithm: HARDWARE_INDEX_ALGORITHM,
+          phase: value.runId ? "settling" : value.phase,
+          measurementError: value.runId
+            ? "This accepted CWI-3 run is retained for settlement safety but cannot produce a CWI-4 proof-window score."
+            : value.measurementError,
+        }
+      : value;
     if (
-      !value ||
-      value.version !== HARDWARE_INDEX_VERSION ||
-      value.benchmarkId !== HARDWARE_INDEX_BENCHMARK_ID ||
-      value.scope !== HARDWARE_INDEX_SCOPE ||
-      value.algorithm !== HARDWARE_INDEX_ALGORITHM ||
-      !sameQualified(value.action, HARDWARE_INDEX_ACTION)
+      !source ||
+      source.version !== HARDWARE_INDEX_VERSION ||
+      source.benchmarkId !== HARDWARE_INDEX_BENCHMARK_ID ||
+      source.scope !== HARDWARE_INDEX_SCOPE ||
+      source.algorithm !== HARDWARE_INDEX_ALGORITHM ||
+      !sameQualified(source.action, HARDWARE_INDEX_ACTION)
     ) return null;
-    const driverUrl = normalizedDriverUrl(value.driverUrl);
-    const driverVersion = String(value.driverVersion || "").slice(0, 160);
-    const actionHash = String(value.actionHash || "").trim().slice(0, 512);
-    const runId = String(value.runId || "").trim().slice(0, 256);
-    const phase = new Set(["submitting", "outcome-unknown", "accepted"]).has(value.phase)
-      ? value.phase
+    const driverUrl = normalizedDriverUrl(source.driverUrl);
+    const driverVersion = String(source.driverVersion || "").slice(0, 160);
+    const actionHash = String(source.actionHash || "").trim().slice(0, 512);
+    const runId = String(source.runId || "").trim().slice(0, 256);
+    const phases = new Set(["submitting", "outcome-unknown", "accepted", "proof-running", "settling", "settled"]);
+    const phase = phases.has(source.phase)
+      ? source.phase
       : runId
         ? "accepted"
         : "";
-    const submissionId = String(value.submissionId || "").trim().slice(0, 256);
-    const requestedAt = String(value.requestedAt || value.acceptedAt || "");
-    const acceptedAt = String(value.acceptedAt || "");
-    const timestamp = new Date(requestedAt).valueOf();
+    const submissionId = String(source.submissionId || "").trim().slice(0, 256);
+    const requestedAt = String(source.requestedAt || source.acceptedAt || "");
+    const acceptedAt = String(source.acceptedAt || "");
+    const proofStartedAt = String(source.proofStartedAt || "");
+    const proofCompletedAt = String(source.proofCompletedAt || "");
+    const proofStartProgressIndex = Number.isInteger(Number(source.proofStartProgressIndex))
+      ? Number(source.proofStartProgressIndex)
+      : -1;
+    const proofStopProgressIndex = Number.isInteger(Number(source.proofStopProgressIndex))
+      ? Number(source.proofStopProgressIndex)
+      : -1;
+    const lastProgressIndex = Number.isInteger(Number(source.lastProgressIndex))
+      ? Math.max(-1, Number(source.lastProgressIndex))
+      : -1;
+    const timingSource = new Set(["live-run-sse", "resumed-client-clock", "poll-observed"]).has(source.timingSource)
+      ? source.timingSource
+      : "";
+    const measurementError = String(source.measurementError || "").slice(0, 1000);
+    const settledAt = String(source.settledAt || "");
+    const terminalStatus = new Set(["succeeded", "failed"]).has(source.terminalStatus) ? source.terminalStatus : "";
+    const terminalError = String(source.terminalError || "").slice(0, 1000);
+    const lifecycleTimestamp = phase === "settled" ? new Date(settledAt).valueOf() : new Date(requestedAt).valueOf();
     const acceptedTimestamp = new Date(acceptedAt).valueOf();
+    const proofStartedTimestamp = new Date(proofStartedAt).valueOf();
+    const proofCompletedTimestamp = new Date(proofCompletedAt).valueOf();
+    const requiresRun = new Set(["accepted", "proof-running", "settling", "settled"]).has(phase);
     if (
       !driverUrl || !actionHash || !phase || (!runId && !submissionId) ||
-      (phase === "accepted" && (!runId || !Number.isFinite(acceptedTimestamp))) || !Number.isFinite(timestamp) ||
-      timestamp > Date.now() + 5 * 60_000 ||
-      timestamp < Date.now() - HARDWARE_INDEX_PENDING_MAX_AGE_MS
+      (requiresRun && (!runId || !Number.isFinite(acceptedTimestamp))) ||
+      (phase === "proof-running" && (!Number.isFinite(proofStartedTimestamp) || proofStartProgressIndex < 0)) ||
+      (proofCompletedAt && (!Number.isFinite(proofCompletedTimestamp) || proofStopProgressIndex <= proofStartProgressIndex)) ||
+      (phase === "settled" && (!terminalStatus || !Number.isFinite(lifecycleTimestamp))) ||
+      !Number.isFinite(lifecycleTimestamp) || lifecycleTimestamp > Date.now() + 5 * 60_000 ||
+      lifecycleTimestamp < Date.now() - HARDWARE_INDEX_PENDING_MAX_AGE_MS
     ) return null;
     return {
       version: HARDWARE_INDEX_VERSION,
@@ -311,8 +376,8 @@
       algorithm: HARDWARE_INDEX_ALGORITHM,
       driverUrl,
       driverVersion,
-      connectionId: String(value.connectionId || "").slice(0, 256),
-      connectionName: String(value.connectionName || "Driver").slice(0, 160),
+      connectionId: String(source.connectionId || "").slice(0, 256),
+      connectionName: String(source.connectionName || "Driver").slice(0, 160),
       action: { ...HARDWARE_INDEX_ACTION },
       actionHash,
       runId,
@@ -321,6 +386,16 @@
       outcomeUnknown: phase === "outcome-unknown",
       requestedAt,
       acceptedAt,
+      proofStartedAt,
+      proofCompletedAt,
+      proofStartProgressIndex,
+      proofStopProgressIndex,
+      lastProgressIndex: Math.max(lastProgressIndex, proofStartProgressIndex, proofStopProgressIndex),
+      timingSource,
+      measurementError,
+      settledAt: phase === "settled" ? settledAt : "",
+      terminalStatus: phase === "settled" ? terminalStatus : "",
+      terminalError: phase === "settled" && terminalStatus === "failed" ? terminalError : "",
     };
   }
 
@@ -335,13 +410,11 @@
   }
 
   function pruneHardwareIndexRunMap(runs, results) {
-    const pruned = normalizeHardwareIndexRunMap(runs);
-    const normalizedResults = normalizeHardwareIndexMap(results);
-    for (const [key, run] of Object.entries(pruned)) {
-      const result = normalizedResults[key];
-      if (result && new Date(result.measuredAt).valueOf() >= new Date(run.requestedAt).valueOf()) delete pruned[key];
-    }
-    return pruned;
+    void results;
+    // A proof-window result is available before the action settles. Keep the
+    // accepted/settling run record as a lock until a terminal tombstone wins
+    // cross-tab merging; normalizing the map also expires old tombstones.
+    return normalizeHardwareIndexRunMap(runs);
   }
 
   function hardwareIndexTimestamp(result) {
@@ -357,6 +430,11 @@
   function compareHardwareIndexes(left, right) {
     const timestampDifference = hardwareIndexTimestamp(left) - hardwareIndexTimestamp(right);
     if (timestampDifference) return timestampDifference;
+    const settlementRank = { pending: 0, failed: 1, succeeded: 1 };
+    const settlementDifference = (settlementRank[left?.settlementStatus] || 0) - (settlementRank[right?.settlementStatus] || 0);
+    if (settlementDifference) return settlementDifference;
+    const settledDifference = new Date(left?.settledAt || 0).valueOf() - new Date(right?.settledAt || 0).valueOf();
+    if (settledDifference) return settledDifference;
     const leftFingerprint = hardwareIndexFingerprint(left);
     const rightFingerprint = hardwareIndexFingerprint(right);
     return leftFingerprint === rightFingerprint ? 0 : leftFingerprint > rightFingerprint ? 1 : -1;
@@ -385,11 +463,39 @@
 
   function mergeHardwareIndexRunMaps(...maps) {
     const merged = {};
-    const phaseRank = { submitting: 0, "outcome-unknown": 1, accepted: 2 };
+    const phaseRank = { submitting: 0, "outcome-unknown": 1, accepted: 2, "proof-running": 3, settling: 4, settled: 5 };
+    const mergeSameRun = (previous, run) => {
+      const advanced = (phaseRank[run.phase] || 0) >= (phaseRank[previous.phase] || 0) ? run : previous;
+      const other = advanced === run ? previous : run;
+      return normalizeHardwareIndexRun({
+        ...other,
+        ...advanced,
+        runId: advanced.runId || other.runId,
+        proofStartedAt: advanced.proofStartedAt || other.proofStartedAt,
+        proofCompletedAt: advanced.proofCompletedAt || other.proofCompletedAt,
+        proofStartProgressIndex: Math.max(previous.proofStartProgressIndex, run.proofStartProgressIndex),
+        proofStopProgressIndex: Math.max(previous.proofStopProgressIndex, run.proofStopProgressIndex),
+        lastProgressIndex: Math.max(previous.lastProgressIndex, run.lastProgressIndex),
+        timingSource: advanced.timingSource || other.timingSource,
+        measurementError: advanced.measurementError || other.measurementError,
+        settledAt: advanced.settledAt || other.settledAt,
+        terminalStatus: advanced.terminalStatus || other.terminalStatus,
+        terminalError: advanced.terminalError || other.terminalError,
+      }) || advanced;
+    };
     for (const map of maps.map(normalizeHardwareIndexRunMap)) {
       for (const [key, run] of Object.entries(map)) {
         const previous = merged[key];
         const timeDifference = new Date(run.requestedAt).valueOf() - new Date(previous?.requestedAt || 0).valueOf();
+        const sameRun = Boolean(
+          previous &&
+          ((run.runId && run.runId === previous.runId) ||
+            (run.submissionId && run.submissionId === previous.submissionId))
+        );
+        if (sameRun) {
+          merged[key] = mergeSameRun(previous, run);
+          continue;
+        }
         if (
           !previous ||
           timeDifference > 0 ||
@@ -448,22 +554,20 @@
 
     state.hardwareIndex.result = result;
     state.hardwareIndex.persistent = persistent;
-    if (resultChanged && state.hardwareIndex.status !== "running") {
+    if (resultChanged && !new Set(["running", "settling"]).has(state.hardwareIndex.status)) {
       state.hardwareIndex.status = "ready";
       state.hardwareIndex.error = "";
     }
     patchCurrentConfigPreview();
     if (homePromptVisible) {
-      toast("Client work index updated", `${formatProofDuration(result.durationMs)} MineIron lifecycle / ${persistent ? "saved locally" : "this tab only"}`, "success");
+      toast("Client work index updated", `${formatProofDuration(result.durationMs)} Generate Proof window / ${persistent ? "saved locally" : "this tab only"}`, "success");
     }
     if (resultChanged || persistent !== wasPersistent) patchHardwareIndex();
     return persistent;
   }
 
   function persistHardwareIndex(result) {
-    clearedHardwareIndexRunUrls.add(result.driverUrl);
     state.config.clientWorkIndexes[result.driverUrl] = result;
-    delete state.config.clientWorkIndexRuns[result.driverUrl];
     state.hardwareIndex.result = result;
     return persistConfig(false, false);
   }
@@ -516,6 +620,8 @@
       progress: null,
       activeRun: null,
       progressTimer: null,
+      proofEventSource: null,
+      settlementWatchers: new Set(),
     },
     drawer: null,
     editingConnectionId: null,
@@ -790,7 +896,7 @@
     );
     const mergedResult = hardwareIndexForConnection(state.config, activeConnection());
     state.hardwareIndex.result = mergedResult;
-    if (state.hardwareIndex.status !== "running") {
+    if (!new Set(["running", "settling"]).has(state.hardwareIndex.status)) {
       state.hardwareIndex.status = mergedResult ? "ready" : "idle";
       if (mergedResult) state.hardwareIndex.error = "";
     }
@@ -3267,9 +3373,9 @@
     };
   }
 
-  // CWI-3 deliberately uses one transparent baseline: the observed selected-Driver
-  // lifecycle of a committed craft-rocket::MineIron run. MineIron itself is an
-  // observation; every other action is only a one-action average, never a fabricated
+  // CWI-4 uses one transparent baseline: the observed selected-Driver Generate Proof
+  // event window for craft-rocket::MineIron. Commit is excluded. MineIron itself is
+  // observed; every other action is only a one-action average, never a fabricated
   // PoW or VDF component rate.
   function estimateActionProofTiming(
     action,
@@ -3359,13 +3465,21 @@
     return "";
   }
 
-  function hardwareIndexPendingForConnection(connection = activeConnection()) {
+  function hardwareIndexRunForConnection(connection = activeConnection()) {
     const key = hardwareIndexConnectionKey(connection);
     return key ? normalizeHardwareIndexRun(state.config.clientWorkIndexRuns?.[key]) : null;
   }
 
+  function hardwareIndexPendingForConnection(connection = activeConnection()) {
+    const run = hardwareIndexRunForConnection(connection);
+    return run?.phase === "settled" ? null : run;
+  }
+
   function hardwareIndexPendingHasRun(pending) {
-    return Boolean(pending?.phase === "accepted" && pending.runId);
+    return Boolean(
+      pending?.runId &&
+      new Set(["accepted", "proof-running", "settling"]).has(pending.phase)
+    );
   }
 
   function hardwareIndexPendingLockCopy(pending) {
@@ -3376,48 +3490,102 @@
   }
 
   function formatMineIronRate(result) {
-    const value = Number(result?.mineIronPerHour);
+    const value = Number(result?.mineIronProofsPerHour ?? result?.proofBaselinesPerHour ?? result?.mineIronPerHour);
     if (!Number.isFinite(value) || value <= 0) return "Unknown";
-    return `${value < 10 ? value.toFixed(2) : value < 100 ? value.toFixed(1) : Math.round(value).toLocaleString()} / hr`;
+    return `${value < 10 ? value.toFixed(2) : value < 100 ? value.toFixed(1) : Math.round(value).toLocaleString()} proof baselines/hr`;
+  }
+
+  function hardwareIndexUiIsActive() {
+    return state.hardwareIndex.status === "running" || state.hardwareIndex.status === "settling";
+  }
+
+  function hardwareIndexProgressElapsedMs(progress = state.hardwareIndex.progress) {
+    const frozenDuration = Number(currentHardwareIndex()?.durationMs);
+    if (state.hardwareIndex.status === "settling" && Number.isFinite(frozenDuration)) {
+      return Math.max(0, frozenDuration);
+    }
+    const startedAt = progress?.proofStartedAt ? new Date(progress.proofStartedAt).valueOf() : NaN;
+    const completedAt = progress?.proofCompletedAt ? new Date(progress.proofCompletedAt).valueOf() : NaN;
+    if (Number.isFinite(startedAt)) {
+      return Math.max(0, (Number.isFinite(completedAt) ? completedAt : Date.now()) - startedAt);
+    }
+    return Math.max(0, Number(progress?.elapsedMs) || 0);
+  }
+
+  function hardwareIndexProgressTimeLabel(progress, elapsedMs) {
+    if (state.hardwareIndex.status === "settling" || progress?.proofCompletedAt) return `${formatProofDuration(elapsedMs)} proof / frozen`;
+    if (!progress?.proofStartedAt) return "Waiting to start";
+    return `${formatProofDuration(elapsedMs)} elapsed`;
+  }
+
+  function hardwareIndexProgressAriaValue(progress, phase, elapsedMs) {
+    if (state.hardwareIndex.status === "settling" || progress?.proofCompletedAt) {
+      return `Proof measurement complete at ${formatProofDuration(elapsedMs)}. MineIron settlement continues outside CWI.`;
+    }
+    if (!progress?.proofStartedAt) return `${phase}. Waiting for the proof timing start event.`;
+    return `${phase}. Generate Proof timing is active.`;
+  }
+
+  function hardwareIndexProgressAnnouncement(progress, phase, elapsedMs) {
+    if (state.hardwareIndex.status === "settling" || progress?.proofCompletedAt) {
+      return `CWI proof timing complete at ${formatProofDuration(elapsedMs)}. The timer is frozen. MineIron settlement continues and is excluded from CWI.`;
+    }
+    if (!progress?.proofStartedAt) {
+      return `${phase}. Waiting for Driver event generateProof running, message Generating proof.`;
+    }
+    return `${phase}. CWI timing started at Driver event generateProof running, message Generating proof.`;
   }
 
   function hardwareIndexProgressDetail(progress = state.hardwareIndex.progress) {
     const message = String(progress?.message || "Waiting for retained Driver state.");
-    return `${message} This benchmark creates and commits one real craft-rocket::Iron; closing this page does not cancel it.`;
+    if (state.hardwareIndex.status === "settling" || progress?.proofCompletedAt) {
+      return `${message} CWI is frozen at the Generate Proof stop event. Commit continues in Activity and is excluded from the score.`;
+    }
+    return `${message} CWI starts at generateProof/running with message "Generating proof" and stops at generateProof/done with message "Proof generation complete". Commit is excluded; closing this page does not cancel the submitted MineIron.`;
   }
 
   function hardwareIndexProgressMarkup(extraClass = "") {
     const progress = state.hardwareIndex.progress || {};
-    const elapsedMs = Math.max(0, Number(progress.elapsedMs) || 0);
+    const elapsedMs = hardwareIndexProgressElapsedMs(progress);
     const phase = String(progress.phase || "Starting MineIron action");
+    const status = String(state.hardwareIndex.status || "idle");
+    const timingPhase = progress.proofCompletedAt ? "proof-complete" : progress.proofStartedAt ? "proof-running" : "waiting";
+    const phaseKey = `${status}:${timingPhase}:${phase}`;
+    const settlingClass = status === "settling" ? " is-settling" : "";
     return `
-      <div class="cwi-progress${extraClass ? ` ${extraClass}` : ""}">
-        <div class="cwi-progress-copy"><span data-cwi-progress-phase>${escapeHtml(phase)}</span><strong data-cwi-progress-time>${escapeHtml(formatProofDuration(elapsedMs))} elapsed</strong></div>
-        <progress data-cwi-progress-meter aria-label="Client work index run in progress" aria-valuetext="${escapeHtml(`${phase}. ${formatProofDuration(elapsedMs)} elapsed.`)}"></progress>
+      <div class="cwi-progress${settlingClass}${extraClass ? ` ${extraClass}` : ""}">
+        <div class="cwi-progress-copy"><span data-cwi-progress-phase>${escapeHtml(phase)}</span><strong data-cwi-progress-time>${escapeHtml(hardwareIndexProgressTimeLabel(progress, elapsedMs))}</strong></div>
+        <progress data-cwi-progress-meter data-cwi-progress-meter-phase="${escapeHtml(phaseKey)}" aria-label="${status === "settling" ? "MineIron settlement after client work index measurement" : "Client work index proof measurement in progress"}" aria-valuetext="${escapeHtml(hardwareIndexProgressAriaValue(progress, phase, elapsedMs))}"></progress>
         <small data-cwi-progress-detail>${escapeHtml(hardwareIndexProgressDetail(progress))}</small>
-        <span class="sr-only" data-cwi-progress-announcement aria-live="polite" aria-atomic="true">${escapeHtml(phase)}</span>
+        <span class="sr-only" data-cwi-progress-announcement data-cwi-announced-phase="${escapeHtml(phaseKey)}" role="status" aria-live="polite" aria-atomic="true">${escapeHtml(hardwareIndexProgressAnnouncement(progress, phase, elapsedMs))}</span>
       </div>`;
   }
 
   function updateHardwareIndexProgressUi() {
-    if (state.hardwareIndex.status !== "running") return;
+    if (!hardwareIndexUiIsActive()) return;
     const progress = state.hardwareIndex.progress || {};
-    if (progress.acceptedAt) progress.elapsedMs = Math.max(0, Date.now() - new Date(progress.acceptedAt).valueOf());
-    const elapsedMs = Math.max(0, Number(progress.elapsedMs) || 0);
+    const elapsedMs = hardwareIndexProgressElapsedMs(progress);
     const phase = String(progress.phase || "Following MineIron action");
+    const timingPhase = progress.proofCompletedAt ? "proof-complete" : progress.proofStartedAt ? "proof-running" : "waiting";
+    const phaseKey = `${state.hardwareIndex.status}:${timingPhase}:${phase}`;
     document.querySelectorAll("[data-cwi-progress-meter]").forEach((meter) => {
       meter.removeAttribute("value");
-      meter.setAttribute("aria-valuetext", `${phase}. ${formatProofDuration(elapsedMs)} elapsed.`);
+      if (meter.dataset.cwiProgressMeterPhase !== phaseKey) {
+        meter.dataset.cwiProgressMeterPhase = phaseKey;
+        meter.setAttribute("aria-valuetext", hardwareIndexProgressAriaValue(progress, phase, elapsedMs));
+      }
     });
     document.querySelectorAll("[data-cwi-progress-phase]").forEach((element) => { element.textContent = phase; });
     document.querySelectorAll("[data-cwi-progress-time]").forEach((element) => {
-      element.textContent = `${formatProofDuration(elapsedMs)} elapsed`;
+      element.textContent = hardwareIndexProgressTimeLabel(progress, elapsedMs);
     });
     document.querySelectorAll("[data-cwi-progress-detail]").forEach((element) => {
       element.textContent = hardwareIndexProgressDetail(progress);
     });
     document.querySelectorAll("[data-cwi-progress-announcement]").forEach((element) => {
-      if (element.textContent !== phase) element.textContent = phase;
+      if (element.dataset.cwiAnnouncedPhase === phaseKey) return;
+      element.dataset.cwiAnnouncedPhase = phaseKey;
+      element.textContent = hardwareIndexProgressAnnouncement(progress, phase, elapsedMs);
     });
   }
 
@@ -3425,11 +3593,15 @@
     const benchmark = state.hardwareIndex;
     const result = currentHardwareIndex();
     const pending = hardwareIndexPendingForConnection();
-    const running = benchmark.status === "running";
+    const measuring = benchmark.status === "running";
+    const settling = benchmark.status === "settling";
+    const active = measuring || settling;
     const failed = benchmark.status === "error" && !result;
     const activeRunName = benchmark.activeRun?.connectionName || activeConnection()?.name || "selected Driver";
-    const title = running
-      ? `MineIron running on ${activeRunName}`
+    const title = settling
+      ? result ? `${HARDWARE_INDEX_LABEL} / ${formatProofDuration(result.durationMs)} measured` : "MineIron settling / no CWI saved"
+      : measuring
+        ? `Measuring MineIron proof on ${activeRunName}`
       : result
         ? `${HARDWARE_INDEX_LABEL} / ${formatProofDuration(result.durationMs)}`
         : pending
@@ -3437,33 +3609,37 @@
           : failed
             ? "Driver check needs attention"
             : "Driver index not measured";
-    const copy = running
-      ? "Following one real MineIron action through proof generation, commit, and live completion. This action cannot be cancelled from the console."
+    const copy = settling
+      ? result
+        ? `Generate Proof timing is frozen at ${formatProofDuration(result.durationMs)}. MineIron settlement continues in Activity; commit is excluded from ${HARDWARE_INDEX_LABEL}.`
+        : `The exact Generate Proof timing window was not available, so no score was fabricated. MineIron settlement continues in Activity.`
+      : measuring
+        ? `Timing generateProof/running "Generating proof" through generateProof/done "Proof generation complete". Commit is excluded.`
       : result
-        ? `${formatMineIronRate(result)} MineIron-equivalent throughput / ${benchmark.persistent ? "saved locally" : "this tab only"}.`
+        ? `${formatMineIronRate(result)} / higher is faster / commit excluded / ${benchmark.persistent ? "saved locally" : "this tab only"}.`
         : pending
           ? hardwareIndexPendingLockCopy(pending)
           : failed
             ? benchmark.error
-            : "Run one real craft-rocket::MineIron lifecycle on the selected Driver. The resulting Iron is committed and kept.";
+            : `Measure one real craft-rocket::MineIron Generate Proof window on the selected Driver. Settlement continues separately and may keep one Iron.`;
     let button;
-    if (running) {
-      button = '<button class="game-button menu-focusable" type="button" data-hardware-index-focus aria-disabled="true" aria-describedby="home-cwi-help">Run in progress</button>';
+    if (active) {
+      button = `<button class="game-button menu-focusable" type="button" data-hardware-index-focus aria-disabled="true" aria-describedby="home-cwi-help">${settling ? "Settlement in progress" : "Measurement in progress"}</button>`;
     } else if (result) {
       button = '<button class="game-button menu-focusable" type="button" data-command="config" data-hardware-index-focus aria-label="Open client work index details">View details</button>';
     } else if (pending && !hardwareIndexPendingHasRun(pending)) {
       button = '<button class="game-button menu-focusable" type="button" data-command="activity" data-hardware-index-focus aria-describedby="home-cwi-help">Review Activity</button>';
     } else {
-      const buttonText = pending ? "Resume" : failed ? "Retry CWI" : "Run live test";
+      const buttonText = pending ? "Resume" : failed ? "Retry CWI" : "Run proof test";
       button = `<button class="game-button menu-focusable" type="button" data-command="run-hardware-index" data-hardware-index-focus aria-describedby="home-cwi-help">${buttonText}</button>`;
     }
     return `
       <span class="home-cwi-mark" aria-hidden="true">CWI</span>
       <div class="home-cwi-copy">
-        <span class="home-cwi-kicker">Selected Driver calibration</span>
+        <span class="home-cwi-kicker">Selected Driver proof baseline</span>
         <h2 id="home-cwi-title">${escapeHtml(title)}</h2>
         <p id="home-cwi-help">${escapeHtml(copy)}</p>
-        ${running ? hardwareIndexProgressMarkup("home-cwi-track") : ""}
+        ${active ? hardwareIndexProgressMarkup("home-cwi-track") : ""}
       </div>
       ${button}`;
   }
@@ -3480,37 +3656,64 @@
     const benchmark = state.hardwareIndex;
     const result = currentHardwareIndex();
     const pending = hardwareIndexPendingForConnection();
-    const running = benchmark.status === "running";
-    const buttonLabel = running
-      ? "Run in progress"
+    const measuring = benchmark.status === "running";
+    const settling = benchmark.status === "settling";
+    const active = measuring || settling;
+    const buttonLabel = measuring
+      ? "Measurement in progress"
+      : settling
+        ? "Settlement in progress"
       : pending
         ? hardwareIndexPendingHasRun(pending) ? "Resume tracking" : "Submission locked"
         : result
-          ? "Run & commit again"
-          : "Run & commit MineIron";
-    const buttonMarkup = running
+          ? "Measure another MineIron"
+          : "Measure MineIron proof";
+    const buttonMarkup = active
       ? `<button class="game-button" type="button" data-hardware-index-focus aria-disabled="true">${buttonLabel}</button>`
       : pending && !hardwareIndexPendingHasRun(pending)
         ? '<button class="game-button" type="button" data-command="activity" data-hardware-index-focus>Review Activity</button>'
       : `<button class="game-button" type="button" data-command="run-hardware-index" data-hardware-index-focus>${buttonLabel}</button>`;
     let readout;
-    if (running) {
+    if (measuring) {
       const activeRun = benchmark.activeRun;
       readout = `
-        <div class="hardware-index-score is-running"><span>Client work index / selected Driver lifecycle</span><strong>${HARDWARE_INDEX_LABEL} RUN</strong><small>${escapeHtml(activeRun?.connectionName || "Driver")} / run ${escapeHtml(shortText(activeRun?.runId))} / prior valid result remains available</small></div>
+        <div class="hardware-index-score is-running"><span>Client work index / Generate Proof window</span><strong>${HARDWARE_INDEX_LABEL} MEASURE</strong><small>${escapeHtml(activeRun?.connectionName || "Driver")} / generateProof/running "Generating proof" → generateProof/done "Proof generation complete"</small></div>
         ${hardwareIndexProgressMarkup("hardware-index-track")}`;
     } else if (result) {
       const resultNote = benchmark.status === "error"
         ? `Last saved result retained / tracking failed: ${benchmark.error}`
-        : `${benchmark.persistent ? "saved locally" : "this tab only"} / completed ${formatDate(result.measuredAt)}`;
+        : settling
+          ? `proof timing saved / MineIron settlement continues in Activity / commit excluded`
+          : `${benchmark.persistent ? "saved locally" : "this tab only"} / measured ${formatDate(result.measuredAt)}`;
+      const settlementStatus = settling ? "pending" : String(result.settlementStatus || "unknown");
+      const settlementLabel = settlementStatus === "pending"
+        ? "Continuing in Activity"
+        : settlementStatus === "succeeded"
+          ? "Succeeded"
+          : settlementStatus === "failed"
+            ? "Failed"
+            : "Not recorded";
+      const settlementDetail = result.settlementError
+        ? `run ${shortText(result.runId)} / ${result.settlementError}`
+        : `run ${shortText(result.runId)} / excluded from ${HARDWARE_INDEX_LABEL}`;
+      const timingSourceLabel = {
+        "live-run-sse": "live Driver progress events",
+        "resumed-client-clock": "resumed client observation",
+        "poll-observed": "polled Driver progress",
+      }[result.timingSource] || "timing source unavailable";
       readout = `
-        <div class="hardware-index-score"><span>Client work index / observed MineIron lifecycle</span><strong>${escapeHtml(formatProofDuration(result.durationMs))}</strong><small class="hardware-index-result-note${benchmark.status === "error" ? " is-error" : ""}">${escapeHtml(resultNote)}</small></div>
+        <div class="hardware-index-score${settling ? " is-settling" : ""}"><span>Client work index / observed Generate Proof window</span><strong>${escapeHtml(formatProofDuration(result.durationMs))}</strong><small class="hardware-index-result-note${benchmark.status === "error" ? " is-error" : ""}">${escapeHtml(resultNote)}</small></div>
         <dl class="hardware-index-metrics">
-          <div><dt>Transparent throughput</dt><dd><strong>${escapeHtml(formatMineIronRate(result))}</strong><small>derived from one completed lifecycle / not a percentile or synthetic score</small></dd></div>
-          <div><dt>Benchmark action</dt><dd><strong>craft-rocket::MineIron</strong><small>observed from request start through proof, chain commit, and verified live output</small></dd></div>
-          <div><dt>Driver binding</dt><dd><strong>${escapeHtml(result.driverVersion || "Version unavailable")}</strong><small>${escapeHtml(result.driverUrl)} / action ${escapeHtml(shortText(result.actionHash, 10, 7))}</small></dd></div>
-          <div><dt>Committed output</dt><dd><strong>${escapeHtml(result.outputFiles[0] ? shortText(result.outputFiles[0], 18, 10) : "Iron verified live")}</strong><small>run ${escapeHtml(shortText(result.runId))} / benchmark output is real and retained</small></dd></div>
-        </dl>`;
+          <div><dt>Proof throughput</dt><dd><strong>${escapeHtml(formatMineIronRate(result))}</strong><small>higher is faster / one hour ÷ observed proof duration / not a percentile or synthetic score</small></dd></div>
+          <div><dt>Observed window</dt><dd><strong>craft-rocket::MineIron</strong><small>generateProof/running "Generating proof" → generateProof/done "Proof generation complete"</small></dd></div>
+          <div><dt>Driver binding</dt><dd><strong>${escapeHtml(result.driverVersion || "Version unavailable")}</strong><small>${escapeHtml(result.driverUrl)} / action ${escapeHtml(shortText(result.actionHash, 10, 7))} / ${escapeHtml(timingSourceLabel)}</small></dd></div>
+          <div><dt>Action settlement</dt><dd><strong>${escapeHtml(settlementLabel)}</strong><small>${escapeHtml(settlementDetail)}</small></dd></div>
+        </dl>
+        ${settling ? hardwareIndexProgressMarkup("hardware-index-track") : ""}`;
+    } else if (settling) {
+      readout = `
+        <div class="hardware-index-score is-error"><span>Client work index / Generate Proof window</span><strong>${HARDWARE_INDEX_LABEL} --</strong><small>No trustworthy start-to-stop window was captured, so no score was saved. MineIron settlement continues and remains excluded.</small></div>
+        ${hardwareIndexProgressMarkup("hardware-index-track")}`;
     } else {
       const emptyDetail = pending
         ? hardwareIndexPendingHasRun(pending)
@@ -3519,7 +3722,7 @@
         : benchmark.error || "No completed MineIron benchmark for this Driver and action build.";
       readout = `
         <div class="hardware-index-score${benchmark.status === "error" ? " is-error" : ""}">
-          <span>Client work index / selected Driver lifecycle</span><strong>${HARDWARE_INDEX_LABEL} --</strong><small>${escapeHtml(emptyDetail)}</small>
+          <span>Client work index / selected Driver proof window</span><strong>${HARDWARE_INDEX_LABEL} --</strong><small>${escapeHtml(emptyDetail)}</small>
         </div>`;
     }
     return `
@@ -3527,20 +3730,27 @@
         ${readout}
         ${buttonMarkup}
       </div>
-      <p class="hardware-index-note"><strong>${HARDWARE_INDEX_LABEL}</strong> is the measured wall-clock lifecycle of one real <code>craft-rocket::MineIron</code> action on the selected Driver, from request start through proof generation, commit, and verified live output. Every completed test creates and keeps one on-chain Iron. Planner estimates use this duration as a transparent per-action average: MineIron is directly observed; every other action is not action-specific and may differ substantially.</p>`;
+      <p class="hardware-index-note"><strong>${HARDWARE_INDEX_LABEL}</strong> measures one exact Driver event window: <code>generateProof/running</code> with message <code>Generating proof</code> through <code>generateProof/done</code> with message <code>Proof generation complete</code>. Transaction submission, commit, confirmation, and live-output verification are excluded. The submitted MineIron still settles and may create one retained Iron. Proof baselines/hr is one hour divided by the observed proof duration, so higher is faster when the Driver version and MineIron action hash match. Planner estimates reuse this proof-only baseline; other actions may differ substantially.</p>`;
   }
 
   function hardwareIndexAnnouncement() {
     const benchmark = state.hardwareIndex;
     const result = currentHardwareIndex();
     const pending = hardwareIndexPendingForConnection();
-    if (benchmark.status === "running") return `Client work index MineIron run is in progress. ${formatProofDuration(benchmark.progress?.elapsedMs || 0)} elapsed. It cannot be cancelled from this console.`;
-    if (benchmark.status === "error" && result) return `Client work index tracking failed. The last observed MineIron lifecycle of ${formatProofDuration(result.durationMs)} is retained. ${benchmark.error}`;
+    if (benchmark.status === "settling" && result) return `Client work index proof timing complete at ${formatProofDuration(result.durationMs)}. The timer is frozen. MineIron settlement continues and is excluded from the score.`;
+    if (benchmark.status === "settling") return "No trustworthy Generate Proof timing window was captured. No score was saved. MineIron settlement continues outside CWI.";
+    if (benchmark.status === "running") {
+      const progress = benchmark.progress || {};
+      return progress.proofStartedAt
+        ? `Client work index Generate Proof measurement is in progress. ${formatProofDuration(hardwareIndexProgressElapsedMs(progress))} elapsed. Commit will be excluded.`
+        : `MineIron was accepted. Waiting for generateProof/running with message Generating proof before starting the CWI timer.`;
+    }
+    if (benchmark.status === "error" && result) return `Client work index tracking failed. The last observed Generate Proof window of ${formatProofDuration(result.durationMs)} is retained. ${benchmark.error}`;
     if (benchmark.status === "error") return `Client work index failed. ${benchmark.error}`;
     if (pending) return hardwareIndexPendingHasRun(pending)
       ? `A previously accepted MineIron benchmark run is waiting to be tracked. Run id ${pending.runId}.`
       : hardwareIndexPendingLockCopy(pending);
-    if (result) return `Client work index ready. One MineIron lifecycle took ${formatProofDuration(result.durationMs)} on the selected Driver. ${benchmark.persistent ? "Saved locally." : "Available for this tab only."}`;
+    if (result) return `Client work index ready. The observed MineIron Generate Proof window took ${formatProofDuration(result.durationMs)} on the selected Driver. Commit was excluded. ${benchmark.persistent ? "Saved locally." : "Available for this tab only."}`;
     return "";
   }
 
@@ -3564,7 +3774,7 @@
     let removedFocusedHome = false;
     document.querySelectorAll("[data-hardware-index]").forEach((region) => {
       const view = region.dataset.hardwareIndexView;
-      if (view === "home" && currentHardwareIndex() && state.hardwareIndex.status !== "running") {
+      if (view === "home" && currentHardwareIndex() && !hardwareIndexUiIsActive()) {
         removedFocusedHome ||= focusedInIndex === region;
         region.remove();
         return;
@@ -3611,11 +3821,11 @@
 
   function hardwareIndexRunPhase(snapshot) {
     const status = String(snapshot?.status || "queued").toLowerCase();
-    if (status === "generateproof" || status === "running") return "Generating MineIron proof";
-    if (status === "committing") return "Committing benchmark Iron";
-    if (status === "succeeded") return "Verifying live Iron output";
+    if (status === "generateproof" || status === "running") return "Generate Proof in progress";
+    if (status === "committing") return "MineIron settlement continuing";
+    if (status === "succeeded") return "MineIron settlement complete";
     if (status === "failed") return "MineIron action failed";
-    return "Queued by selected Driver";
+    return "Waiting for Generate Proof";
   }
 
   function hardwareIndexRunMatchesCurrentWorkspace(run) {
@@ -3626,6 +3836,14 @@
       connection.id === run.connectionId &&
       hardwareIndexConnectionKey(connection) === run.driverUrl
     );
+  }
+
+  function hardwareIndexRunConnection(run) {
+    return {
+      id: run.connectionId || `cwi-${run.driverUrl}`,
+      name: run.connectionName || "Benchmark Driver",
+      driverUrl: run.driverUrl,
+    };
   }
 
   function validateHardwareIndexRunSnapshot(snapshot, run) {
@@ -3639,118 +3857,541 @@
     return snapshot;
   }
 
-  async function verifyHardwareIndexOutput(snapshot, connection) {
-    const outputFiles = Array.isArray(snapshot?.result?.outputFiles) ? snapshot.result.outputFiles.map(String) : [];
-    if (outputFiles.length !== 1) throw new Error("The completed benchmark did not report exactly one output object.");
-    let lastError = null;
-    for (const outputPath of outputFiles) {
-      const fileName = outputPath.split(/[\\/]/).pop();
-      if (!fileName) continue;
-      try {
-        const object = await driverRequest(connection, `/objects/${encodeURIComponent(fileName)}`, { timeout: 12000 });
-        if (sameQualified(object?.class, { pluginName: "craft-rocket", name: "Iron" }) && String(object?.status || "").toLowerCase() === "live") {
-          return { outputFiles, object };
-        }
-        lastError = new Error(`${fileName} is not a live craft-rocket::Iron.`);
-      } catch (error) {
-        lastError = error;
-      }
+  function hardwareIndexProgressMatches(progress, expected) {
+    return Boolean(
+      progress &&
+      progress.phase === expected.phase &&
+      progress.status === expected.status &&
+      progress.message === expected.message
+    );
+  }
+
+  function hardwareIndexProgressEntries(snapshot, observedAt = new Date().toISOString()) {
+    return (Array.isArray(snapshot?.progress) ? snapshot.progress : []).map((progress, index) => ({
+      index,
+      progress,
+      observedAt,
+    }));
+  }
+
+  function updateHardwareIndexProgressState(run, progress, snapshot = null) {
+    const latest = progress || (Array.isArray(snapshot?.progress) && snapshot.progress.length
+      ? snapshot.progress[snapshot.progress.length - 1]
+      : null);
+    state.hardwareIndex.activeRun = run;
+    state.hardwareIndex.progress = {
+      phase: run.phase === "settling"
+        ? "Proof timing complete / settlement continuing"
+        : run.phase === "proof-running"
+          ? "Generate Proof timing active"
+          : hardwareIndexRunPhase(snapshot),
+      message: String(latest?.message || (run.proofStartedAt ? "Generate Proof timing is active." : "Waiting for the exact Generating proof event.")).slice(0, 300),
+      proofStartedAt: run.proofStartedAt,
+      proofCompletedAt: run.proofCompletedAt,
+      elapsedMs: run.proofStartedAt ? Math.max(0, Date.now() - new Date(run.proofStartedAt).valueOf()) : 0,
+    };
+    updateHardwareIndexProgressUi();
+  }
+
+  function markHardwareIndexMeasurementUnavailable(run, message, lastProgressIndex = run.lastProgressIndex) {
+    return normalizeHardwareIndexRun({
+      ...run,
+      phase: "settling",
+      lastProgressIndex,
+      measurementError: message,
+    });
+  }
+
+  function observeHardwareIndexProgressBatch(run, entries, { replayBatch = false, timingSource = "poll-observed" } = {}) {
+    let current = normalizeHardwareIndexRun(run);
+    if (!current) throw new Error("The retained MineIron benchmark record is invalid.");
+    const unseen = entries
+      .filter((entry) => Number.isInteger(entry.index) && entry.index > current.lastProgressIndex)
+      .sort((left, right) => left.index - right.index);
+    if (!unseen.length) return { kind: "waiting", run: current, latest: null };
+    if (unseen[0].index > current.lastProgressIndex + 1) return { kind: "recover", run: current, latest: null };
+
+    const startedBeforeBatch = Boolean(current.proofStartedAt);
+    const startEntry = unseen.find((entry) => hardwareIndexProgressMatches(entry.progress, HARDWARE_INDEX_PROOF_START));
+    const stopEntry = unseen.find((entry) => hardwareIndexProgressMatches(entry.progress, HARDWARE_INDEX_PROOF_STOP));
+    if (
+      replayBatch &&
+      !startedBeforeBatch &&
+      startEntry &&
+      stopEntry &&
+      stopEntry.index > startEntry.index
+    ) {
+      const lastProgressIndex = unseen[unseen.length - 1].index;
+      current = markHardwareIndexMeasurementUnavailable(
+        current,
+        "The Generate Proof start and stop were both already buffered before live timing began. No CWI score was fabricated.",
+        lastProgressIndex,
+      );
+      if (!current) throw new Error("The unmeasurable MineIron run could not be retained safely.");
+      persistHardwareIndexRun(current);
+      return { kind: "inconclusive", run: current, latest: unseen[unseen.length - 1].progress };
     }
-    throw new Error(`The action succeeded, but its live Iron output could not be verified${lastError?.message ? `: ${lastError.message}` : "."}`);
+
+    let kind = "waiting";
+    let latest = null;
+    for (const entry of unseen) {
+      if (entry.index > current.lastProgressIndex + 1) return { kind: "recover", run: current, latest };
+      const progress = entry.progress;
+      if (String(progress?.runId || current.runId) !== current.runId) {
+        throw new Error(`The Driver mixed progress from another run into ${shortText(current.runId)}; CWI remains locked.`);
+      }
+      latest = progress;
+      const observedAt = String(entry.observedAt || new Date().toISOString());
+      if (hardwareIndexProgressMatches(progress, HARDWARE_INDEX_PROOF_START) && !current.proofStartedAt) {
+        current = normalizeHardwareIndexRun({
+          ...current,
+          phase: "proof-running",
+          proofStartedAt: observedAt,
+          proofStartProgressIndex: entry.index,
+          lastProgressIndex: entry.index,
+          timingSource,
+        });
+        kind = "started";
+      } else if (hardwareIndexProgressMatches(progress, HARDWARE_INDEX_PROOF_STOP)) {
+        if (!current.proofStartedAt || current.proofStartProgressIndex < 0) {
+          current = markHardwareIndexMeasurementUnavailable(
+            current,
+            "Proof generation completed without a previously observed Generating proof start event. No CWI score was fabricated.",
+            entry.index,
+          );
+          kind = "inconclusive";
+        } else {
+          const startedTimestamp = new Date(current.proofStartedAt).valueOf();
+          const observedTimestamp = new Date(observedAt).valueOf();
+          const completedTimestamp = Math.max(startedTimestamp + 1, observedTimestamp);
+          current = normalizeHardwareIndexRun({
+            ...current,
+            phase: "settling",
+            proofCompletedAt: new Date(completedTimestamp).toISOString(),
+            proofStopProgressIndex: entry.index,
+            lastProgressIndex: entry.index,
+            timingSource: current.timingSource || timingSource,
+          });
+          kind = "complete";
+        }
+      } else {
+        current = normalizeHardwareIndexRun({ ...current, lastProgressIndex: entry.index });
+      }
+      if (!current) throw new Error("The MineIron proof observation could not be recorded safely.");
+      if (kind === "complete" || kind === "inconclusive") break;
+    }
+    if (kind !== "complete") persistHardwareIndexRun(current);
+    return { kind, run: current, latest };
+  }
+
+  function createHardwareIndexProofStream(run) {
+    if (typeof EventSource !== "function") return null;
+    const connection = hardwareIndexRunConnection(run);
+    const queue = [];
+    const waiters = new Set();
+    let failed = false;
+    let source;
+    const wake = () => {
+      for (const waiter of waiters) waiter();
+      waiters.clear();
+    };
+    try {
+      source = new EventSource(endpointUrl(connection, `/actions/runs/${encodeURIComponent(run.runId)}/events`), { withCredentials: false });
+    } catch {
+      return null;
+    }
+    source.onmessage = (event) => {
+      let progress;
+      try {
+        progress = JSON.parse(event.data);
+      } catch {
+        failed = true;
+        wake();
+        return;
+      }
+      const id = String(event.lastEventId ?? "");
+      if (!/^\d+$/.test(id)) {
+        failed = true;
+        wake();
+        return;
+      }
+      queue.push({ index: Number(id), progress, observedAt: new Date().toISOString() });
+      wake();
+    };
+    source.onerror = () => {
+      failed = true;
+      wake();
+    };
+    return {
+      drain() {
+        return queue.splice(0, queue.length);
+      },
+      async next(timeoutMs) {
+        if (queue.length || failed) return { entries: this.drain(), failed };
+        await new Promise((resolve) => {
+          let timer = null;
+          const done = () => {
+            if (timer) clearTimeout(timer);
+            waiters.delete(done);
+            resolve();
+          };
+          waiters.add(done);
+          timer = setTimeout(done, timeoutMs);
+        });
+        return { entries: this.drain(), failed };
+      },
+      close() {
+        source.close();
+        wake();
+      },
+      get failed() {
+        return failed;
+      },
+      source,
+    };
+  }
+
+  function buildHardwareIndexProofResult(run) {
+    const startedTimestamp = new Date(run.proofStartedAt || "").valueOf();
+    const completedTimestamp = new Date(run.proofCompletedAt || "").valueOf();
+    return normalizeHardwareIndex({
+      version: HARDWARE_INDEX_VERSION,
+      benchmarkId: HARDWARE_INDEX_BENCHMARK_ID,
+      scope: HARDWARE_INDEX_SCOPE,
+      algorithm: HARDWARE_INDEX_ALGORITHM,
+      driverUrl: run.driverUrl,
+      driverVersion: run.driverVersion,
+      action: HARDWARE_INDEX_ACTION,
+      actionHash: run.actionHash,
+      runId: run.runId,
+      durationMs: completedTimestamp - startedTimestamp,
+      requestedAt: run.requestedAt,
+      acceptedAt: run.acceptedAt,
+      proofStartedAt: run.proofStartedAt,
+      proofCompletedAt: run.proofCompletedAt,
+      timingSource: run.timingSource,
+      proofStartProgressIndex: run.proofStartProgressIndex,
+      proofStopProgressIndex: run.proofStopProgressIndex,
+      settlementStatus: "pending",
+    });
+  }
+
+  function persistHardwareIndexMeasurement(result, run) {
+    state.config.clientWorkIndexes[result.driverUrl] = result;
+    state.config.clientWorkIndexRuns[run.driverUrl] = run;
+    state.hardwareIndex.result = result;
+    return persistConfig(false, false);
+  }
+
+  async function readHardwareIndexRunSnapshot(run) {
+    const connection = hardwareIndexRunConnection(run);
+    const snapshot = validateHardwareIndexRunSnapshot(
+      await driverRequest(connection, `/actions/runs/${encodeURIComponent(run.runId)}`, { timeout: 10000 }),
+      run,
+    );
+    if (hardwareIndexRunMatchesCurrentWorkspace(run)) {
+      mergeRun(snapshot);
+      scheduleLivePatch({ activity: true, runId: run.runId });
+    }
+    return snapshot;
+  }
+
+  function terminalHardwareIndexStatus(snapshot) {
+    const status = String(snapshot?.status || "").toLowerCase();
+    return TERMINAL_RUNS.has(status) ? status : "";
   }
 
   async function followHardwareIndexRun(run, token) {
-    const connection = {
-      id: run.connectionId || `cwi-${run.driverUrl}`,
-      name: run.connectionName || "Benchmark Driver",
-      driverUrl: run.driverUrl,
-    };
-    for (;;) {
-      if (token !== state.hardwareIndex.runToken) throw new Error("Benchmark tracking was superseded in this tab.");
-      const snapshot = validateHardwareIndexRunSnapshot(
-        await driverRequest(connection, `/actions/runs/${encodeURIComponent(run.runId)}`, { timeout: 10000 }),
-        run,
-      );
-      if (hardwareIndexRunMatchesCurrentWorkspace(run)) mergeRun(snapshot);
-      const latest = Array.isArray(snapshot?.progress) && snapshot.progress.length
-        ? snapshot.progress[snapshot.progress.length - 1]
-        : null;
-      state.hardwareIndex.progress = {
-        phase: hardwareIndexRunPhase(snapshot),
-        message: String(latest?.message || `Driver status: ${snapshot?.status || "queued"}`).slice(0, 300),
-        acceptedAt: run.requestedAt,
-        elapsedMs: Math.max(0, Date.now() - new Date(run.requestedAt).valueOf()),
-      };
-      updateHardwareIndexProgressUi();
-      const status = String(snapshot?.status || "").toLowerCase();
-      if (status === "failed") {
-        const error = new Error(snapshot?.error || "The MineIron benchmark action failed.");
-        error.hardwareIndexTerminal = true;
-        throw error;
+    let current = normalizeHardwareIndexRun(run);
+    if (!current) throw new Error("The retained MineIron benchmark record is invalid.");
+    let stream = createHardwareIndexProofStream(current);
+    if (stream) state.hardwareIndex.proofEventSource = stream.source;
+    const deadline = Date.now() + HARDWARE_INDEX_MAX_RUN_MS;
+    let snapshot = null;
+    try {
+      snapshot = await readHardwareIndexRunSnapshot(current);
+      let outcome = observeHardwareIndexProgressBatch(current, hardwareIndexProgressEntries(snapshot), {
+        replayBatch: true,
+        timingSource: current.proofStartedAt ? "resumed-client-clock" : "poll-observed",
+      });
+      current = outcome.run;
+      updateHardwareIndexProgressState(current, outcome.latest, snapshot);
+      if (outcome.kind === "complete" || outcome.kind === "inconclusive") return { ...outcome, snapshot };
+      if (terminalHardwareIndexStatus(snapshot)) {
+        current = markHardwareIndexMeasurementUnavailable(
+          current,
+          current.measurementError || "The MineIron run ended before a trustworthy Generate Proof stop event was observed.",
+          Math.max(current.lastProgressIndex, (snapshot.progress?.length || 0) - 1),
+        );
+        if (current) persistHardwareIndexRun(current);
+        return { kind: "inconclusive", run: current, snapshot };
       }
-      if (status === "succeeded") {
-        const verified = await verifyHardwareIndexOutput(snapshot, connection);
-        return { snapshot, verified };
+
+      if (stream) {
+        const buffered = stream.drain();
+        if (buffered.length) {
+          outcome = observeHardwareIndexProgressBatch(current, buffered, {
+            replayBatch: true,
+            timingSource: current.proofStartedAt ? "resumed-client-clock" : "live-run-sse",
+          });
+          current = outcome.run;
+          updateHardwareIndexProgressState(current, outcome.latest, snapshot);
+          if (outcome.kind === "complete" || outcome.kind === "inconclusive") return { ...outcome, snapshot };
+        }
       }
-      const elapsedMs = Date.now() - new Date(run.requestedAt).valueOf();
-      if (elapsedMs > HARDWARE_INDEX_MAX_RUN_MS) {
-        throw new Error(`Run ${shortText(run.runId)} is still non-terminal after ${formatProofDuration(elapsedMs)}. Its id is saved; Resume tracking later instead of starting another Iron.`);
+
+      while (Date.now() < deadline) {
+        if (token !== state.hardwareIndex.runToken) throw new Error("Benchmark tracking was superseded in this tab.");
+        let entries = [];
+        let recover = !stream;
+        if (stream) {
+          const next = await stream.next(5_000);
+          entries = next.entries;
+          recover = next.failed || !entries.length;
+        } else {
+          await new Promise((resolve) => setTimeout(resolve, HARDWARE_INDEX_POLL_MS));
+        }
+        if (entries.length) {
+          outcome = observeHardwareIndexProgressBatch(current, entries, { timingSource: "live-run-sse" });
+          current = outcome.run;
+          updateHardwareIndexProgressState(current, outcome.latest, snapshot);
+          if (outcome.kind === "complete" || outcome.kind === "inconclusive") return { ...outcome, snapshot };
+          recover ||= outcome.kind === "recover";
+        }
+        if (!recover) continue;
+        snapshot = await readHardwareIndexRunSnapshot(current);
+        outcome = observeHardwareIndexProgressBatch(current, hardwareIndexProgressEntries(snapshot), {
+          replayBatch: true,
+          timingSource: current.proofStartedAt ? "resumed-client-clock" : "poll-observed",
+        });
+        current = outcome.run;
+        updateHardwareIndexProgressState(current, outcome.latest, snapshot);
+        if (outcome.kind === "complete" || outcome.kind === "inconclusive") return { ...outcome, snapshot };
+        if (terminalHardwareIndexStatus(snapshot)) {
+          current = markHardwareIndexMeasurementUnavailable(
+            current,
+            current.measurementError || "The MineIron run ended before a trustworthy Generate Proof stop event was observed.",
+            Math.max(current.lastProgressIndex, (snapshot.progress?.length || 0) - 1),
+          );
+          if (current) persistHardwareIndexRun(current);
+          return { kind: "inconclusive", run: current, snapshot };
+        }
+        if (stream?.failed) {
+          stream.close();
+          if (state.hardwareIndex.proofEventSource === stream.source) state.hardwareIndex.proofEventSource = null;
+          stream = null;
+        }
       }
-      await new Promise((resolve) => setTimeout(resolve, HARDWARE_INDEX_POLL_MS));
+      throw new Error(`The exact Generate Proof stop event was not observed within ${formatProofDuration(HARDWARE_INDEX_MAX_RUN_MS)}. The run id and any observed start are saved; resume this run instead of submitting another Iron.`);
+    } finally {
+      stream?.close();
+      if (state.hardwareIndex.proofEventSource === stream?.source) state.hardwareIndex.proofEventSource = null;
     }
   }
 
-  async function trackHardwareIndexRun(run, { resumed = false } = {}) {
-    if (state.hardwareIndex.status === "running") return;
-    const token = ++state.hardwareIndex.runToken;
-    state.hardwareIndex.status = "running";
+  function persistHardwareIndexTerminal(run, snapshot) {
+    const terminalStatus = terminalHardwareIndexStatus(snapshot);
+    if (!terminalStatus) return null;
+    const settledAt = new Date().toISOString();
+    const settledRun = normalizeHardwareIndexRun({
+      ...run,
+      phase: "settled",
+      settledAt,
+      terminalStatus,
+      terminalError: terminalStatus === "failed" ? String(snapshot?.error || "MineIron settlement failed.") : "",
+      lastProgressIndex: Math.max(run.lastProgressIndex, (snapshot?.progress?.length || 0) - 1),
+    });
+    if (!settledRun) throw new Error("The terminal MineIron run could not be recorded safely.");
+    const existing = normalizeHardwareIndex(state.config.clientWorkIndexes[run.driverUrl]);
+    let settledResult = existing;
+    if (existing?.runId === run.runId) {
+      settledResult = normalizeHardwareIndex({
+        ...existing,
+        settlementStatus: terminalStatus,
+        settledAt,
+        settlementError: terminalStatus === "failed" ? String(snapshot?.error || "MineIron settlement failed.") : "",
+      });
+      if (settledResult) state.config.clientWorkIndexes[run.driverUrl] = settledResult;
+    }
+    state.config.clientWorkIndexRuns[run.driverUrl] = settledRun;
+    persistConfig(false, false);
+    return { run: settledRun, result: settledResult, terminalStatus };
+  }
+
+  function finishHardwareIndexSettlement(run, snapshot) {
+    const settled = persistHardwareIndexTerminal(run, snapshot);
+    if (!settled) return false;
+    const sameActiveRun = state.hardwareIndex.activeRun?.runId === run.runId;
+    if (sameActiveRun) {
+      clearInterval(state.hardwareIndex.progressTimer);
+      state.hardwareIndex.progressTimer = null;
+      state.hardwareIndex.progress = null;
+      state.hardwareIndex.activeRun = null;
+      const selectedResult = currentHardwareIndex();
+      const selectedRun = hardwareIndexConnectionKey(activeConnection()) === run.driverUrl;
+      const measuredThisRun = selectedResult?.runId === run.runId;
+      state.hardwareIndex.status = measuredThisRun || (!selectedRun && selectedResult) ? "ready" : selectedRun ? "error" : "idle";
+      state.hardwareIndex.error = selectedRun && !measuredThisRun
+        ? run.measurementError || "MineIron settled, but no trustworthy CWI proof window was captured."
+        : "";
+      patchHardwareIndex();
+    }
+    if (hardwareIndexRunMatchesCurrentWorkspace(run)) {
+      const connection = activeConnection();
+      if (connection) void refreshCatalogAndObjects(connection, state.workspaceGeneration);
+    }
+    const detail = settled.terminalStatus === "succeeded"
+      ? "The benchmark Iron settled. The saved proof duration did not change."
+      : `${snapshot?.error || "MineIron settlement failed."} The proof measurement, if captured, is still valid.`;
+    toast(settled.terminalStatus === "succeeded" ? "MineIron settlement complete" : "MineIron settlement failed", detail, settled.terminalStatus === "succeeded" ? "success" : "warning", 8000);
+    return true;
+  }
+
+  function beginHardwareIndexSettlement(run, initialSnapshot = null) {
+    const current = normalizeHardwareIndexRun(run);
+    if (!current?.runId || current.phase === "settled") return;
+    const key = `${current.driverUrl}:${current.runId}`;
+    if (state.hardwareIndex.settlementWatchers.has(key)) return;
+    state.hardwareIndex.settlementWatchers.add(key);
+    void (async () => {
+      let snapshot = initialSnapshot;
+      let lastError = null;
+      const deadline = Date.now() + HARDWARE_INDEX_MAX_RUN_MS;
+      try {
+        for (;;) {
+          if (!snapshot) {
+            try {
+              snapshot = await readHardwareIndexRunSnapshot(current);
+              lastError = null;
+            } catch (error) {
+              lastError = error;
+            }
+          }
+          if (snapshot) {
+            const latest = Array.isArray(snapshot.progress) && snapshot.progress.length
+              ? snapshot.progress[snapshot.progress.length - 1]
+              : null;
+            if (state.hardwareIndex.activeRun?.runId === current.runId) {
+              state.hardwareIndex.progress = {
+                ...state.hardwareIndex.progress,
+                phase: hardwareIndexRunPhase(snapshot),
+                message: String(latest?.message || `Driver status: ${snapshot.status || "committing"}`).slice(0, 300),
+                proofStartedAt: current.proofStartedAt,
+                proofCompletedAt: current.proofCompletedAt,
+              };
+              updateHardwareIndexProgressUi();
+            }
+            if (terminalHardwareIndexStatus(snapshot)) {
+              finishHardwareIndexSettlement(current, snapshot);
+              return;
+            }
+          }
+          if (Date.now() >= deadline) break;
+          snapshot = null;
+          await new Promise((resolve) => setTimeout(resolve, HARDWARE_INDEX_POLL_MS));
+        }
+        if (state.hardwareIndex.activeRun?.runId === current.runId) {
+          clearInterval(state.hardwareIndex.progressTimer);
+          state.hardwareIndex.progressTimer = null;
+          state.hardwareIndex.progress = null;
+          state.hardwareIndex.activeRun = null;
+          state.hardwareIndex.status = currentHardwareIndex() ? "ready" : "error";
+          state.hardwareIndex.error = currentHardwareIndex()
+            ? ""
+            : current.measurementError || "MineIron settlement tracking paused before a terminal result was available.";
+          patchHardwareIndex();
+        }
+        toast("MineIron settlement still pending", `${lastError?.message || "The run is still non-terminal."} Its saved proof duration is frozen; resume tracking from Menu Config or Activity.`, "warning", 9000);
+      } finally {
+        state.hardwareIndex.settlementWatchers.delete(key);
+      }
+    })();
+  }
+
+  function enterHardwareIndexSettlement(run, result, snapshot = null) {
+    state.hardwareIndex.status = "settling";
     state.hardwareIndex.error = "";
     state.hardwareIndex.activeRun = run;
     state.hardwareIndex.progress = {
-      phase: resumed ? "Resuming retained MineIron run" : "MineIron accepted by Driver",
-      message: resumed ? "Reading the existing run; no new action was submitted." : "Following the accepted action to terminal success.",
-      acceptedAt: run.requestedAt,
-      elapsedMs: Math.max(0, Date.now() - new Date(run.requestedAt).valueOf()),
+      phase: "Proof timing complete / settlement continuing",
+      message: result
+        ? "Proof generation complete. Transaction and commit time are excluded from CWI."
+        : run.measurementError || "The exact proof window was missed; settlement continues without a new score.",
+      proofStartedAt: run.proofStartedAt,
+      proofCompletedAt: run.proofCompletedAt,
+      elapsedMs: result?.durationMs || 0,
+    };
+    clearInterval(state.hardwareIndex.progressTimer);
+    state.hardwareIndex.progressTimer = setInterval(updateHardwareIndexProgressUi, 500);
+    patchHardwareIndex();
+    beginHardwareIndexSettlement(run, snapshot);
+  }
+
+  async function trackHardwareIndexRun(run, { resumed = false } = {}) {
+    let normalizedRun = normalizeHardwareIndexRun(run);
+    if (!normalizedRun) return;
+    if (resumed && normalizedRun.proofStartedAt && normalizedRun.phase === "proof-running") {
+      normalizedRun = normalizeHardwareIndexRun({ ...normalizedRun, timingSource: "resumed-client-clock" });
+      if (normalizedRun) persistHardwareIndexRun(normalizedRun);
+    }
+    if (normalizedRun.phase === "settling") {
+      enterHardwareIndexSettlement(normalizedRun, normalizeHardwareIndex(state.config.clientWorkIndexes[normalizedRun.driverUrl]));
+      return;
+    }
+    if (normalizedRun.phase === "settled" || state.hardwareIndex.status === "running") return;
+    const token = ++state.hardwareIndex.runToken;
+    state.hardwareIndex.proofEventSource?.close();
+    state.hardwareIndex.status = "running";
+    state.hardwareIndex.error = "";
+    state.hardwareIndex.activeRun = normalizedRun;
+    state.hardwareIndex.progress = {
+      phase: normalizedRun.proofStartedAt
+        ? "Generate Proof timing resumed"
+        : resumed ? "Resuming retained MineIron run" : "Waiting for Generate Proof",
+      message: normalizedRun.proofStartedAt
+        ? "A saved Generating proof start was found; waiting for Proof generation complete."
+        : resumed ? "Reading the retained run; no new action was submitted." : "The timer has not started yet.",
+      proofStartedAt: normalizedRun.proofStartedAt,
+      proofCompletedAt: "",
+      elapsedMs: 0,
     };
     clearInterval(state.hardwareIndex.progressTimer);
     state.hardwareIndex.progressTimer = setInterval(updateHardwareIndexProgressUi, 500);
     patchHardwareIndex();
     try {
-      const { snapshot, verified } = await followHardwareIndexRun(run, token);
+      const outcome = await followHardwareIndexRun(normalizedRun, token);
       if (token !== state.hardwareIndex.runToken) return;
-      const completedAt = new Date().toISOString();
-      const result = normalizeHardwareIndex({
-        version: HARDWARE_INDEX_VERSION,
-        benchmarkId: HARDWARE_INDEX_BENCHMARK_ID,
-        scope: HARDWARE_INDEX_SCOPE,
-        algorithm: HARDWARE_INDEX_ALGORITHM,
-        driverUrl: run.driverUrl,
-        driverVersion: run.driverVersion,
-        action: HARDWARE_INDEX_ACTION,
-        actionHash: run.actionHash,
-        runId: run.runId,
-        durationMs: Math.max(1, new Date(completedAt).valueOf() - new Date(run.requestedAt).valueOf()),
-        requestedAt: run.requestedAt,
-        acceptedAt: run.acceptedAt,
-        completedAt,
-        outputFiles: verified.outputFiles,
-      });
-      if (!result || String(snapshot?.status).toLowerCase() !== "succeeded") throw new Error("The completed MineIron result could not be normalized.");
-      const persisted = persistHardwareIndex(result);
-      state.hardwareIndex.result = hardwareIndexConnectionKey(activeConnection()) === result.driverUrl ? result : currentHardwareIndex();
-      state.hardwareIndex.persistent = persisted;
-      state.hardwareIndex.status = state.hardwareIndex.result ? "ready" : "idle";
-      state.hardwareIndex.error = "";
-      toast("Client work index ready", `${formatProofDuration(result.durationMs)} / one live Iron committed / ${persisted ? "saved locally" : "this tab only"}`, "success", 7000);
-      if (activeConnection()?.driverUrl === run.driverUrl) void refreshCatalogAndObjects(activeConnection(), state.workspaceGeneration);
+      let trackedRun = outcome.run;
+      if (outcome.kind === "complete") {
+        const result = buildHardwareIndexProofResult(trackedRun);
+        if (!result) {
+          trackedRun = markHardwareIndexMeasurementUnavailable(
+            trackedRun,
+            "The observed Generate Proof timestamps were invalid, so no CWI score was saved.",
+          );
+          if (!trackedRun) throw new Error("The completed proof observation could not be retained safely.");
+          persistHardwareIndexRun(trackedRun);
+          toast("CWI timing unavailable", trackedRun.measurementError, "warning", 8000);
+          enterHardwareIndexSettlement(trackedRun, null, outcome.snapshot);
+          return;
+        }
+        state.hardwareIndex.status = "settling";
+        const persisted = persistHardwareIndexMeasurement(result, trackedRun);
+        state.hardwareIndex.persistent = persisted;
+        toast("Client work index ready", `${formatProofDuration(result.durationMs)} Generate Proof window / commit excluded / ${persisted ? "saved locally" : "this tab only"}`, "success", 7000);
+        enterHardwareIndexSettlement(trackedRun, result, outcome.snapshot);
+        return;
+      }
+      persistHardwareIndexRun(trackedRun);
+      toast("CWI timing unavailable", trackedRun.measurementError || "The exact proof event window was not observed, so no score was saved.", "warning", 9000);
+      enterHardwareIndexSettlement(trackedRun, null, outcome.snapshot);
     } catch (error) {
       if (token !== state.hardwareIndex.runToken) return;
-      if (error.hardwareIndexTerminal) clearHardwareIndexRun(run.driverUrl);
       state.hardwareIndex.status = "error";
       state.hardwareIndex.error = error.message;
-      toast("Client work index not saved", error.message, "error", 9000);
+      toast("Client work index not saved", `${error.message} The retained run remains locked; resume it rather than creating another Iron.`, "error", 9000);
     } finally {
-      if (token === state.hardwareIndex.runToken) {
+      if (token === state.hardwareIndex.runToken && state.hardwareIndex.status !== "settling") {
         clearInterval(state.hardwareIndex.progressTimer);
         state.hardwareIndex.progressTimer = null;
         state.hardwareIndex.progress = null;
@@ -3761,9 +4402,13 @@
   }
 
   async function resumePendingHardwareIndexForConnection(connection = activeConnection()) {
-    if (!connection || state.hardwareIndex.status === "running") return;
+    if (!connection || hardwareIndexUiIsActive()) return;
     const pending = hardwareIndexPendingForConnection(connection);
     if (!pending) return;
+    if (pending.phase === "settling") {
+      enterHardwareIndexSettlement(pending, normalizeHardwareIndex(state.config.clientWorkIndexes[pending.driverUrl]));
+      return;
+    }
     if (hardwareIndexPendingHasRun(pending)) {
       await trackHardwareIndexRun(pending, { resumed: true });
       return;
@@ -3774,13 +4419,14 @@
   }
 
   async function runHardwareIndex() {
-    if (state.hardwareIndex.status === "running") return;
+    if (hardwareIndexUiIsActive()) return;
     if (document.activeElement?.closest?.('[data-command="run-hardware-index"]')) state.hardwareIndex.restoreFocus = true;
     const connection = activeConnection();
     if (!connection) return;
     const pending = hardwareIndexPendingForConnection(connection);
     if (pending) {
-      if (hardwareIndexPendingHasRun(pending)) await trackHardwareIndexRun(pending, { resumed: true });
+      if (pending.phase === "settling") enterHardwareIndexSettlement(pending, normalizeHardwareIndex(state.config.clientWorkIndexes[pending.driverUrl]));
+      else if (hardwareIndexPendingHasRun(pending)) await trackHardwareIndexRun(pending, { resumed: true });
       else {
         state.hardwareIndex.status = "error";
         state.hardwareIndex.error = hardwareIndexPendingLockCopy(pending);
@@ -3833,8 +4479,9 @@
     state.hardwareIndex.error = "";
     state.hardwareIndex.progress = {
       phase: "Submitting MineIron action",
-      message: "Waiting for the selected Driver to return a retained run id.",
-      acceptedAt: requestedAt,
+      message: "Waiting for the selected Driver to return a retained run id. The proof timer has not started.",
+      proofStartedAt: "",
+      proofCompletedAt: "",
       elapsedMs: 0,
     };
     patchHardwareIndex();
@@ -3871,6 +4518,7 @@
       rememberRun(capturedConnection.id, run.runId);
       if (isCurrentWorkspace(capturedConnection, capturedWorkspaceGeneration) && hardwareIndexRunMatchesCurrentWorkspace(run)) {
         mergeRun({ ...accepted, action: HARDWARE_INDEX_ACTION, result: null, error: null, progress: [] });
+        void watchRun(run.runId, capturedConnection, capturedWorkspaceGeneration);
       }
       state.hardwareIndex.status = "idle";
       state.hardwareIndex.progress = null;
@@ -5719,8 +6367,8 @@
       : !totalTiming.count
         ? "Already available / no actions"
         : totalTiming.requiresCwi
-          ? "Run CWI to apply the MineIron lifecycle average"
-          : `${totalTiming.count} action${totalTiming.count === 1 ? "" : "s"} × ${formatProofDuration(cwi?.durationMs)} MineIron lifecycle`;
+          ? "Run CWI to apply the MineIron proof-window baseline"
+          : `${totalTiming.count} action${totalTiming.count === 1 ? "" : "s"} × ${formatProofDuration(cwi?.durationMs)} MineIron proof baseline`;
     const tree = buildPlannerDisplayTree(result, timingByStep, context.catalog);
     const stateLabel = {
       satisfied: "Already on hand",
@@ -5730,16 +6378,18 @@
       "invalid-goal": "Invalid goal",
     }[result.status] || result.status;
     const cwiControl = !cwi && totalTiming.requiresCwi
-      ? state.hardwareIndex.status === "running"
-        ? '<button class="game-button primary" type="button" disabled>CWI running</button>'
+      ? hardwareIndexUiIsActive()
+        ? `<button class="game-button primary" type="button" disabled>${state.hardwareIndex.status === "settling" ? "MineIron settling" : "CWI measuring"}</button>`
         : gameButton("Run CWI", "run-hardware-index", { tone: "primary" })
       : "";
     const groundingNote = cwi
-      ? `Observed MineIron ${formatProofDuration(cwi.durationMs)} / ${formatDate(cwi.measuredAt)}`
+      ? `Observed MineIron proof window ${formatProofDuration(cwi.durationMs)} / commit excluded / ${formatDate(cwi.measuredAt)}`
       : totalTiming.requiresCwi
-        ? state.hardwareIndex.status === "running"
-          ? `Following a real MineIron lifecycle on ${state.hardwareIndex.activeRun?.connectionName || "another Driver"}`
-          : "Required for a selected-Driver per-action baseline"
+        ? hardwareIndexUiIsActive()
+          ? state.hardwareIndex.status === "settling"
+            ? "MineIron is settling, but no trustworthy proof window was saved"
+            : `Measuring a real MineIron proof window on ${state.hardwareIndex.activeRun?.connectionName || "another Driver"}`
+          : "Required for a selected-Driver proof-window baseline"
         : totalTiming.directWorkCount
           ? "Timing coverage incomplete"
           : "No readable timed gates";
@@ -5807,7 +6457,7 @@
       ${plannerTreeSvg(tree, timingByStep, context.cartridge.name)}
       ${plannerStepListMarkup(context, timingByStep)}
       ${diagnosticMarkup.length || warningMarkup.length ? `<div class="terminal-note warning planner-diagnostics"><strong>Plan limits</strong><ul>${[...diagnosticMarkup, ...warningMarkup].slice(0, 8).join("")}</ul></div>` : ""}
-      <div class="terminal-note planner-truth-note">CWI records one real MineIron action on the selected Driver from request start through proof generation, chain commit, and verified live output. The planner's total is action count × that observed duration. MineIron with the measured action hash is observed; every other step is a CWI average, not an action-specific prediction. PoW/VDF labels describe readable gate severity only and do not add fabricated component seconds. Bounded shortest search is used first; any valid goal-directed fallback is labeled and may not be minimal. UPDATE arcs mark paired same-class turnover, not verified object identity or field results. Refresh or replan after every real action.</div>`;
+      <div class="terminal-note planner-truth-note">CWI records the exact Driver window from <code>generateProof/running</code> with message <code>Generating proof</code> through <code>generateProof/done</code> with message <code>Proof generation complete</code>. Transaction submission, commit, confirmation, and live output are excluded. The planner total is action count × that proof-only baseline. MineIron with the measured action hash is observed; every other step is a CWI average, not an action-specific prediction. PoW/VDF labels describe readable gate severity only and do not add fabricated component seconds. Bounded shortest search is used first; any valid goal-directed fallback is labeled and may not be minimal. UPDATE arcs mark paired same-class turnover, not verified object identity or field results. Refresh or replan after every real action.</div>`;
   }
 
   function plannerGoalOptionsMarkup(context) {
@@ -6526,25 +7176,25 @@
         ? `${formatProofDuration(timing.totalMilliseconds)} OBSERVED`
         : `~${formatProofDuration(timing.totalMilliseconds)} AVG`;
     }
-    if (timing.requiresCwi) return state.hardwareIndex.status === "running" ? "CWI RUNNING" : "CWI REQUIRED";
+    if (timing.requiresCwi) return hardwareIndexUiIsActive() ? "CWI ACTIVE" : "CWI REQUIRED";
     return "UNKNOWN";
   }
 
   function actionProofEstimateSummary(timing) {
     const stateLabel = timing.estimateKind === "observed"
-      ? "MINEIRON OBSERVED"
+      ? "MINEIRON PROOF OBSERVED"
       : timing.estimateKind === "average"
-        ? "CWI PER-ACTION AVERAGE"
+        ? "CWI PROOF-WINDOW AVERAGE"
         : "CALIBRATION REQUIRED";
     const detail = timing.estimateKind === "observed"
-      ? "This exact MineIron action hash was measured through proof generation, commit, and verified live output."
+      ? "This exact MineIron action hash was measured from the Generate Proof start sentinel to its done sentinel; commit was excluded."
       : timing.estimateKind === "average"
-        ? "The measured MineIron lifecycle is reused as a transparent average; it is not specific to this action."
-        : "Run one real MineIron lifecycle on the selected Driver to establish the per-action baseline.";
+        ? "The measured MineIron proof window is reused as a transparent average; it is not specific to this action."
+        : "Run one real MineIron Generate Proof window on the selected Driver to establish the baseline.";
     const stateClass = timing.hasCwi ? "is-complete" : "is-unknown";
     return `
       <div class="proof-estimate-summary ${stateClass}">
-        <div><span>Selected-Driver lifecycle baseline</span><strong>${escapeHtml(actionProofTotalTimingLabel(timing))}</strong></div>
+        <div><span>Selected-Driver proof baseline</span><strong>${escapeHtml(actionProofTotalTimingLabel(timing))}</strong></div>
         <div><span>${escapeHtml(stateLabel)}</span><small>${escapeHtml(detail)}</small></div>
       </div>`;
   }
@@ -6553,30 +7203,36 @@
     if (!timing.hasCwi) return "";
     const cwi = timing.cwi;
     const liveState = state.hardwareIndex.status === "running"
-      ? " / refreshing now"
+      ? " / measuring another proof now"
+      : state.hardwareIndex.status === "settling"
+        ? " / saved proof frozen; MineIron settling"
       : state.hardwareIndex.status === "error"
         ? " / last valid result retained"
         : "";
     return `
       <div class="proof-cwi-source">
-        <span><b>${HARDWARE_INDEX_LABEL} ${escapeHtml(formatProofDuration(cwi.durationMs))}</b> / ${escapeHtml(formatMineIronRate(cwi))} MineIron equivalent${escapeHtml(liveState)}</span>
+        <span><b>${HARDWARE_INDEX_LABEL} ${escapeHtml(formatProofDuration(cwi.durationMs))}</b> / ${escapeHtml(formatMineIronRate(cwi))}${escapeHtml(liveState)}</span>
         <small>${escapeHtml(cwi.driverUrl)} / action ${escapeHtml(shortText(cwi.actionHash, 10, 7))} / measured ${escapeHtml(formatDate(cwi.measuredAt))}</small>
       </div>`;
   }
 
   function actionProofCwiCalloutMarkup(timing) {
     if (!timing.requiresCwi) return "";
-    const running = state.hardwareIndex.status === "running";
+    const measuring = state.hardwareIndex.status === "running";
+    const settling = state.hardwareIndex.status === "settling";
+    const active = measuring || settling;
     const failed = state.hardwareIndex.status === "error";
     const pending = hardwareIndexPendingForConnection();
     const resumable = hardwareIndexPendingHasRun(pending);
     const locked = Boolean(pending && !resumable);
     const activeRunName = state.hardwareIndex.activeRun?.connectionName || "selected Driver";
-    const runningHere = Boolean(
-      running && state.hardwareIndex.activeRun?.driverUrl === hardwareIndexConnectionKey(activeConnection())
+    const activeHere = Boolean(
+      active && state.hardwareIndex.activeRun?.driverUrl === hardwareIndexConnectionKey(activeConnection())
     );
-    const title = running
-      ? `MineIron running on ${activeRunName}`
+    const title = settling
+      ? `MineIron settling on ${activeRunName}`
+      : measuring
+        ? `Measuring MineIron proof on ${activeRunName}`
       : locked
         ? "Submission outcome locked"
         : failed
@@ -6584,27 +7240,29 @@
           : resumable
             ? "Accepted MineIron needs tracking"
             : "Driver calibration required";
-    const copy = running
-      ? runningHere
-        ? "Following the live action through proof, commit, and verified output. It cannot be cancelled here."
-        : `The active test belongs to ${activeRunName}, not this selected Driver. It continues even after switching connections.`
+    const copy = active
+      ? activeHere
+        ? settling
+          ? "The proof timer is frozen. MineIron settlement continues in Activity and is excluded; no score is fabricated if the exact event window was missed."
+          : `Timing generateProof/running "Generating proof" through generateProof/done "Proof generation complete". Commit is excluded.`
+        : `The active MineIron belongs to ${activeRunName}, not this selected Driver. It continues even after switching connections.`
       : locked
         ? hardwareIndexPendingLockCopy(pending)
         : failed
           ? state.hardwareIndex.error || "The selected Driver could not complete CWI."
           : resumable
             ? `Resume retained run ${shortText(pending.runId)}; no new action will be submitted.`
-            : "Run one real craft-rocket::MineIron action. It creates and keeps one live on-chain Iron.";
-    const control = running || locked
-      ? running
-        ? '<button class="game-button" type="button" data-hardware-index-focus aria-disabled="true">In progress</button>'
+            : "Run one real craft-rocket::MineIron action and measure only its Generate Proof window. Settlement continues separately and may keep one Iron.";
+    const control = active || locked
+      ? active
+        ? `<button class="game-button" type="button" data-hardware-index-focus aria-disabled="true">${settling ? "Settling" : "Measuring"}</button>`
         : '<button class="game-button" type="button" data-command="activity" data-hardware-index-focus>Review Activity</button>'
       : `<button class="game-button" type="button" data-command="run-hardware-index" data-hardware-index-focus>${resumable ? "Resume CWI" : failed ? "Retry CWI" : "Run CWI"}</button>`;
     return `
       <div class="proof-cwi-callout${failed ? " is-error" : ""}">
-        <div><span>${running ? "Active benchmark" : "Selected Driver"} / ${HARDWARE_INDEX_LABEL}</span><strong>${escapeHtml(title)}</strong><small>${escapeHtml(copy)}</small></div>
+        <div><span>${active ? "Active MineIron" : "Selected Driver"} / ${HARDWARE_INDEX_LABEL}</span><strong>${escapeHtml(title)}</strong><small>${escapeHtml(copy)}</small></div>
         ${control}
-        ${running ? hardwareIndexProgressMarkup("proof-cwi-track") : ""}
+        ${active ? hardwareIndexProgressMarkup("proof-cwi-track") : ""}
       </div>`;
   }
 
@@ -6626,15 +7284,16 @@
       </div>
       ${actionProofCwiSourceMarkup(timing)}
       ${actionProofCwiCalloutMarkup(timing)}
-      <p class="action-proof-note">PoW and VDF remain severity/workload labels only. CWI does not invent separate component rates: it measures one complete MineIron lifecycle on the selected Driver, then uses that duration as the planner's per-action average. Only the measured MineIron action hash is an observed action-specific time.</p>`;
+      <p class="action-proof-note">PoW and VDF remain severity/workload labels only. CWI does not invent separate component rates: it measures the MineIron window from <code>generateProof/running</code> “Generating proof” through <code>generateProof/done</code> “Proof generation complete”, excluding commit, then uses that duration as the planner's per-action average. Only the measured MineIron action hash is an observed action-specific time.</p>`;
   }
 
   function actionProofTimingAnnouncement(action) {
     const timing = estimateActionProofTiming(action);
-    if (timing.requiresCwi && state.hardwareIndex.status === "running") return "A real MineIron client work index run is in progress.";
-    if (timing.requiresCwi) return "Client work index is required for the selected-Driver per-action baseline.";
+    if (timing.requiresCwi && state.hardwareIndex.status === "settling") return "MineIron settlement is in progress, but no trustworthy Generate Proof timing window was saved.";
+    if (timing.requiresCwi && state.hardwareIndex.status === "running") return "A real MineIron Generate Proof measurement is in progress.";
+    if (timing.requiresCwi) return "Client work index is required for the selected-Driver proof-window baseline.";
     if (timing.totalMilliseconds == null) return "Action timing is unknown.";
-    const qualifier = timing.estimateKind === "observed" ? "Observed MineIron lifecycle" : "CWI per-action average, not action-specific";
+    const qualifier = timing.estimateKind === "observed" ? "Observed MineIron proof window, commit excluded" : "CWI proof-window average, not action-specific";
     return `${qualifier}: ${formatProofDuration(timing.totalMilliseconds)}.`;
   }
 
@@ -6643,7 +7302,7 @@
     return `
       <section class="game-panel action-proof-panel" data-hardware-index data-hardware-index-view="action-proof" data-action-key="${escapeHtml(key)}" data-cwi-state="${escapeHtml(state.hardwareIndex.status)}" tabindex="-1" aria-labelledby="action-proof-title">
         <span class="sr-only" data-hardware-index-announcement aria-live="polite" aria-atomic="true">${escapeHtml(actionProofTimingAnnouncement(action))}</span>
-        <div class="game-panel-header"><h3 id="action-proof-title">Direct work gates</h3><span>CWI Driver baseline</span></div>
+        <div class="game-panel-header"><h3 id="action-proof-title">Direct work gates</h3><span>CWI proof baseline</span></div>
         <div class="game-panel-body" data-hardware-index-content>${actionProofRequirementsContentMarkup(action)}</div>
       </section>`;
   }
@@ -7353,9 +8012,9 @@
           ${menuTile("reset-config", "RST", "Reset defaults", "Restore the local Driver profile and clear saved cartridge selections.", { meta: "Caution" })}
         </div>
         <div class="game-panel hardware-index-panel">
-          <div class="game-panel-header"><h2>Client work index</h2><span>Selected Driver lifecycle</span></div>
+          <div class="game-panel-header"><h2>Client work index</h2><span>Selected Driver proof baseline</span></div>
           <div class="game-panel-body">
-            <p class="screen-copy hardware-index-intro">Run one real zero-input <code>craft-rocket::MineIron</code> action on the selected Driver and measure its complete request-to-live lifecycle. The test follows proof generation and chain commit, verifies the single Iron output is live, and keeps that committed object. Its run id is saved immediately so a reload resumes tracking instead of creating another Iron. Completed measurements are stored locally per Driver URL, Driver version, and MineIron action hash for 30 days.</p>
+            <p class="screen-copy hardware-index-intro">Run one real zero-input <code>craft-rocket::MineIron</code> action and measure one exact Driver event window: <code>generateProof/running</code> with message <code>Generating proof</code> through <code>generateProof/done</code> with message <code>Proof generation complete</code>. The timer freezes at the stop event, and proof baselines/hr reports relative machine throughput: higher is faster when the Driver version and MineIron action hash match. Transaction submission, chain commit, confirmation, and live-output verification continue as settlement but are excluded from CWI. The submitted action may create one retained Iron and cannot be cancelled by closing this page. Allow several minutes on slower hardware. The run id is saved immediately, and completed proof measurements are stored locally per Driver URL, Driver version, and MineIron action hash for 30 days.</p>
             <div class="hardware-index" id="config-cwi-panel" tabindex="-1" data-hardware-index data-hardware-index-view="full">
               <span class="sr-only" data-hardware-index-announcement aria-live="polite" aria-atomic="true">${escapeHtml(hardwareIndexAnnouncement())}</span>
               <div data-hardware-index-content>${hardwareIndexContentMarkup()}</div>

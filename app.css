@@ -1362,7 +1362,19 @@ button {
     3px 3px 0 var(--hard-shadow);
 }
 
+.home-cwi-prompt[data-cwi-state="settling"] {
+  box-shadow:
+    inset 5px 0 0 var(--teal),
+    3px 3px 0 var(--hard-shadow);
+}
+
 .home-cwi-prompt[data-cwi-state="ready"] .home-cwi-mark {
+  border-color: var(--teal-dark);
+  box-shadow: 2px 2px 0 var(--teal-dark);
+  color: var(--teal);
+}
+
+.home-cwi-prompt[data-cwi-state="settling"] .home-cwi-mark {
   border-color: var(--teal-dark);
   box-shadow: 2px 2px 0 var(--teal-dark);
   color: var(--teal);
@@ -3149,6 +3161,10 @@ html.has-tech-tree-fullscreen body {
   color: var(--amber);
 }
 
+.hardware-index-score.is-settling > strong {
+  color: var(--teal);
+}
+
 .hardware-index-score.is-error > strong,
 .hardware-index-score.is-error > small {
   color: var(--coral);
@@ -3224,6 +3240,10 @@ html.has-tech-tree-fullscreen body {
   letter-spacing: 0.07em;
   text-transform: uppercase;
   white-space: nowrap;
+}
+
+.cwi-progress.is-settling .cwi-progress-copy span {
+  color: var(--teal);
 }
 
 .cwi-progress-copy strong {
