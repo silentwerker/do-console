@@ -2158,6 +2158,9 @@
   const PLANNER_DEFAULT_MAX_STEPS = GOAL_WORKFLOW_MAX_STEPS;
   const PLANNER_DEFAULT_MAX_EXPANDED_STATES = 30000;
   const PLANNER_MAX_QUANTITY = GOAL_WORKFLOW_MAX_QUANTITY;
+  const PLANNER_OPAQUE_EFFECT_WARNING = "Some predicate effects are opaque; the planner uses the action's raw flattened input/output totals.";
+  const PLANNER_STATE_GUARD_WARNING = "Predicate state guards are not simulated; this plan proves class-token flow only.";
+  const PLANNER_FALLBACK_WARNING = "A valid exact-token goal-directed fallback plan was found after shortest-path search reached its bound; its action count is not guaranteed minimal, and Driver predicate/state checks remain authoritative.";
 
   function plannerCompareText(left, right) {
     const a = String(left || "");
@@ -2195,13 +2198,13 @@
 
   function plannerHasStateGuards(source) {
     const text = String(source || "");
-    const hasNonTypeDictionaryField = ["DictContains", "DictUpdate"].some((name) =>
-      predicateCalls(text, name).some((call) => {
-        const field = splitPredicateArguments(call.argumentsSource)[1] || "";
-        const literal = field.match(/^\s*["']([^"']+)["']\s*$/)?.[1];
-        return Boolean(literal && literal !== "type");
-      }),
-    );
+    // DictUpdate writes predicate state; it is an effect, not a guard. Only a
+    // field-membership test can block an otherwise class-compatible action.
+    const hasNonTypeDictionaryField = predicateCalls(text, "DictContains").some((call) => {
+      const field = splitPredicateArguments(call.argumentsSource)[1] || "";
+      const literal = field.match(/^\s*["']([^"']+)["']\s*$/)?.[1];
+      return Boolean(literal && literal !== "type");
+    });
     if (hasNonTypeDictionaryField) return true;
     // SDK action wrappers use ArrayContains(in|out, ...) as slot plumbing. An
     // array membership test against any other value is an application guard.
@@ -2308,10 +2311,10 @@
         warnings.push("Object mutation or identity turnover is present; paired same-class turnover is shown as UPDATE flow, but field-level mutation and identity continuity are not simulated.");
       }
       if (!flow.classified || flow.opaqueInputs.length || flow.opaqueOutputs.length) {
-        warnings.push("Some predicate effects are opaque; the planner uses the action's raw flattened input/output totals.");
+        warnings.push(PLANNER_OPAQUE_EFFECT_WARNING);
       }
       if (plannerHasStateGuards(raw.predicateSource)) {
-        warnings.push("Predicate state guards are not simulated; this plan proves class-token flow only.");
+        warnings.push(PLANNER_STATE_GUARD_WARNING);
       }
       const invalidRefs = [...(raw.totalInputs || []), ...(raw.totalOutputs || [])].filter((ref) => !plannerValidClassRef(ref));
       const searchable = Boolean(raw?.action?.pluginName && raw?.action?.name && String(raw?.hash || "").trim()) && !invalidRefs.length;
@@ -3103,7 +3106,7 @@
             warnings: plannerUniqueStrings([
               ...(normalizedInventory.warnings || []),
               ...materialized.warnings,
-              "A valid exact-token goal-directed fallback plan was found after shortest-path search reached its bound; its action count is not guaranteed minimal, and Driver predicate/state checks remain authoritative.",
+              PLANNER_FALLBACK_WARNING,
             ]),
             diagnostics: [...cycleDiagnostics, searchDiagnostic],
           };
@@ -6953,7 +6956,12 @@
       ? "The complete path is fitted; zoom for detail and drag to pan. UPDATE tools remain compact references."
       : "The complete path is fitted. Read down for requirements; arrows flow up toward the target.";
     const goalRule = `craft ${result.goal.quantity} new / ${result.goal.initialCount} on hand / finish with at least ${result.goal.targetCount}`;
-    const diagnosticMarkup = (result.diagnostics || []).map((diagnostic) => {
+    const successfulPlan = result.status === "planned";
+    const successfulFallback = successfulPlan && result.strategy === "goal-directed-fallback";
+    const displayedDiagnostics = (result.diagnostics || []).filter((diagnostic) =>
+      !successfulPlan || !new Set(["seeded-cycle", "search-limit"]).has(diagnostic.code)
+    );
+    const diagnosticMarkup = displayedDiagnostics.map((diagnostic) => {
       const classIds = [...new Set(diagnostic.classIds || [])];
       const actionIds = [...new Set(diagnostic.actionIds || [])];
       const classRefs = classIds.slice(0, 6).map((classId) => {
@@ -6969,10 +6977,37 @@
       ].filter(Boolean).join(" / ");
       return `<li><span>${escapeHtml(diagnostic.message)}</span>${references ? `<small>${escapeHtml(references)}</small>` : ""}</li>`;
     });
-    const warningMarkup = [...new Set([
+    const rawWarnings = [...new Set([
       ...(result.warnings || []),
       ...result.steps.flatMap((step) => step.warnings || []),
-    ])].filter(Boolean).map((message) => `<li><span>${escapeHtml(message)}</span></li>`);
+    ])].filter(Boolean);
+    const hasOpaqueEffectNote = rawWarnings.includes(PLANNER_OPAQUE_EFFECT_WARNING);
+    const hasStateGuardNote = rawWarnings.includes(PLANNER_STATE_GUARD_WARNING);
+    const displayedWarnings = rawWarnings.filter((message) =>
+      message !== PLANNER_FALLBACK_WARNING &&
+      message !== PLANNER_OPAQUE_EFFECT_WARNING &&
+      message !== PLANNER_STATE_GUARD_WARNING
+    );
+    if (hasOpaqueEffectNote && hasStateGuardNote) {
+      displayedWarnings.unshift("Some action internals are not modeled; planning uses exact flattened inputs and outputs, and the Driver validates predicate state when each action runs.");
+    } else if (hasOpaqueEffectNote) {
+      displayedWarnings.unshift("Some predicate effects cannot be classified for the graph; planning still uses each action's exact flattened inputs and outputs.");
+    } else if (hasStateGuardNote) {
+      displayedWarnings.unshift("Some internal predicate state is not modeled; the Driver validates it when each action runs.");
+    }
+    if (successfulFallback) {
+      const fallbackNote = result.execution?.mode === "repeat-unit"
+        ? `${result.totals.unitActionCount}-action first batch validated; ~${result.totals.actionCount} actions are projected across live replans. A shortest first-batch route was not proven. The Driver remains authoritative for every action.`
+        : `${result.totals.actionCount}-action exact-token plan ready; a shortest route was not proven. The Driver remains authoritative for every action.`;
+      displayedWarnings.unshift(fallbackNote);
+    }
+    const warningMarkup = displayedWarnings.map((message) => `<li><span>${escapeHtml(message)}</span></li>`);
+    const plannerNoteItems = successfulPlan
+      ? [...warningMarkup, ...diagnosticMarkup]
+      : [...diagnosticMarkup, ...warningMarkup];
+    const plannerNotesMarkup = diagnosticMarkup.length || warningMarkup.length
+      ? `<div class="terminal-note${successfulPlan ? "" : " warning"} planner-diagnostics"><strong>${successfulPlan ? "Planner notes" : "Plan limits"}</strong><ul>${plannerNoteItems.slice(0, 8).join("")}</ul></div>`
+      : "";
     return `
       <div class="planner-summary" aria-label="Plan summary">
         <div class="planner-summary-item"><span>Goal state</span><strong>${escapeHtml(stateLabel)}</strong><small>${escapeHtml(result.goal.label)} / ${escapeHtml(shortText(result.goal.hash, 6, 4))} / ${escapeHtml(goalRule)}</small></div>
@@ -6984,7 +7019,7 @@
       <div class="planner-flow-key" aria-label="Plan relationship legend"><span><i class="planner-key-input" aria-hidden="true"></i>USE / consumed input</span><span><i class="planner-key-output" aria-hidden="true"></i>MAKE / created output</span><span><i class="planner-key-update" aria-hidden="true"></i>UPDATE / paired turnover</span>${inventoryKey}${hasMissingBranches ? '<span><i class="planner-key-missing" aria-hidden="true"></i>MISSING / unresolved prerequisite</span>' : ""}<span class="work-gate-key"><b class="gate-symbol" aria-hidden="true">⛏</b>PoW <b class="gate-symbol" aria-hidden="true">⌛</b>VDF <small><i class="gate-tone is-green" aria-hidden="true"></i>low <i class="gate-tone is-yellow" aria-hidden="true"></i>mid/? <i class="gate-tone is-red" aria-hidden="true"></i>high</small></span><span>${escapeHtml(treeGuide)}</span></div>
       ${plannerTreeSvg(tree, timingByStep, context.cartridge.name)}
       ${plannerStepListMarkup(context, timingByStep)}
-      ${diagnosticMarkup.length || warningMarkup.length ? `<div class="terminal-note warning planner-diagnostics"><strong>Plan limits</strong><ul>${[...diagnosticMarkup, ...warningMarkup].slice(0, 8).join("")}</ul></div>` : ""}`;
+      ${plannerNotesMarkup}`;
   }
 
   function plannerGoalOptionsMarkup(context) {
