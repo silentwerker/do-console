@@ -4219,6 +4219,71 @@ body.drawer-open {
   padding-bottom: 22px;
 }
 
+.workflow-confirm-body {
+  display: grid;
+  min-height: calc(100vh - 176px);
+  min-height: calc(100dvh - 176px);
+  place-items: center;
+}
+
+.workflow-start-confirm-card {
+  width: min(100%, 600px);
+  border-width: 3px;
+  box-shadow: 6px 6px 0 var(--hard-shadow);
+}
+
+.workflow-start-hero {
+  display: grid;
+  grid-template-columns: 62px minmax(0, 1fr);
+  align-items: center;
+  gap: 15px;
+}
+
+.workflow-start-glyph {
+  display: grid;
+  width: 62px;
+  height: 62px;
+  place-items: center;
+  border: 3px solid var(--lcd-line);
+  background: var(--lcd-deep);
+  box-shadow: inset 3px 3px 0 var(--screen-inset-dark), 3px 3px 0 var(--hard-shadow);
+  color: var(--success);
+  font-size: 24px;
+  line-height: 1;
+}
+
+.workflow-start-hero strong {
+  color: var(--lcd-text);
+  font-size: 13px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.workflow-start-hero p,
+.workflow-start-batch-note {
+  margin: 7px 0 0;
+  color: var(--lcd-muted);
+  font-size: 8px;
+  font-weight: 800;
+  line-height: 1.7;
+}
+
+.workflow-start-summary {
+  margin-top: 16px;
+}
+
+.workflow-start-batch-note {
+  padding: 0 2px;
+}
+
+.workflow-start-warning {
+  margin-top: 13px;
+}
+
+.workflow-start-controls {
+  grid-template-columns: repeat(2, minmax(130px, 1fr));
+}
+
 .workflow-summary {
   margin-top: 0;
 }
@@ -5574,6 +5639,23 @@ html.has-planner-tree-fullscreen .game-shell::after {
 
   .workflow-drawer-body {
     padding: 13px;
+  }
+
+  .workflow-confirm-body {
+    min-height: calc(100vh - 158px);
+    min-height: calc(100dvh - 158px);
+  }
+
+  .workflow-start-hero {
+    grid-template-columns: 46px minmax(0, 1fr);
+    align-items: start;
+    gap: 11px;
+  }
+
+  .workflow-start-glyph {
+    width: 46px;
+    height: 46px;
+    font-size: 18px;
   }
 
   .workflow-queue-row {

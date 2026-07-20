@@ -32,6 +32,7 @@
   const POW_REFERENCE_WORK_MS = 1_000;
   const VDF_ITERATION_WORK_MS = 5_000;
   const STRUCTURAL_SLOT_WORK_MS = 60_000;
+  const WORK_ESTIMATOR_EXTRAPOLATION_FACTOR = 0.5;
   const ACTION_OPERATIONAL_CONTINGENCY = 0.25;
   const HARDWARE_INDEX_PROOF_START = Object.freeze({ phase: "generateProof", status: "running", message: "Generating proof" });
   const HARDWARE_INDEX_PROOF_STOP = Object.freeze({ phase: "generateProof", status: "done", message: "Proof generation complete" });
@@ -1769,7 +1770,7 @@
       { screen: "actions", command: "actions", label: "Play" },
       { screen: "planner", command: "planner", label: "Goal Planner" },
       { screen: "tree", command: "tree", label: "Tech Tree" },
-      { screen: "objects", command: "objects", label: "Objects" },
+      { screen: "objects", command: "objects", label: "Inventory" },
       { screen: "activity", command: "activity", label: "Activity" },
     ];
     const activeLabel = items.find((item) => item.screen === activeScreen)?.label || "Cartridge";
@@ -3638,7 +3639,8 @@
   // that machine-specific result with the readable proof gates and flattened I/O
   // shape, then adds commit and operational allowances. The calibration constants
   // come from craft-rocket's authored 1 s PoW / 5 s VDF scale and observed Driver
-  // proof windows (41.7 s MineIron reference; roughly 60 s per extra I/O slot).
+  // proof windows. Modeled work beyond the observed CWI baseline is empirically
+  // corrected without altering that measured baseline or the commit allowance.
   function estimateActionProofTiming(
     action,
     cwiResult = currentHardwareIndex(),
@@ -3665,10 +3667,11 @@
     const ioSlotCount = totalInputs + totalOutputs;
     const structuralWorkMilliseconds = Math.max(0, ioSlotCount - 1) * STRUCTURAL_SLOT_WORK_MS;
     const hardwareScale = hasCwi ? cwi.durationMs / WORK_ESTIMATOR_REFERENCE_CWI_MS : null;
+    const extrapolationScale = hasCwi ? hardwareScale * WORK_ESTIMATOR_EXTRAPOLATION_FACTOR : null;
     const additionalDirectWorkMilliseconds = hasCwi
-      ? Math.max(0, directWorkMilliseconds - POW_REFERENCE_WORK_MS) * hardwareScale
+      ? Math.max(0, directWorkMilliseconds - POW_REFERENCE_WORK_MS) * extrapolationScale
       : null;
-    const structuralProofMilliseconds = hasCwi ? structuralWorkMilliseconds * hardwareScale : null;
+    const structuralProofMilliseconds = hasCwi ? structuralWorkMilliseconds * extrapolationScale : null;
     const proofMilliseconds = hasCwi
       ? cwi.durationMs + additionalDirectWorkMilliseconds + structuralProofMilliseconds
       : null;
@@ -3696,6 +3699,8 @@
       powRatio,
       ioSlotCount,
       hardwareScale,
+      extrapolationScale,
+      extrapolationFactor: WORK_ESTIMATOR_EXTRAPOLATION_FACTOR,
       directWorkMilliseconds,
       structuralWorkMilliseconds,
       additionalDirectWorkMilliseconds,
@@ -3706,8 +3711,8 @@
       operationalAllowanceMilliseconds,
       operationalContingency: ACTION_OPERATIONAL_CONTINGENCY,
       totalMilliseconds,
-      powMilliseconds: hasCwi && powRatio != null ? powWorkMilliseconds * hardwareScale : null,
-      vdfMilliseconds: hasCwi ? vdfWorkMilliseconds * hardwareScale : null,
+      powMilliseconds: hasCwi && powRatio != null ? powWorkMilliseconds * extrapolationScale : null,
+      vdfMilliseconds: hasCwi ? vdfWorkMilliseconds * extrapolationScale : null,
       powLowerBound: Boolean(!workload.pow.complete || !referenceAttempts),
       vdfLowerBound: Boolean(!workload.vdf.complete),
     };
@@ -9245,16 +9250,8 @@
       return;
     }
     if (workflow.status === "ready" && !options.skipConfirmation) {
-      const totalLabel = goalWorkflowActionTotalLabel(workflow);
-      const batching = workflow.executionMode === "repeat-unit"
-        ? ` The action total is initially estimated at ${totalLabel}; the controller replans from live inventory between goal batches until the requested quantity is verified.`
-        : "";
-      const approved = globalThis.confirm(
-        `Start the ${goalWorkflowGoalLabel(workflow)} workflow on ${workflow.connection.name}?\n\n` +
-          `${totalLabel} state-changing actions will be submitted sequentially.${batching} Inputs are consumed and completed steps cannot be undone. ` +
-          "Pause or Exit takes effect before the next action; an accepted Driver action always finishes.",
-      );
-      if (!approved) return;
+      showGoalWorkflowStartConfirmation();
+      return;
     }
     const token = ++state.goalWorkflowLoopToken;
     const execute = async (lock) => {
@@ -9320,6 +9317,35 @@
         if (token === state.goalWorkflowLoopToken) state.goalWorkflowLoopPromise = null;
         notifyGoalWorkflowChange();
       });
+  }
+
+  function showGoalWorkflowStartConfirmation() {
+    const workflow = state.goalWorkflow;
+    if (!workflow || workflow.status !== "ready") return;
+    if (state.drawer?.type !== "workflow") openGoalWorkflowManager();
+    if (state.drawer?.type !== "workflow") return;
+    state.drawer.workflowStartConfirmation = true;
+    renderDrawer();
+  }
+
+  function cancelGoalWorkflowStartConfirmation() {
+    if (state.drawer?.type !== "workflow" || !state.drawer.workflowStartConfirmation) return false;
+    state.drawer.workflowStartConfirmation = false;
+    renderDrawer();
+    return true;
+  }
+
+  function confirmGoalWorkflowStart() {
+    const workflow = state.goalWorkflow;
+    if (
+      !workflow ||
+      workflow.status !== "ready" ||
+      state.drawer?.type !== "workflow" ||
+      !state.drawer.workflowStartConfirmation
+    ) return;
+    state.drawer.workflowStartConfirmation = false;
+    renderDrawer(false);
+    launchGoalWorkflowEngine({ skipConfirmation: true });
   }
 
   function pauseGoalWorkflow() {
@@ -9470,7 +9496,7 @@
   }
 
   function objectCatalogMarkup(cartridge = selectedCartridge()) {
-    if (!cartridge) return errorPanel("Select a cartridge", "Choose a cartridge before opening its objects.", "cartridges");
+    if (!cartridge) return errorPanel("Select a cartridge", "Choose a cartridge before opening its inventory.", "cartridges");
     const query = state.objectSearch.trim().toLowerCase();
     const filtered = state.workspace.objects.filter((object) => {
       if (object.class?.pluginName !== cartridge.id) return false;
@@ -9496,10 +9522,10 @@
         </button>`;
     }).join("");
     return `${state.workspace.errors.objects
-      ? errorPanel("Objects unavailable", state.workspace.errors.objects)
+      ? errorPanel("Inventory unavailable", state.workspace.errors.objects)
       : visible.length
         ? `<div class="object-grid">${cards}</div>`
-        : '<div class="game-panel"><div class="game-empty"><h2>No objects match</h2><p>Change the search, status, or selected cartridge.</p></div></div>'}
+        : '<div class="game-panel"><div class="game-empty"><h2>No inventory matches</h2><p>Change the search, status, or selected cartridge.</p></div></div>'}
       ${filtered.length > visible.length ? `<div class="load-more">${gameButton(`Show ${Math.min(90, filtered.length - visible.length)} more`, "more-objects")}</div>` : ""}`;
   }
 
@@ -9508,7 +9534,7 @@
     if (!cartridge) {
       return `
         <section class="game-screen" aria-labelledby="objects-title">
-          ${screenHeading("Object menu", "No cartridge selected", "Objects are shown only for the selected cartridge.", backButton())}
+          ${screenHeading("Inventory menu", "No cartridge selected", "Inventory is shown only for the selected cartridge.", backButton())}
           <div data-catalog-region="objects">${objectCatalogMarkup(null)}</div>
         </section>`;
     }
@@ -9519,14 +9545,14 @@
       <section class="game-screen game-screen-wide" aria-labelledby="objects-title">
         ${screenHeading(
           `${cartridge.name} cartridge`,
-          "Objects",
-          "Only objects belonging to the selected cartridge are shown.",
+          "Inventory",
+          "Your current inventory compatible with the selected cartridge.",
         )}
         ${cartridgeNavigation("objects", gameButton("Import .dobj", "import-object", { tone: "primary", disabled: connectionStatus(activeConnection()?.id).state !== "online" }))}
         <div class="game-toolbar">
-          <input id="object-search" class="game-input game-search" type="search" placeholder="Search objects" value="${escapeHtml(state.objectSearch)}" aria-label="Search objects" />
+          <input id="object-search" class="game-input game-search" type="search" placeholder="Search inventory" value="${escapeHtml(state.objectSearch)}" aria-label="Search inventory" />
           <div class="game-toolbar-group">
-            <label class="sr-only" for="object-status">Object status</label>
+            <label class="sr-only" for="object-status">Inventory status</label>
             <select id="object-status" class="game-select">${statusOptions}</select>
           </div>
         </div>
@@ -10070,8 +10096,50 @@
       Boolean(workflow.pauseRequested),
       Boolean(workflow.exitRequested),
       workflow.error || "",
+      workflow.estimatedTotalMilliseconds,
       goalWorkflowOwnedByOtherTab(workflow),
     ]);
+  }
+
+  function renderGoalWorkflowStartConfirmation(workflow) {
+    const actionTotalLabel = goalWorkflowActionTotalLabel(workflow);
+    const estimate = workflow.estimatedTotalMilliseconds == null
+      ? "Unknown"
+      : `${workflow.estimateComplete ? "~" : ">= "}${formatProofDuration(workflow.estimatedTotalMilliseconds)}`;
+    const batchNote = workflow.executionMode === "repeat-unit"
+      ? "The controller replans from live inventory between goal batches until the requested quantity is verified."
+      : "The saved action set will run in its displayed order.";
+    return `
+      <div data-workflow-start-confirmation data-workflow-fingerprint="${escapeHtml(goalWorkflowDrawerFingerprint(workflow))}">
+        <p id="workflow-dialog-description" class="sr-only">Confirm the state-changing Driver workflow for ${escapeHtml(goalWorkflowGoalLabel(workflow))}, or cancel to return to its workflow monitor.</p>
+        <div class="drawer-header workflow-drawer-header">
+          <div><p class="screen-kicker">Workflow launch</p><h2 class="drawer-title" id="drawer-title" data-workflow-focus tabindex="-1">Start this workflow?</h2><small>${escapeHtml(goalWorkflowGoalLabel(workflow))}</small></div>
+          <button class="game-button" type="button" data-command="workflow-start-cancel">Back</button>
+        </div>
+        <div class="drawer-body workflow-confirm-body">
+          <section class="game-panel workflow-start-confirm-card" aria-labelledby="workflow-start-goal">
+            <div class="game-panel-header"><h3 id="workflow-start-goal">${escapeHtml(goalWorkflowGoalLabel(workflow))}</h3><span>Ready</span></div>
+            <div class="game-panel-body">
+              <div class="workflow-start-hero">
+                <span class="workflow-start-glyph" aria-hidden="true">&#9654;</span>
+                <div><strong>Authorize sequential actions</strong><p>Starting this flow allows the console to submit each planned action to the selected Driver after a fresh live preflight.</p></div>
+              </div>
+              <div class="summary-strip workflow-start-summary">
+                <div class="summary-stat"><span>Driver</span><strong>${escapeHtml(workflow.connection.name)}</strong></div>
+                <div class="summary-stat"><span>Actions</span><strong>${escapeHtml(actionTotalLabel)}</strong></div>
+                <div class="summary-stat"><span>Estimate</span><strong>${escapeHtml(estimate)}</strong></div>
+                <div class="summary-stat"><span>Cartridge</span><strong>${escapeHtml(workflow.cartridgeName)}</strong></div>
+              </div>
+              <p class="workflow-start-batch-note">${escapeHtml(batchNote)}</p>
+              <div class="terminal-note warning workflow-start-warning"><strong>Committed steps cannot be undone.</strong><br />Inputs are consumed. Pause or Exit stops later submissions only; an action already accepted by the Driver always finishes.</div>
+            </div>
+          </section>
+        </div>
+        <div class="drawer-footer workflow-controls workflow-start-controls">
+          <button class="game-button" type="button" data-command="workflow-start-cancel">Cancel</button>
+          <button class="game-button game-button-primary" type="button" data-command="workflow-start-confirm" data-workflow-primary><span aria-hidden="true">&#9654;</span><span>Start workflow</span></button>
+        </div>
+      </div>`;
   }
 
   function renderGoalWorkflowDrawer(workflow) {
@@ -10129,6 +10197,16 @@
   function patchGoalWorkflowDrawer() {
     if (state.drawer?.type !== "workflow" || !state.goalWorkflow) return;
     const workflow = state.goalWorkflow;
+    if (state.drawer.workflowStartConfirmation) {
+      const confirmation = drawerContent.querySelector("[data-workflow-start-confirmation]");
+      if (workflow.status !== "ready") {
+        state.drawer.workflowStartConfirmation = false;
+        renderDrawer(false);
+      } else if (!confirmation || confirmation.dataset.workflowFingerprint !== goalWorkflowDrawerFingerprint(workflow)) {
+        renderDrawer(false);
+      }
+      return;
+    }
     const root = drawerContent.querySelector("[data-workflow-drawer]");
     if (!root || root.dataset.workflowFingerprint !== goalWorkflowDrawerFingerprint(workflow)) {
       renderDrawer(false);
@@ -10330,7 +10408,9 @@
       html = renderRunDrawer(state.drawer);
     } else if (state.drawer.type === "workflow") {
       html = state.goalWorkflow
-        ? renderGoalWorkflowDrawer(state.goalWorkflow)
+        ? state.drawer.workflowStartConfirmation
+          ? renderGoalWorkflowStartConfirmation(state.goalWorkflow)
+          : renderGoalWorkflowDrawer(state.goalWorkflow)
         : '<div class="drawer-body"><div class="game-error"><h2 id="drawer-title">Workflow unavailable</h2></div></div>';
     }
     drawer.dataset.drawerType = state.drawer.type;
@@ -10341,7 +10421,7 @@
     requestAnimationFrame(() => {
       const captured = !focusFirst ? findCapturedFocus(drawerContent, focusToken) : null;
       const workflowTarget = state.drawer?.type === "workflow"
-        ? drawerContent.querySelector("[data-workflow-primary], [data-workflow-focus]")
+        ? drawerContent.querySelector("[data-workflow-primary]") || drawerContent.querySelector("[data-workflow-focus]")
         : null;
       const target = captured || workflowTarget || drawerContent.querySelector("button, select, input");
       target?.focus({ preventScroll: true });
@@ -10733,6 +10813,12 @@
       case "workflow-resume":
         resumeGoalWorkflow();
         break;
+      case "workflow-start-confirm":
+        confirmGoalWorkflowStart();
+        break;
+      case "workflow-start-cancel":
+        cancelGoalWorkflowStartConfirmation();
+        break;
       case "workflow-pause":
         pauseGoalWorkflow();
         break;
@@ -10965,7 +11051,9 @@
     }
   });
 
-  drawerBackdrop.addEventListener("click", closeDrawer);
+  drawerBackdrop.addEventListener("click", () => {
+    if (!cancelGoalWorkflowStartConfirmation()) closeDrawer();
+  });
   byId("theme-picker").addEventListener("click", (event) => {
     const target = event.target.closest("[data-command='set-theme']");
     if (target) void handleCommand(target);
@@ -11049,6 +11137,7 @@
         syncPlannerTreeFullscreenUi();
         return;
       }
+      if (cancelGoalWorkflowStartConfirmation()) return;
       if (!state.drawer && state.cartridgeNavOpen) {
         state.cartridgeNavOpen = false;
         const nav = main.querySelector(".cartridge-nav");
