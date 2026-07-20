@@ -27,7 +27,7 @@
   const HARDWARE_INDEX_PENDING_MAX_AGE_MS = 24 * 60 * 60_000;
   const HARDWARE_INDEX_POLL_MS = 1_200;
   const HARDWARE_INDEX_ACTION = Object.freeze({ pluginName: "craft-rocket", name: "MineIron" });
-  const ACTION_COMMIT_ALLOWANCE_MS = 60_000;
+  const ACTION_COMMIT_ALLOWANCE_MS = 30_000;
   const WORK_ESTIMATOR_REFERENCE_CWI_MS = 41_700;
   const POW_REFERENCE_WORK_MS = 1_000;
   const VDF_ITERATION_WORK_MS = 5_000;
