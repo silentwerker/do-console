@@ -8,6 +8,7 @@
 
   const CONFIG_VERSION = 1;
   const STORAGE_KEY = "don.lightConsole.config.v1";
+  const RUN_LIST_CAPABILITY_STORAGE_KEY = "don.lightConsole.runListCapabilities.v1";
   const GOAL_WORKFLOW_STORAGE_KEY = "don.lightConsole.goalWorkflow.v1";
   const GOAL_WORKFLOW_VERSION = 1;
   const GOAL_WORKFLOW_POLL_MS = 1_200;
@@ -149,6 +150,19 @@
     };
   }
 
+  function normalizeRecentRunIds(value) {
+    return Array.isArray(value)
+      ? [...new Set(value.map((id) => String(id).trim()).filter(Boolean))].slice(0, 30)
+      : [];
+  }
+
+  function normalizeRecentRunIdMap(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+    return Object.fromEntries(
+      Object.entries(value).map(([key, idsValue]) => [key, normalizeRecentRunIds(idsValue)]),
+    );
+  }
+
   function normalizeConfig(value) {
     const source = value && typeof value === "object" ? value : {};
     const rawConnections = Array.isArray(source.connections) && source.connections.length
@@ -175,15 +189,7 @@
         source.activeCartridgeByConnection && typeof source.activeCartridgeByConnection === "object"
           ? { ...source.activeCartridgeByConnection }
           : {},
-      recentRunIdsByConnection:
-        source.recentRunIdsByConnection && typeof source.recentRunIdsByConnection === "object"
-          ? Object.fromEntries(
-              Object.entries(source.recentRunIdsByConnection).map(([key, idsValue]) => [
-                key,
-                Array.isArray(idsValue) ? idsValue.map(String).slice(0, 30) : [],
-              ]),
-            )
-          : {},
+      recentRunIdsByConnection: normalizeRecentRunIdMap(source.recentRunIdsByConnection),
       clientWorkIndexes,
       clientWorkIndexRuns,
       ui: {
@@ -222,6 +228,61 @@
     } catch {
       return "";
     }
+  }
+
+  function loadRunListCapabilities() {
+    try {
+      const parsed = JSON.parse(localStorage.getItem(RUN_LIST_CAPABILITY_STORAGE_KEY) || "{}");
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return new Map();
+      return new Map(
+        Object.entries(parsed)
+          .filter(([key, value]) => key && typeof value === "boolean")
+          .slice(-32),
+      );
+    } catch {
+      return new Map();
+    }
+  }
+
+  const runListCapabilities = loadRunListCapabilities();
+
+  function runListCapabilityKey(connection, health) {
+    const driverUrl = normalizedDriverUrl(connection?.driverUrl);
+    const version = String(health?.version || "").trim();
+    return driverUrl && version ? `${driverUrl}\n${version}` : "";
+  }
+
+  function cachedRunListCapability(connection, health) {
+    const key = runListCapabilityKey(connection, health);
+    return key && runListCapabilities.has(key) ? runListCapabilities.get(key) : null;
+  }
+
+  function rememberRunListCapability(connection, health, supported) {
+    const key = runListCapabilityKey(connection, health);
+    if (!key) return;
+    runListCapabilities.delete(key);
+    runListCapabilities.set(key, Boolean(supported));
+    while (runListCapabilities.size > 32) runListCapabilities.delete(runListCapabilities.keys().next().value);
+    try {
+      localStorage.setItem(RUN_LIST_CAPABILITY_STORAGE_KEY, JSON.stringify(Object.fromEntries(runListCapabilities)));
+    } catch {
+      // Capability caching is an optimization; per-id recovery still works.
+    }
+  }
+
+  function inferredRunListCapability(health) {
+    const advertised = health?.capabilities?.retainedRunInventory;
+    if (typeof advertised === "boolean") return advertised;
+    const releaseCandidate = /^v?0\.1\.0-rc\.(\d+)$/i.exec(String(health?.version || "").trim());
+    if (releaseCandidate && Number(releaseCandidate[1]) <= 43) return false;
+    return null;
+  }
+
+  function isLegacyRunListRouteError(error) {
+    return Boolean(
+      error?.status === 500 &&
+      /invalid qualified name\s+["']?runs["']?.*missing\s+["']?::["']?\s+separator/i.test(String(error?.message || "")),
+    );
   }
 
   function hardwareIndexConnectionKey(connection) {
@@ -1473,32 +1534,113 @@
     });
   }
 
-  async function loadRetainedRuns(connection, generation = state.workspaceGeneration) {
+  const retainedRunLoadPromises = new Map();
+
+  function storedRecentRunIds(connectionId) {
     try {
-      const runs = await driverRequest(connection, "/actions/runs", { timeout: 8000 });
-      if (!Array.isArray(runs)) throw new DriverError("The retained-run response is incompatible.");
-      if (!isCurrentWorkspace(connection, generation)) return false;
-      state.workspace.runsSupported = true;
-      delete state.workspace.errors.runs;
-      replaceRetainedRuns(runs);
-      return true;
-    } catch (error) {
-      if (!isCurrentWorkspace(connection, generation)) return false;
-      state.workspace.runsSupported = false;
-      state.workspace.errors.runs = error.message;
+      const parsed = JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}");
+      return normalizeRecentRunIds(parsed?.recentRunIdsByConnection?.[connectionId]);
+    } catch {
+      return [];
     }
-    const ids = state.config.recentRunIdsByConnection[connection.id] || [];
+  }
+
+  function mergeRecentRunIds(connectionId, preferredIds = []) {
+    return normalizeRecentRunIds([
+      ...preferredIds,
+      ...storedRecentRunIds(connectionId),
+      ...(state.config.recentRunIdsByConnection[connectionId] || []),
+    ]);
+  }
+
+  function pruneRecentRunIds(connectionId, expiredIds) {
+    if (!expiredIds.size) return;
+    const currentIds = mergeRecentRunIds(connectionId);
+    const retainedIds = currentIds.filter((id) => !expiredIds.has(id));
+    if (retainedIds.length === currentIds.length) return;
+    state.config.recentRunIdsByConnection[connectionId] = retainedIds;
+    persistConfig(false, false);
+  }
+
+  async function loadRetainedRunsOnce(connection, generation, options = {}) {
+    if (!isCurrentWorkspace(connection, generation)) return false;
+    delete state.workspace.errors.runs;
+    const health = state.workspace.health || connectionStatus(connection.id).health;
+    const cachedCapability = cachedRunListCapability(connection, health);
+    const inferredCapability = inferredRunListCapability(health);
+    let listCapability = inferredCapability ?? cachedCapability;
+    if (inferredCapability != null && inferredCapability !== cachedCapability) {
+      rememberRunListCapability(connection, health, inferredCapability);
+    }
+    const hasVersion = Boolean(String(health?.version || "").trim());
+    const shouldProbeList = listCapability === true || (
+      listCapability == null && (hasVersion || options.probeList === true)
+    );
+
+    if (shouldProbeList) {
+      try {
+        const runs = await driverRequest(connection, "/actions/runs", { timeout: 8000 });
+        if (!Array.isArray(runs)) throw new DriverError("The retained-run response is incompatible.");
+        if (!isCurrentWorkspace(connection, generation)) return false;
+        rememberRunListCapability(connection, health, true);
+        state.workspace.runsSupported = true;
+        replaceRetainedRuns(runs);
+        return true;
+      } catch (error) {
+        if (!isCurrentWorkspace(connection, generation)) return false;
+        if (
+          isLegacyRunListRouteError(error) ||
+          new Set([404, 405]).has(error.status) ||
+          (!error.status && /retained-run response is incompatible/i.test(error.message))
+        ) {
+          listCapability = false;
+          rememberRunListCapability(connection, health, false);
+        } else {
+          state.workspace.runsSupported = cachedCapability === true ? true : null;
+          state.workspace.errors.runs = error.message || "Run inventory failed.";
+        }
+      }
+    }
+
+    state.workspace.runsSupported = listCapability === false ? false : listCapability === true ? true : null;
+    const listUnavailable = !shouldProbeList || listCapability === false;
+    const ids = mergeRecentRunIds(connection.id);
+    if (!ids.length) {
+      if (isCurrentWorkspace(connection, generation) && listUnavailable) replaceRetainedRuns([]);
+      return true;
+    }
     const snapshots = await Promise.allSettled(
-      ids.slice(0, 20).map((id) => driverRequest(connection, `/actions/runs/${encodeURIComponent(id)}`, { timeout: 5000 })),
+      ids.map((id) => driverRequest(connection, `/actions/runs/${encodeURIComponent(id)}`, { timeout: 5000 })),
     );
     if (!isCurrentWorkspace(connection, generation)) return false;
     const recovered = snapshots.filter((result) => result.status === "fulfilled").map((result) => result.value);
     const fallbackAuthoritative = snapshots.every(
       (result) => result.status === "fulfilled" || result.reason?.status === 404,
     );
-    if (fallbackAuthoritative) replaceRetainedRuns(recovered);
+    const expiredIds = new Set(
+      snapshots.flatMap((result, index) => result.status === "rejected" && result.reason?.status === 404 ? [ids[index]] : []),
+    );
+    pruneRecentRunIds(connection.id, expiredIds);
+    const transientError = snapshots.find(
+      (result) => result.status === "rejected" && result.reason?.status !== 404,
+    );
+    if (transientError) state.workspace.errors.runs = transientError.reason?.message || "Run recovery failed.";
+    if (fallbackAuthoritative && listUnavailable && state.workspace.runsSupported !== true) replaceRetainedRuns(recovered);
     else for (const run of recovered) mergeRun(run);
     return fallbackAuthoritative;
+  }
+
+  async function loadRetainedRuns(connection, generation = state.workspaceGeneration, options = {}) {
+    const key = `${connection?.id || ""}\n${normalizedDriverUrl(connection?.driverUrl)}\n${generation}\n${options.probeList === true}`;
+    const existing = retainedRunLoadPromises.get(key);
+    if (existing) return existing;
+    const pending = loadRetainedRunsOnce(connection, generation, options);
+    retainedRunLoadPromises.set(key, pending);
+    try {
+      return await pending;
+    } finally {
+      if (retainedRunLoadPromises.get(key) === pending) retainedRunLoadPromises.delete(key);
+    }
   }
 
   async function loadWorkspace() {
@@ -1757,8 +1899,7 @@
   }
 
   function rememberRun(connectionId, runId) {
-    const current = state.config.recentRunIdsByConnection[connectionId] || [];
-    state.config.recentRunIdsByConnection[connectionId] = [runId, ...current.filter((id) => id !== runId)].slice(0, 30);
+    state.config.recentRunIdsByConnection[connectionId] = mergeRecentRunIds(connectionId, [runId]);
     persistConfig();
   }
 
@@ -10931,18 +11072,28 @@
   }
 
   function screenFromHash() {
-    const value = location.hash.replace(/^#\/?/, "").split(/[/?]/)[0];
-    return value || "home";
+    const match = location.hash.match(/^#\/([^/?]+)/);
+    return match?.[1] || null;
+  }
+
+  function showScreen(screen) {
+    state.screen = screen;
+    state.config.ui.lastScreen = screen;
+    persistConfig();
+    render();
   }
 
   function navigate(screen) {
     state.cartridgeNavOpen = false;
-    if (location.hash !== `#/${screen}`) {
-      location.hash = `#/${screen}`;
-    } else {
-      state.screen = screen;
-      render();
+    const nextHash = `#/${screen}`;
+    if (location.origin !== "null" && location.hash !== nextHash) {
+      try {
+        history.pushState({ screen }, "", nextHash);
+      } catch {
+        // In-memory routing still works if this browser rejects history writes.
+      }
     }
+    showScreen(screen);
   }
 
   function navigateBack() {
@@ -10990,6 +11141,9 @@
       if (existingId) {
         const index = state.config.connections.findIndex((item) => item.id === existingId);
         if (index < 0) throw new Error("The connection no longer exists.");
+        if (normalizedDriverUrl(state.config.connections[index].driverUrl) !== normalizedDriverUrl(connection.driverUrl)) {
+          delete state.config.recentRunIdsByConnection[existingId];
+        }
         state.config.connections[index] = connection;
       } else {
         state.config.connections.push(connection);
@@ -11028,7 +11182,7 @@
     if (!connection) return;
     const generation = state.workspaceGeneration;
     state.workspace.errors.runs = null;
-    await loadRetainedRuns(connection, generation);
+    await loadRetainedRuns(connection, generation, { probeList: true });
     if (isCurrentWorkspace(connection, generation)) scheduleLivePatch({ activity: true });
   }
 
@@ -11517,6 +11671,10 @@
   });
   byId("refresh-button").addEventListener("click", () => void refreshEverything());
   byId("workflow-monitor").addEventListener("click", openGoalWorkflowManager);
+  document.querySelector(".game-brand")?.addEventListener("click", (event) => {
+    event.preventDefault();
+    navigate("home");
+  });
   pexeInput.addEventListener("change", () => void installCartridgeFile(pexeInput.files?.[0]));
   dobjInput.addEventListener("change", () => void importObjectFile(dobjInput.files?.[0]));
   configInput.addEventListener("change", async () => {
@@ -11529,13 +11687,15 @@
       toast("Config is invalid", error.message, "error");
     }
   });
-  window.addEventListener("hashchange", () => {
+  function syncScreenFromLocation() {
+    const screen = screenFromHash();
+    if (!screen || screen === state.screen) return;
     state.cartridgeNavOpen = false;
-    state.screen = screenFromHash();
-    state.config.ui.lastScreen = state.screen;
-    persistConfig();
-    render();
-  });
+    showScreen(screen);
+  }
+
+  window.addEventListener("hashchange", syncScreenFromLocation);
+  window.addEventListener("popstate", syncScreenFromLocation);
 
   window.addEventListener("storage", (event) => {
     if (event.key === LEGACY_HARDWARE_INDEX_STORAGE_KEY) return;
@@ -11553,6 +11713,16 @@
     if (event.key !== STORAGE_KEY || !event.newValue) return;
     try {
       const incomingConfig = JSON.parse(event.newValue);
+      const incomingConnections = new Map(
+        (Array.isArray(incomingConfig?.connections) ? incomingConfig.connections : [])
+          .map((connection) => [String(connection?.id || ""), normalizedDriverUrl(connection?.driverUrl)]),
+      );
+      for (const connection of state.config.connections) {
+        if (incomingConnections.get(connection.id) !== normalizedDriverUrl(connection.driverUrl)) continue;
+        state.config.recentRunIdsByConnection[connection.id] = normalizeRecentRunIds(
+          incomingConfig?.recentRunIdsByConnection?.[connection.id],
+        );
+      }
       synchronizeHardwareIndexFromStorage(incomingConfig, incomingConfig);
     } catch {
       // Ignore malformed or unrelated local config updates from another tab.
@@ -11626,8 +11796,14 @@
     updateUiSoundUi();
     updateMusicUi();
     void initializeMusic();
-    state.screen = screenFromHash();
-    if (!location.hash) history.replaceState(null, "", "#/home");
+    state.screen = screenFromHash() || "home";
+    if (location.origin !== "null" && !location.hash) {
+      try {
+        history.replaceState({ screen: "home" }, "", "#/home");
+      } catch {
+        // Direct-file mode can still route entirely in memory.
+      }
+    }
     render();
     await recoverInterruptedGoalWorkflowAtStartup();
     await probeAllConnections();
